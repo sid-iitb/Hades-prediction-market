@@ -76,6 +76,15 @@ def fetch_kalshi_data_struct():
     except Exception as e:
         return None, str(e)
 
+
+def select_markets_within_range(market_data, current_price, window=1000):
+    if current_price is None:
+        return []
+    return [
+        m for m in market_data
+        if m.get('strike', 0) > 0 and abs(m.get('strike', 0) - current_price) <= window
+    ]
+
 def main():
     data, err = fetch_kalshi_data_struct()
 
@@ -95,10 +104,7 @@ def main():
     # Find the market closest to current price for display
     current_price = data['current_price'] or 0
     # Keep only strikes within +/- 1000 of current price and positive strikes
-    market_data = [
-        m for m in market_data
-        if m.get('strike', 0) > 0 and abs(m.get('strike', 0) - current_price) <= 1000
-    ]
+    market_data = select_markets_within_range(market_data, current_price, window=1000)
     if not market_data:
         print("No markets within $1,000 of current price.")
         return
