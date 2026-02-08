@@ -226,6 +226,40 @@ def dashboard():
         grid-template-columns: repeat(3, minmax(0, 1fr));
         gap: 12px;
       }
+      .markets {
+        background: rgba(10, 16, 32, 0.6);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 12px;
+      }
+      .markets h3 {
+        margin: 0 0 10px 0;
+        font-size: 13px;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+      }
+      .markets table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 13px;
+      }
+      .markets th,
+      .markets td {
+        padding: 8px 6px;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+        text-align: left;
+      }
+      .markets th {
+        color: var(--muted);
+        font-weight: 600;
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+      }
+      .markets tr:last-child td {
+        border-bottom: none;
+      }
       .stat {
         background: rgba(255, 255, 255, 0.04);
         border: 1px solid var(--border);
@@ -282,6 +316,22 @@ def dashboard():
               <div id="count" class="value">--</div>
             </div>
           </div>
+          <div class="markets">
+            <h3>Latest 10 Kalshi Markets</h3>
+            <table>
+              <thead>
+                <tr>
+                  <th>Strike</th>
+                  <th>Yes Ask</th>
+                  <th>No Ask</th>
+                  <th>Subtitle</th>
+                </tr>
+              </thead>
+              <tbody id="markets-body">
+                <tr><td colspan="4">Loading...</td></tr>
+              </tbody>
+            </table>
+          </div>
         </div>
       </div>
     </div>
@@ -294,6 +344,7 @@ def dashboard():
       const countEl = document.getElementById("count");
       const canvas = document.getElementById("chart");
       const ctx = canvas.getContext("2d");
+      const marketsBody = document.getElementById("markets-body");
 
       function resizeCanvas() {
         const rect = canvas.getBoundingClientRect();
@@ -398,11 +449,48 @@ def dashboard():
         }
       }
 
+      function renderMarkets(markets) {
+        if (!markets || !markets.length) {
+          marketsBody.innerHTML = "<tr><td colspan=\\"4\\">No markets found.</td></tr>";
+          return;
+        }
+        const rows = markets.slice(0, 10).map(m => {
+          const strike = Number(m.strike || 0);
+          const yesAsk = m.yes_ask ?? "--";
+          const noAsk = m.no_ask ?? "--";
+          const subtitle = m.subtitle || "";
+          return `
+            <tr>
+              <td>${strike ? strike.toLocaleString("en-US", { style: "currency", currency: "USD" }) : "--"}</td>
+              <td>${yesAsk}c</td>
+              <td>${noAsk}c</td>
+              <td>${subtitle}</td>
+            </tr>
+          `;
+        }).join("");
+        marketsBody.innerHTML = rows;
+      }
+
+      async function refreshMarkets() {
+        try {
+          const res = await fetch("/kalshi_ingest/latest");
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const data = await res.json();
+          const records = data.records || [];
+          const latest = records.length ? records[0] : null;
+          renderMarkets(latest ? (latest.markets || []) : []);
+        } catch (err) {
+          renderMarkets([]);
+        }
+      }
+
       refresh();
       refreshChart();
+      refreshMarkets();
       setInterval(() => {
         refresh();
         refreshChart();
+        refreshMarkets();
       }, 1000);
       window.addEventListener("resize", refreshChart);
     </script>
