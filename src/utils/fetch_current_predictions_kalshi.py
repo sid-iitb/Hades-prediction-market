@@ -57,6 +57,7 @@ def fetch_kalshi_data_struct():
             if strike > 0:
                 market_data.append({
                     'strike': strike,
+                    'ticker': m.get('ticker'),
                     'yes_bid': m.get('yes_bid', 0),
                     'yes_ask': m.get('yes_ask', 0),
                     'no_bid': m.get('no_bid', 0),

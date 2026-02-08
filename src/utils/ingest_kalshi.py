@@ -38,6 +38,7 @@ def ensure_db(conn):
             no_bid REAL,
             no_ask REAL,
             subtitle TEXT,
+            ticker TEXT,
             FOREIGN KEY (run_id) REFERENCES ingest_runs(id)
         )
         """
@@ -64,8 +65,8 @@ def insert_run(conn, event_ticker, current_price, markets):
         cur.executemany(
             """
             INSERT INTO kalshi_markets (
-                run_id, strike, yes_bid, yes_ask, no_bid, no_ask, subtitle
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                run_id, strike, yes_bid, yes_ask, no_bid, no_ask, subtitle, ticker
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -76,6 +77,7 @@ def insert_run(conn, event_ticker, current_price, markets):
                     m.get("no_bid"),
                     m.get("no_ask"),
                     m.get("subtitle"),
+                    m.get("ticker")
                 )
                 for m in markets
             ],

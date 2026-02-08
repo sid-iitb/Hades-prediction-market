@@ -71,7 +71,7 @@ def get_latest_ingest():
         for run in runs:
             cur.execute(
                 """
-                SELECT strike, yes_bid, yes_ask, no_bid, no_ask, subtitle
+                SELECT strike, yes_bid, yes_ask, no_bid, no_ask, subtitle, ticker
                 FROM kalshi_markets
                 WHERE run_id = ?
                 ORDER BY strike ASC
@@ -322,6 +322,7 @@ def dashboard():
               <thead>
                 <tr>
                   <th>Strike</th>
+                  <th>Ticker</th>
                   <th>Yes Ask</th>
                   <th>No Ask</th>
                   <th>Subtitle</th>
@@ -451,17 +452,19 @@ def dashboard():
 
       function renderMarkets(markets) {
         if (!markets || !markets.length) {
-          marketsBody.innerHTML = "<tr><td colspan=\\"4\\">No markets found.</td></tr>";
+          marketsBody.innerHTML = "<tr><td colspan=\\"5\\">No markets found.</td></tr>";
           return;
         }
         const rows = markets.slice(0, 10).map(m => {
           const strike = Number(m.strike || 0);
+          const ticker = m.ticker || "";
           const yesAsk = m.yes_ask ?? "--";
           const noAsk = m.no_ask ?? "--";
           const subtitle = m.subtitle || "";
           return `
             <tr>
               <td>${strike ? strike.toLocaleString("en-US", { style: "currency", currency: "USD" }) : "--"}</td>
+              <td>${ticker}c</td>
               <td>${yesAsk}c</td>
               <td>${noAsk}c</td>
               <td>${subtitle}</td>
