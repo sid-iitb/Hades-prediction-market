@@ -1,7 +1,7 @@
 import os
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from src.utils.fetch_current_predictions_kalshi import (
     fetch_kalshi_data_struct,
@@ -81,7 +81,28 @@ def insert_run(conn, event_ticker, current_price, markets):
             ],
         )
     conn.commit()
-    print("Completed Storing " + str(ts) + "BTC" + str(current_price))
+    print("Pushed Record to Storage " + str(ts) + "BTC" + str(current_price))
+
+
+def purge_old(conn, hours=24):
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    cutoff_iso = cutoff.isoformat()
+    cur = conn.cursor()
+    # Delete markets for old runs first
+    cur.execute(
+        """
+        DELETE FROM kalshi_markets
+        WHERE run_id IN (
+            SELECT id FROM ingest_runs WHERE ts < ?
+        )
+        """,
+        (cutoff_iso,),
+    )
+    cur.execute(
+        "DELETE FROM ingest_runs WHERE ts < ?",
+        (cutoff_iso,),
+    )
+    conn.commit()
 
 
 def ingest_loop(db_path=None, window=1000, interval_sec=1):
@@ -107,6 +128,7 @@ def ingest_loop(db_path=None, window=1000, interval_sec=1):
                 current_price,
                 markets,
             )
+            purge_old(conn, hours=24)
             time.sleep(interval_sec)
     except KeyboardInterrupt:
         print("Ingest stopped.")

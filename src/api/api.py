@@ -1,6 +1,7 @@
 import datetime
 import os
 import sqlite3
+from datetime import timedelta, timezone
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -52,13 +53,17 @@ def get_latest_ingest():
     try:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
+        cutoff = datetime.datetime.now(timezone.utc) - timedelta(hours=2)
+        cutoff_iso = cutoff.isoformat()
         cur.execute(
             """
             SELECT id, ts, event_ticker, current_price
             FROM ingest_runs
+            WHERE ts >= ?
             ORDER BY id DESC
-            LIMIT 10
-            """
+            LIMIT 200
+            """,
+            (cutoff_iso,),
         )
         runs = cur.fetchall()
         results = []
