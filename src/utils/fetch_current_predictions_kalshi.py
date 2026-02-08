@@ -1,7 +1,7 @@
-import requests
-import datetime
-import pytz
 import re
+
+import requests
+
 from get_current_trading_markets import get_current_market_urls
 from src.client.kraken_client import KrakenClient
 
@@ -35,10 +35,10 @@ def fetch_kalshi_data_struct():
         # Get current market info
         market_info = get_current_market_urls()
         kalshi_url = market_info["kalshi"]
-        
+
         # Extract event ticker from URL
         event_ticker = kalshi_url.split("/")[-1].upper()
-        
+
         # Fetch Current BTC Price
         current_price = client.latest_btc_price().price
 
@@ -46,10 +46,10 @@ def fetch_kalshi_data_struct():
         markets, err = get_kalshi_markets(event_ticker)
         if err:
             return None, f"Kalshi Error: {err}"
-            
+
         if not markets:
             return [], None
-            
+
         # Parse strikes and sort
         market_data = []
         for m in markets:
@@ -63,30 +63,30 @@ def fetch_kalshi_data_struct():
                     'no_ask': m.get('no_ask', 0),
                     'subtitle': m.get('subtitle')
                 })
-                
+
         # Sort by strike price
         market_data.sort(key=lambda x: x['strike'])
-        
+
         return {
             "event_ticker": event_ticker,
             "current_price": current_price,
             "markets": market_data
         }, None
-        
+
     except Exception as e:
         return None, str(e)
 
 def main():
     data, err = fetch_kalshi_data_struct()
-    
+
     if err:
         print(f"Error: {err}")
         return
-        
+
     print(f"Fetching data for Event: {data['event_ticker']}")
     if data['current_price']:
         print(f"CURRENT PRICE: ${data['current_price']:,.2f}")
-    
+
     market_data = data['markets']
     if not market_data:
         print("No markets found.")
@@ -94,24 +94,17 @@ def main():
 
     # Find the market closest to current price for display
     current_price = data['current_price'] or 0
-    closest_idx = 0
-    min_diff = float('inf')
-    
-    for i, m in enumerate(market_data):
-        diff = abs(m['strike'] - current_price)
-        if diff < min_diff:
-            min_diff = diff
-            closest_idx = i
-            
-    # Select 3 markets
-    start_idx = max(0, closest_idx - 1)
-    end_idx = min(len(market_data), start_idx + 100)
-    
-    if end_idx - start_idx < 3 and start_idx > 0:
-        start_idx = max(0, end_idx - 3)
-        
-    selected_markets = market_data[start_idx:end_idx]
-    
+    # Keep only strikes within +/- 1000 of current price and positive strikes
+    market_data = [
+        m for m in market_data
+        if m.get('strike', 0) > 0 and abs(m.get('strike', 0) - current_price) <= 1000
+    ]
+    if not market_data:
+        print("No markets within $1,000 of current price.")
+        return
+    # Show all markets within range after filtering
+    selected_markets = market_data
+
     # Print Data
     print("-" * 30)
     for i, m in enumerate(selected_markets):
