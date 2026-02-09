@@ -2,12 +2,23 @@ import datetime
 import os
 import sqlite3
 from datetime import timedelta, timezone
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
 
+from src.client.kalshi_client import KalshiClient
 from src.client.kraken_client import KrakenClient
+from src.offline_processing.ingest_kalshi import ingest_loop
+
+from dotenv import load_dotenv
+
+env_file = Path("../.env")
+
+# Load environment variables
+load_dotenv()
 
 app = FastAPI()
 
@@ -44,6 +55,12 @@ def get_arbitrage_data():
     return response
 
 
+class KalshiOrderRequest(BaseModel):
+    ticker: str
+    yes_ask_cents: int
+    max_cost_cents: int = 500
+
+
 @app.get("/kalshi_ingest/latest")
 def get_latest_ingest():
     db_path = get_db_path()
@@ -71,7 +88,7 @@ def get_latest_ingest():
         for run in runs:
             cur.execute(
                 """
-                SELECT strike, yes_bid, yes_ask, no_bid, no_ask, subtitle, ticker
+                SELECT strike, yes_bid, yes_ask, no_bid, no_ask, subtitle
                 FROM kalshi_markets
                 WHERE run_id = ?
                 ORDER BY strike ASC
@@ -118,6 +135,21 @@ def get_last_hour_ingest():
         return {"records": records}
     finally:
         conn.close()
+
+
+@app.get("/kalshi/place_yes_ask_order")
+def place_yes_ask_order():
+    client = KalshiClient()
+    resp = client.place_yes_limit_at_ask(
+        ticker="KXBTCD-26FEB0819-T69249.99",
+        yes_ask_cents=10,
+        max_cost_cents=100,
+    )
+    try:
+        body = resp.json()
+    except Exception:
+        body = resp.text
+    return {"status_code": resp.status_code, "response": body}
 
 
 @app.get("/dashboard", response_class=HTMLResponse)

@@ -2,7 +2,7 @@ import re
 
 import requests
 
-from get_current_trading_markets import get_current_market_urls
+from src.utils.get_current_trading_markets import get_current_market_urls
 from src.client.kraken_client import KrakenClient
 
 # Configuration
@@ -115,7 +115,7 @@ def main():
     # Print Data
     print("-" * 30)
     for i, m in enumerate(selected_markets):
-        print(f"PRICE TO BEAT {i+1}: {m['subtitle']}")
+        print(f"PRICE TO BEAT {i+1}: {m['subtitle']} & Ticker: {m['ticker']}")
         print(f"BUY YES PRICE {i+1}: {m['yes_ask']}c, BUY NO PRICE {i+1}: {m['no_ask']}c")
         print()
 
