@@ -160,15 +160,22 @@ def get_last_hour_ingest():
     finally:
         conn.close()
 
-
-@app.get("/kalshi/place_yes_ask_order")
-def place_yes_ask_order():
+@app.get("/kalshi/place_best_ask_order")
+def place_best_ask_order(side: str, ticker: str, max_cost_cents: int = 500):
     client = KalshiClient()
-    resp = client.place_yes_limit_at_ask(
-        ticker="KXBTCD-26FEB0819-T69249.99",
-        yes_ask_cents=10,
-        max_cost_cents=100,
-    )
+    if side.lower() == "yes":
+        resp = client.place_yes_limit_at_best_ask(
+            ticker=ticker,
+            max_cost_cents=max_cost_cents,
+        )
+    elif side.lower() == "no":
+        resp = client.place_no_limit_at_best_ask(
+            ticker=ticker,
+            max_cost_cents=max_cost_cents,
+        )
+    else:
+        return {"error": "side must be 'yes' or 'no'"}
+
     try:
         body = resp.json()
     except Exception:
