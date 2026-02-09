@@ -12,7 +12,6 @@ from pydantic import BaseModel
 from src.client.kalshi_client import KalshiClient
 from src.client.kraken_client import KrakenClient
 from src.offline_processing.ingest_kalshi import ingest_loop
-
 from dotenv import load_dotenv
 
 env_file = Path("../.env")
