@@ -47,20 +47,12 @@ Notes:
 - Optional: set `KALSHI_DB_PATH` to override the default SQLite path.
 - Optional: set `KALSHI_AUTO_INGEST=false` to disable auto-starting the ingest loop when the API boots.
 
-### 4) Run the ingest loop (optional but recommended)
-```bash
-python -m src.offline_processing.ingest_kalshi
-```
-This continuously writes market snapshots to `data/kalshi_ingest.db` (once per second) and prunes data older than 24 hours.
-
-Note: when you run the API server (step 5), the ingest loop will auto-start in the background unless you set `KALSHI_AUTO_INGEST=false`.
-
-### 5) Run the API server + dashboard
+### 4) Run the API server + dashboard
 ```bash
 python -m src.api
 ```
-Then open:
-- `http://localhost:8090/dashboard`
+- This continuously writes market snapshots to `data/kalshi_ingest.db` (once per second) and prunes data older than 24 hours.
+- Then open:- `http://localhost:8090/dashboard`
 
 ## API Endpoints
 - `GET /get_price_ticker`
@@ -71,6 +63,8 @@ Then open:
   - Returns BTC price samples for the last hour.
 - `GET /kalshi/place_yes_ask_order`
   - Places a sample YES order at the ask (real order if keys are live). Use with caution.
+- `GET /kalshi/place_best_ask_order?side=yes|no&ticker=...&max_cost_cents=...`
+  - Places a best-ask limit order for YES/NO based on the current order book.
 
 ## Dashboard
 The dashboard shows:
@@ -78,6 +72,7 @@ The dashboard shows:
 - Last hour price curve
 - High/low stats
 - Latest Kalshi markets for the current event
+- One-click YES/NO buttons per market with a configurable max cost (cents)
 
 ## Repository Layout
 ```
