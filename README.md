@@ -4,6 +4,7 @@ A research-grade trading workstation for Kalshi's Bitcoin hourly markets. It ing
 
 The core objective is to evolve from signal collection into automated, risk-aware execution.
 
+
 ## Highlights
 - Live BTC price from Kraken.
 - Kalshi market discovery for the current hour.
@@ -47,6 +48,8 @@ Notes:
 - Optional: set `KALSHI_DB_PATH` to override the default SQLite path.
 - Optional: set `KALSHI_AUTO_INGEST=false` to disable auto-starting the ingest loop when the API boots.
 
+
+
 ### 4) Run the API server + dashboard
 ```bash
 python -m src.api
@@ -67,6 +70,8 @@ python -m src.api
   - Places a best-ask limit order for YES/NO based on the current order book.
 
 ## Dashboard
+![img.png](Dashboard.png)
+
 The dashboard shows:
 - Live BTC price and timestamp
 - Last hour price curve
