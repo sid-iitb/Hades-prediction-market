@@ -45,12 +45,15 @@ Notes:
 - `KALSHI_PRIVATE_KEY` should point to your private key PEM.
 - Do not commit secrets. `.env` is already ignored by git.
 - Optional: set `KALSHI_DB_PATH` to override the default SQLite path.
+- Optional: set `KALSHI_AUTO_INGEST=false` to disable auto-starting the ingest loop when the API boots.
 
 ### 4) Run the ingest loop (optional but recommended)
 ```bash
 python -m src.offline_processing.ingest_kalshi
 ```
 This continuously writes market snapshots to `data/kalshi_ingest.db` (once per second) and prunes data older than 24 hours.
+
+Note: when you run the API server (step 5), the ingest loop will auto-start in the background unless you set `KALSHI_AUTO_INGEST=false`.
 
 ### 5) Run the API server + dashboard
 ```bash

@@ -1,6 +1,7 @@
 import datetime
 import os
 import sqlite3
+import threading
 from datetime import timedelta, timezone
 from pathlib import Path
 
@@ -39,6 +40,30 @@ DEFAULT_DB_PATH = os.path.join(
 
 def get_db_path():
     return os.getenv("KALSHI_DB_PATH") or DEFAULT_DB_PATH
+
+
+_ingest_thread: threading.Thread | None = None
+
+
+def _start_ingest_loop():
+    global _ingest_thread
+    if _ingest_thread and _ingest_thread.is_alive():
+        return
+    db_path = get_db_path()
+    _ingest_thread = threading.Thread(
+        target=ingest_loop,
+        kwargs={"db_path": db_path},
+        name="kalshi-ingest-loop",
+        daemon=True,
+    )
+    _ingest_thread.start()
+
+
+@app.on_event("startup")
+def startup_ingest():
+    auto_ingest = os.getenv("KALSHI_AUTO_INGEST", "true").lower()
+    if auto_ingest in {"1", "true", "yes", "on"}:
+        _start_ingest_loop()
 
 
 @app.get("/get_price_ticker")
@@ -87,7 +112,7 @@ def get_latest_ingest():
         for run in runs:
             cur.execute(
                 """
-                SELECT strike, yes_bid, yes_ask, no_bid, no_ask, subtitle
+                SELECT strike, yes_bid, yes_ask, no_bid, no_ask, subtitle, ticker
                 FROM kalshi_markets
                 WHERE run_id = ?
                 ORDER BY strike ASC
