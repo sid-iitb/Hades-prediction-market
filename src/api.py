@@ -309,6 +309,26 @@ def dashboard():
         margin: 0 0 10px 0;
         gap: 12px;
       }
+      .markets-actions {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+      .max-cost {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .max-cost input {
+        width: 72px;
+        padding: 4px 8px;
+        border-radius: 8px;
+        border: 1px solid var(--border);
+        background: rgba(255, 255, 255, 0.06);
+        color: var(--text);
+      }
       .btn {
         padding: 6px 12px;
         border-radius: 999px;
@@ -320,6 +340,16 @@ def dashboard():
       }
       .btn:hover {
         background: rgba(244, 196, 48, 0.26);
+      }
+      .btn.trade {
+        padding: 4px 8px;
+        font-size: 11px;
+        margin-left: 6px;
+      }
+      .trade-status {
+        margin-top: 8px;
+        font-size: 12px;
+        color: var(--muted);
       }
       .markets table {
         width: 100%;
@@ -401,7 +431,13 @@ def dashboard():
           <div class="markets">
             <div class="markets-header">
               <h3>Latest 10 Kalshi Markets</h3>
-              <button id="refresh-markets" class="btn" type="button">Refresh</button>
+              <div class="markets-actions">
+                <label class="max-cost">
+                  Max Cost (c)
+                  <input id="max-cost" type="number" min="1" value="100" />
+                </label>
+                <button id="refresh-markets" class="btn" type="button">Refresh</button>
+              </div>
             </div>
             <table>
               <thead>
@@ -432,6 +468,7 @@ def dashboard():
       const ctx = canvas.getContext("2d");
       const marketsBody = document.getElementById("markets-body");
       const refreshMarketsBtn = document.getElementById("refresh-markets");
+      const maxCostEl = document.getElementById("max-cost");
 
       function resizeCanvas() {
         const rect = canvas.getBoundingClientRect();
@@ -551,13 +588,26 @@ def dashboard():
             <tr>
               <td>${strike ? strike.toLocaleString("en-US", { style: "currency", currency: "USD" }) : "--"}</td>
               <td>${ticker}</td>
-              <td>${yesAsk}c</td>
-              <td>${noAsk}c</td>
+              <td>
+                ${yesAsk}c
+                <button class="btn trade" data-side="yes" data-ticker="${ticker}">YES</button>
+              </td>
+              <td>
+                ${noAsk}c
+                <button class="btn trade" data-side="no" data-ticker="${ticker}">NO</button>
+              </td>
               <td>${subtitle}</td>
             </tr>
           `;
         }).join("");
-        marketsBody.innerHTML = rows;
+        marketsBody.innerHTML = rows + `<tr><td colspan="5"><div id="trade-status" class="trade-status">Ready.</div></td></tr>`;
+        marketsBody.querySelectorAll("button.trade").forEach(btn => {
+          btn.addEventListener("click", () => {
+            const side = btn.getAttribute("data-side");
+            const ticker = btn.getAttribute("data-ticker");
+            placeBestAskOrder(side, ticker);
+          });
+        });
       }
 
       async function refreshMarkets() {
@@ -570,6 +620,32 @@ def dashboard():
           renderMarkets(latest ? (latest.markets || []) : []);
         } catch (err) {
           renderMarkets([]);
+        }
+      }
+
+      async function placeBestAskOrder(side, ticker) {
+        const statusEl = document.getElementById("trade-status");
+        const maxCost = Number(maxCostEl.value || 0);
+        if (!ticker) {
+          if (statusEl) statusEl.textContent = "Missing ticker.";
+          return;
+        }
+        if (!maxCost || maxCost < 1) {
+          if (statusEl) statusEl.textContent = "Invalid max cost.";
+          return;
+        }
+        if (statusEl) statusEl.textContent = `Placing ${side.toUpperCase()} order...`;
+        try {
+          const url = `/kalshi/place_best_ask_order?side=${encodeURIComponent(side)}&ticker=${encodeURIComponent(ticker)}&max_cost_cents=${encodeURIComponent(maxCost)}`;
+          const res = await fetch(url);
+          const data = await res.json();
+          if (!res.ok || data.error) {
+            if (statusEl) statusEl.textContent = `Error: ${data.error || res.status}`;
+            return;
+          }
+          if (statusEl) statusEl.textContent = `Order submitted (${side.toUpperCase()}) for ${ticker}.`;
+        } catch (err) {
+          if (statusEl) statusEl.textContent = "Request failed.";
         }
       }
 
