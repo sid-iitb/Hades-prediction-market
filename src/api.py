@@ -296,11 +296,30 @@ def dashboard():
         padding: 12px;
       }
       .markets h3 {
-        margin: 0 0 10px 0;
+        margin: 0;
         font-size: 13px;
         color: var(--muted);
         text-transform: uppercase;
         letter-spacing: 0.06em;
+      }
+      .markets-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin: 0 0 10px 0;
+        gap: 12px;
+      }
+      .btn {
+        padding: 6px 12px;
+        border-radius: 999px;
+        border: 1px solid var(--border);
+        background: rgba(244, 196, 48, 0.18);
+        color: var(--accent);
+        font-size: 12px;
+        cursor: pointer;
+      }
+      .btn:hover {
+        background: rgba(244, 196, 48, 0.26);
       }
       .markets table {
         width: 100%;
@@ -380,7 +399,10 @@ def dashboard():
             </div>
           </div>
           <div class="markets">
-            <h3>Latest 10 Kalshi Markets</h3>
+            <div class="markets-header">
+              <h3>Latest 10 Kalshi Markets</h3>
+              <button id="refresh-markets" class="btn" type="button">Refresh</button>
+            </div>
             <table>
               <thead>
                 <tr>
@@ -392,7 +414,7 @@ def dashboard():
                 </tr>
               </thead>
               <tbody id="markets-body">
-                <tr><td colspan="4">Loading...</td></tr>
+                <tr><td colspan="5">Click Refresh to load markets.</td></tr>
               </tbody>
             </table>
           </div>
@@ -409,6 +431,7 @@ def dashboard():
       const canvas = document.getElementById("chart");
       const ctx = canvas.getContext("2d");
       const marketsBody = document.getElementById("markets-body");
+      const refreshMarketsBtn = document.getElementById("refresh-markets");
 
       function resizeCanvas() {
         const rect = canvas.getBoundingClientRect();
@@ -518,7 +541,7 @@ def dashboard():
           marketsBody.innerHTML = "<tr><td colspan=\\"5\\">No markets found.</td></tr>";
           return;
         }
-        const rows = markets.slice(0, 10).map(m => {
+        const rows = markets.slice(0, 20).map(m => {
           const strike = Number(m.strike || 0);
           const ticker = m.ticker || "";
           const yesAsk = m.yes_ask ?? "--";
@@ -527,7 +550,7 @@ def dashboard():
           return `
             <tr>
               <td>${strike ? strike.toLocaleString("en-US", { style: "currency", currency: "USD" }) : "--"}</td>
-              <td>${ticker}c</td>
+              <td>${ticker}</td>
               <td>${yesAsk}c</td>
               <td>${noAsk}c</td>
               <td>${subtitle}</td>
@@ -552,11 +575,10 @@ def dashboard():
 
       refresh();
       refreshChart();
-      refreshMarkets();
+      refreshMarketsBtn.addEventListener("click", refreshMarkets);
       setInterval(() => {
         refresh();
         refreshChart();
-        refreshMarkets();
       }, 1000);
       window.addEventListener("resize", refreshChart);
     </script>

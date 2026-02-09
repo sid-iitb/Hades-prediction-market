@@ -107,7 +107,7 @@ def purge_old(conn, hours=24):
     conn.commit()
 
 
-def ingest_loop(db_path=None, window=1000, interval_sec=1):
+def ingest_loop(db_path=None, window=1500, interval_sec=1):
     db_path = db_path or os.getenv("KALSHI_DB_PATH") or DEFAULT_DB_PATH
     conn = open_db(db_path)
     try:
