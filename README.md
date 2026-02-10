@@ -4,13 +4,22 @@ A research-grade trading workstation for Kalshi's Bitcoin hourly markets. It ing
 
 The core objective is to evolve from signal collection into automated, risk-aware execution.
 
+## Dashboard
+![img.png](Dashboard.png)
+
+The dashboard shows:
+- Live BTC price and timestamp
+- Last hour price curve
+- High/low stats
+- Latest Kalshi markets for the current event
+- One-click YES/NO buttons per market with a configurable max cost (cents)
+
 
 ## Highlights
 - Live BTC price from Kraken.
 - Kalshi market discovery for the current hour.
 - Continuous ingest pipeline with SQLite storage.
 - FastAPI service with JSON endpoints and a built-in dashboard.
-- Clean, modular Python layout (clients, utils, offline processing).
 
 ## Requirements
 - Python 3.11+
@@ -69,15 +78,6 @@ python -m src.api
 - `GET /kalshi/place_best_ask_order?side=yes|no&ticker=...&max_cost_cents=...`
   - Places a best-ask limit order for YES/NO based on the current order book.
 
-## Dashboard
-![img.png](Dashboard.png)
-
-The dashboard shows:
-- Live BTC price and timestamp
-- Last hour price curve
-- High/low stats
-- Latest Kalshi markets for the current event
-- One-click YES/NO buttons per market with a configurable max cost (cents)
 
 ## Repository Layout
 ```

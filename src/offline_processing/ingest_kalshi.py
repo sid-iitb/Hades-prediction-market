@@ -86,7 +86,7 @@ def insert_run(conn, event_ticker, current_price, markets):
     print("Pushed Record to Storage " + str(ts) + "BTC" + str(current_price))
 
 
-def purge_old(conn, hours=24):
+def purge_old(conn, hours=1):
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
     cutoff_iso = cutoff.isoformat()
     cur = conn.cursor()
