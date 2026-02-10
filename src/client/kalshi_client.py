@@ -96,6 +96,109 @@ class KalshiClient:
             "no_ask": no_ask,
         }
 
+    def get_orders(self, status=None, ticker=None, cursor=None, limit=100):
+        """
+        Fetch orders from the portfolio.
+        Optional filters: status, ticker, cursor, limit.
+        """
+        path = "/trade-api/v2/portfolio/orders"
+        headers = self._headers("GET", path)
+        params = {}
+        if status is not None:
+            params["status"] = status
+        if ticker is not None:
+            params["ticker"] = ticker
+        if cursor is not None:
+            params["cursor"] = cursor
+        if limit is not None:
+            params["limit"] = limit
+        resp = requests.get(self.base_url + path, headers=headers, params=params or None)
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_all_orders(self, status=None, ticker=None, limit=100, max_pages=20):
+        """
+        Fetch all orders with pagination.
+        """
+        all_orders = []
+        cursor = None
+        pages = 0
+        while pages < max_pages:
+            data = self.get_orders(
+                status=status,
+                ticker=ticker,
+                cursor=cursor,
+                limit=limit,
+            )
+            orders = data.get("orders", data if isinstance(data, list) else [])
+            if not orders:
+                break
+            all_orders.extend(orders)
+            cursor = data.get("next_cursor") or data.get("cursor")
+            if not cursor:
+                break
+            pages += 1
+        return all_orders
+
+    def get_settlements(self, cursor=None, limit=100):
+        """
+        Fetch settlements from the portfolio.
+        """
+        path = "/trade-api/v2/portfolio/settlements"
+        headers = self._headers("GET", path)
+        params = {}
+        if cursor is not None:
+            params["cursor"] = cursor
+        if limit is not None:
+            params["limit"] = limit
+        resp = requests.get(self.base_url + path, headers=headers, params=params or None)
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_all_settlements(self, limit=200, max_pages=20):
+        """
+        Fetch all settlements with pagination.
+        """
+        all_settlements = []
+        cursor = None
+        pages = 0
+        while pages < max_pages:
+            data = self.get_settlements(cursor=cursor, limit=limit)
+            settlements = data.get("settlements", data if isinstance(data, list) else [])
+            if not settlements:
+                break
+            all_settlements.extend(settlements)
+            cursor = data.get("cursor") or data.get("next_cursor")
+            if not cursor:
+                break
+            pages += 1
+        return all_settlements
+
+    def get_balance(self):
+        """
+        Fetch portfolio balance.
+        """
+        path = "/trade-api/v2/portfolio/balance"
+        headers = self._headers("GET", path)
+        resp = requests.get(self.base_url + path, headers=headers)
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_positions(self, cursor=None, limit=100):
+        """
+        Fetch current positions.
+        """
+        path = "/trade-api/v2/portfolio/positions"
+        headers = self._headers("GET", path)
+        params = {}
+        if cursor is not None:
+            params["cursor"] = cursor
+        if limit is not None:
+            params["limit"] = limit
+        resp = requests.get(self.base_url + path, headers=headers, params=params or None)
+        resp.raise_for_status()
+        return resp.json()
+
     def place_yes_limit_at_ask(self, ticker, yes_ask_cents, max_cost_cents=500):
         """
         Place a demo buy order for YES at the current ask price.

@@ -13,6 +13,7 @@ The dashboard shows:
 - High/low stats
 - Latest Kalshi markets for the current event
 - One-click YES/NO buttons per market with a configurable max cost (cents)
+- Current portfolio panel with balance and open positions (cost, P/L, max payout) and refresh button
 
 
 ## Highlights
@@ -77,6 +78,14 @@ python -m src.api
   - Places a sample YES order at the ask (real order if keys are live). Use with caution.
 - `GET /kalshi/place_best_ask_order?side=yes|no&ticker=...&max_cost_cents=...`
   - Places a best-ask limit order for YES/NO based on the current order book.
+- `GET /kalshi/portfolio/balance`
+  - Returns current portfolio balance.
+- `GET /kalshi/portfolio/orders`
+  - Returns current orders (filter with `status`, `ticker`, `limit`).
+- `GET /kalshi/portfolio/current`
+  - Returns portfolio balance and current positions/orders with estimated cost, mark-based P/L, and max payout.
+- `GET /kalshi/portfolio/net_profit`
+  - Returns net profit across all settled transactions (payout - cost - fees).
 
 
 ## Repository Layout

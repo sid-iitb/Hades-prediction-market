@@ -160,6 +160,18 @@ def get_last_hour_ingest():
     finally:
         conn.close()
 
+
+def _parse_dollar_str_to_cents(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(round(float(value) * 100))
+    try:
+        cleaned = str(value).replace("$", "").replace(",", "").strip()
+        return int(round(float(cleaned) * 100))
+    except Exception:
+        return None
+
 @app.get("/kalshi/place_best_ask_order")
 def place_best_ask_order(side: str, ticker: str, max_cost_cents: int = 500):
     client = KalshiClient()
@@ -181,6 +193,200 @@ def place_best_ask_order(side: str, ticker: str, max_cost_cents: int = 500):
     except Exception:
         body = resp.text
     return {"status_code": resp.status_code, "response": body}
+
+
+@app.get("/kalshi/portfolio/balance")
+def get_portfolio_balance():
+    client = KalshiClient()
+    return client.get_balance()
+
+
+@app.get("/kalshi/portfolio/orders")
+def get_portfolio_orders(status: str | None = None, ticker: str | None = None, limit: int = 100):
+    """
+    Fetch current orders (optionally filtered by status/ticker).
+    """
+    client = KalshiClient()
+    return client.get_orders(status=status, ticker=ticker, limit=limit)
+
+
+def _extract_order_count(order):
+    for key in ("filled_count", "count", "quantity"):
+        val = order.get(key)
+        if isinstance(val, (int, float)):
+            return int(val)
+    return 0
+
+
+def _extract_order_price_cents(order):
+    for key in ("avg_price", "yes_price", "no_price", "price", "limit_price"):
+        val = order.get(key)
+        if isinstance(val, (int, float)):
+            return int(val)
+    return None
+
+
+def _midpoint(a, b):
+    if a is None and b is None:
+        return None
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return int(round((a + b) / 2))
+
+def _price_to_cents(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        v = float(value)
+        if 0 < v <= 1.0:
+            return int(round(v * 100))
+        if 0 < v <= 100:
+            return int(round(v))
+        return int(round(v))
+    return None
+
+
+@app.get("/kalshi/portfolio/current")
+def get_portfolio_current_orders(status: str | None = "open", limit: int = 200):
+    """
+    Current orders/positions with estimated cost, mark-based PnL, and max payout.
+    """
+    client = KalshiClient()
+    orders = client.get_all_orders(status=status, limit=limit, max_pages=20) if status else client.get_all_orders(limit=limit, max_pages=20)
+    balance = client.get_balance()
+    positions = client.get_positions()
+    positions_list = positions.get("market_positions") or positions.get("positions") or []
+
+    rows = []
+
+    # Prefer positions if available (what the Kalshi UI shows under Portfolio)
+    for p in positions_list:
+        ticker = p.get("ticker") or p.get("market_ticker") or p.get("event_ticker")
+        raw_side = p.get("side") if p.get("side") is not None else p.get("position")
+        side = str(raw_side).lower() if raw_side is not None else ""
+        count = p.get("contracts") or p.get("quantity") or p.get("count") or 0
+        if not count and isinstance(raw_side, (int, float)):
+            count = int(abs(raw_side))
+        if isinstance(raw_side, (int, float)) and raw_side != 0:
+            side = "yes" if raw_side > 0 else "no"
+
+        avg_price = p.get("avg_price") or p.get("average_price")
+        price_cents = _price_to_cents(avg_price)
+        if price_cents is None:
+            price_cents = _extract_order_price_cents({"avg_price": avg_price})
+
+        cost_cents = (
+            _parse_dollar_str_to_cents(p.get("total_cost_dollars"))
+            or _parse_dollar_str_to_cents(p.get("total_cost"))
+            or _parse_dollar_str_to_cents(p.get("market_exposure_dollars"))
+            or _parse_dollar_str_to_cents(p.get("market_exposure"))
+            or _parse_dollar_str_to_cents(p.get("total_traded_dollars"))
+            or _parse_dollar_str_to_cents(p.get("total_traded"))
+            or _parse_dollar_str_to_cents(p.get("cost"))
+        )
+        if cost_cents is None and price_cents is not None and count:
+            cost_cents = price_cents * int(count)
+        max_payout_cents = 100 * int(count) if count else None
+        market_value_cents = _parse_dollar_str_to_cents(p.get("market_value"))
+        pnl_cents = (
+            _parse_dollar_str_to_cents(p.get("unrealized_pnl_dollars"))
+            or _parse_dollar_str_to_cents(p.get("unrealized_pnl"))
+            or _parse_dollar_str_to_cents(p.get("realized_pnl_dollars"))
+            or _parse_dollar_str_to_cents(p.get("realized_pnl"))
+            or _parse_dollar_str_to_cents(p.get("pnl"))
+        )
+        if pnl_cents is None and market_value_cents is not None and cost_cents is not None:
+            pnl_cents = market_value_cents - cost_cents
+        if cost_cents is None and market_value_cents is not None and pnl_cents is not None:
+            cost_cents = market_value_cents - pnl_cents
+        if pnl_cents is None and ticker and count:
+            total_traded_cents = _parse_dollar_str_to_cents(p.get("total_traded_dollars")) or _parse_dollar_str_to_cents(p.get("total_traded"))
+            if price_cents is None and total_traded_cents is not None and count:
+                price_cents = int(round(total_traded_cents / int(count)))
+            try:
+                top = client.get_top_of_book(ticker)
+                yes_mid = _midpoint(top.get("yes_bid"), top.get("yes_ask"))
+                no_mid = _midpoint(top.get("no_bid"), top.get("no_ask"))
+                if no_mid is None and yes_mid is not None:
+                    no_mid = 100 - yes_mid
+                if side == "yes" and yes_mid is not None and price_cents is not None:
+                    pnl_cents = int((yes_mid - price_cents) * int(count))
+                elif side == "no" and no_mid is not None and price_cents is not None:
+                    pnl_cents = int((no_mid - price_cents) * int(count))
+            except Exception:
+                pass
+
+        rows.append(
+            {
+                "order_id": p.get("position_id") or p.get("id"),
+                "ticker": ticker,
+                "side": side.upper() if side else p.get("side"),
+                "status": "POSITION",
+                "count": int(count) if count else 0,
+                "price_cents": price_cents,
+                "cost_cents": cost_cents,
+                "mark_cents": None,
+                "pnl_cents": pnl_cents,
+                "max_payout_cents": max_payout_cents,
+            }
+        )
+
+    # Fallback to orders if no positions
+    if not rows:
+        for order in orders:
+            ticker = order.get("ticker")
+            side = (order.get("side") or "").lower()
+            price = _extract_order_price_cents(order)
+            count = _extract_order_count(order)
+            cost_cents = price * count if price is not None and count else None
+            max_payout_cents = 100 * count if count else None
+
+            mark_cents = None
+            pnl_cents = None
+            if ticker and side in {"yes", "no"} and price is not None and count:
+                top = client.get_top_of_book(ticker)
+                yes_mid = _midpoint(top.get("yes_bid"), top.get("yes_ask"))
+                no_mid = _midpoint(top.get("no_bid"), top.get("no_ask"))
+                if no_mid is None and yes_mid is not None:
+                    no_mid = 100 - yes_mid
+                if side == "yes":
+                    mark_cents = yes_mid
+                    if mark_cents is not None:
+                        pnl_cents = int((mark_cents - price) * count)
+                else:
+                    mark_cents = no_mid
+                    if mark_cents is not None:
+                        pnl_cents = int((mark_cents - price) * count)
+
+            rows.append(
+                {
+                    "order_id": order.get("order_id") or order.get("id"),
+                    "ticker": ticker,
+                    "side": order.get("side"),
+                    "status": order.get("status"),
+                    "count": count,
+                    "price_cents": price,
+                    "cost_cents": cost_cents,
+                    "mark_cents": mark_cents,
+                    "pnl_cents": pnl_cents,
+                    "max_payout_cents": max_payout_cents,
+                }
+            )
+
+    return {"balance": balance, "orders": rows}
+
+
+@app.get("/kalshi/portfolio/positions_debug")
+def get_portfolio_positions_debug():
+    client = KalshiClient()
+    positions = client.get_positions()
+    positions_list = positions.get("market_positions") or positions.get("positions") or []
+    return {
+        "positions_sample": positions_list[:5],
+        "raw": positions,
+    }
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
@@ -219,13 +425,13 @@ def dashboard():
         padding: 24px;
       }
       .wrap {
-        width: min(820px, 100%);
+        width: min(1500px, 100%);
       }
       .card {
         background: var(--card);
         border: 1px solid var(--border);
         border-radius: 20px;
-        padding: 28px;
+        padding: 34px;
         box-shadow: 0 10px 40px rgba(0, 0, 0, 0.35);
         backdrop-filter: blur(6px);
       }
@@ -294,6 +500,41 @@ def dashboard():
         border: 1px solid var(--border);
         border-radius: 14px;
         padding: 12px;
+      }
+      .panel-grid {
+        display: grid;
+        grid-template-columns: minmax(0, 3fr) minmax(0, 1.2fr);
+        gap: 16px;
+      }
+      .portfolio-panel {
+        background: rgba(10, 16, 32, 0.6);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 12px;
+        min-height: 260px;
+      }
+      .portfolio-summary {
+        font-size: 12px;
+        color: var(--muted);
+        margin: 0 0 8px 0;
+      }
+      .portfolio-table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 12px;
+      }
+      .portfolio-table th,
+      .portfolio-table td {
+        padding: 6px 4px;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+        text-align: left;
+      }
+      .portfolio-table th {
+        color: var(--muted);
+        font-weight: 600;
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
       }
       .markets h3 {
         margin: 0;
@@ -392,6 +633,7 @@ def dashboard():
         .card { padding: 22px; }
         .meta { gap: 10px; }
         .stats { grid-template-columns: 1fr; }
+        .panel-grid { grid-template-columns: 1fr; }
       }
     </style>
   </head>
@@ -428,31 +670,54 @@ def dashboard():
               <div id="count" class="value">--</div>
             </div>
           </div>
-          <div class="markets">
-            <div class="markets-header">
-              <h3>Latest 10 Kalshi Markets</h3>
-              <div class="markets-actions">
-                <label class="max-cost">
-                  Max Cost (c)
-                  <input id="max-cost" type="number" min="1" value="100" />
-                </label>
-                <button id="refresh-markets" class="btn" type="button">Refresh</button>
+          <div class="panel-grid">
+            <div class="markets">
+              <div class="markets-header">
+                <h3>Latest 10 Kalshi Markets</h3>
+                <div class="markets-actions">
+                  <label class="max-cost">
+                    Max Cost (c)
+                    <input id="max-cost" type="number" min="1" value="100" />
+                  </label>
+                  <button id="refresh-markets" class="btn" type="button">Refresh</button>
+                </div>
               </div>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Strike</th>
+                    <th>Ticker</th>
+                    <th>Yes Ask</th>
+                    <th>No Ask</th>
+                    <th>Subtitle</th>
+                  </tr>
+                </thead>
+                <tbody id="markets-body">
+                  <tr><td colspan="5">Click Refresh to load markets.</td></tr>
+                </tbody>
+              </table>
             </div>
-            <table>
-              <thead>
-                <tr>
-                  <th>Strike</th>
-                  <th>Ticker</th>
-                  <th>Yes Ask</th>
-                  <th>No Ask</th>
-                  <th>Subtitle</th>
-                </tr>
-              </thead>
-              <tbody id="markets-body">
-                <tr><td colspan="5">Click Refresh to load markets.</td></tr>
-              </tbody>
-            </table>
+            <div class="portfolio-panel">
+              <div class="markets-header">
+                <h3>Current Portfolio</h3>
+                <button id="refresh-portfolio" class="btn" type="button">Refresh</button>
+              </div>
+              <div id="portfolio-summary" class="portfolio-summary">No data loaded.</div>
+              <table class="portfolio-table">
+                <thead>
+                  <tr>
+                    <th>Ticker</th>
+                    <th>Side</th>
+                    <th>Cost</th>
+                    <th>P/L</th>
+                    <th>Max</th>
+                  </tr>
+                </thead>
+                <tbody id="portfolio-body">
+                  <tr><td colspan="5">Click Refresh to load orders.</td></tr>
+                </tbody>
+              </table>
+            </div>
           </div>
         </div>
       </div>
@@ -469,6 +734,9 @@ def dashboard():
       const marketsBody = document.getElementById("markets-body");
       const refreshMarketsBtn = document.getElementById("refresh-markets");
       const maxCostEl = document.getElementById("max-cost");
+      const refreshPortfolioBtn = document.getElementById("refresh-portfolio");
+      const portfolioSummaryEl = document.getElementById("portfolio-summary");
+      const portfolioBody = document.getElementById("portfolio-body");
 
       function resizeCanvas() {
         const rect = canvas.getBoundingClientRect();
@@ -649,9 +917,56 @@ def dashboard():
         }
       }
 
+      function formatCents(cents) {
+        if (cents === null || cents === undefined) return "--";
+        const dollars = cents / 100;
+        const sign = dollars >= 0 ? "" : "-";
+        return `${sign}$${Math.abs(dollars).toFixed(2)}`;
+      }
+
+      async function refreshPortfolio() {
+        portfolioSummaryEl.textContent = "Loading portfolio...";
+        try {
+          const res = await fetch("/kalshi/portfolio/current");
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const data = await res.json();
+          const balance = data.balance || {};
+          const cash = formatCents(balance.cash_balance_cents ?? balance.cash_balance);
+          const portfolio = formatCents(balance.portfolio_value_cents ?? balance.portfolio_value);
+          portfolioSummaryEl.textContent = `Cash: ${cash} | Portfolio: ${portfolio}`;
+
+          const orders = data.orders || [];
+          if (!orders.length) {
+            portfolioBody.innerHTML = "<tr><td colspan=\\"5\\">No orders found.</td></tr>";
+            return;
+          }
+          const rows = orders.map(o => {
+            const ticker = o.ticker || "--";
+            const side = (o.side || "--").toUpperCase();
+            const cost = formatCents(o.cost_cents);
+            const pnl = formatCents(o.pnl_cents);
+            const max = formatCents(o.max_payout_cents);
+            return `
+              <tr>
+                <td>${ticker}</td>
+                <td>${side}</td>
+                <td>${cost}</td>
+                <td>${pnl}</td>
+                <td>${max}</td>
+              </tr>
+            `;
+          }).join("");
+          portfolioBody.innerHTML = rows;
+        } catch (err) {
+          portfolioSummaryEl.textContent = "Failed to load portfolio.";
+          portfolioBody.innerHTML = "<tr><td colspan=\\"5\\">Error loading orders.</td></tr>";
+        }
+      }
+
       refresh();
       refreshChart();
       refreshMarketsBtn.addEventListener("click", refreshMarkets);
+      refreshPortfolioBtn.addEventListener("click", refreshPortfolio);
       setInterval(() => {
         refresh();
         refreshChart();
