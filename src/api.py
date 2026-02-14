@@ -13,6 +13,11 @@ from pydantic import BaseModel
 from src.client.kalshi_client import KalshiClient
 from src.client.kraken_client import KrakenClient
 from src.offline_processing.ingest_kalshi import ingest_loop
+from src.strategy.farthest_band import (
+    FarthestBandConfig,
+    execute_farthest_band_trade,
+    select_farthest_band_market,
+)
 from dotenv import load_dotenv
 
 env_file = Path("../.env")
@@ -43,6 +48,15 @@ def get_db_path():
 
 
 _ingest_thread: threading.Thread | None = None
+_farthest_auto_thread: threading.Thread | None = None
+_farthest_auto_stop = threading.Event()
+_farthest_auto_lock = threading.Lock()
+_farthest_auto_state = {
+    "running": False,
+    "config": None,
+    "last_run_at": None,
+    "last_result": None,
+}
 
 
 def _start_ingest_loop():
@@ -159,6 +173,94 @@ def get_last_hour_ingest():
         return {"records": records}
     finally:
         conn.close()
+
+
+def _latest_ingest_record():
+    db_path = get_db_path()
+    if not os.path.exists(db_path):
+        return None
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, ts, event_ticker, current_price
+            FROM ingest_runs
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        )
+        run = cur.fetchone()
+        if not run:
+            return None
+
+        cur.execute(
+            """
+            SELECT strike, yes_bid, yes_ask, no_bid, no_ask, subtitle, ticker
+            FROM kalshi_markets
+            WHERE run_id = ?
+            ORDER BY strike ASC
+            """,
+            (run["id"],),
+        )
+        markets = [dict(row) for row in cur.fetchall()]
+        return {
+            "id": run["id"],
+            "ts": run["ts"],
+            "event_ticker": run["event_ticker"],
+            "current_price": run["current_price"],
+            "markets": markets,
+        }
+    finally:
+        conn.close()
+
+
+def _run_farthest_band_once(config: FarthestBandConfig):
+    ingest = _latest_ingest_record()
+    if not ingest:
+        return {"action": "hold", "reason": "No ingest record found"}
+
+    kraken = KrakenClient()
+    spot = kraken.latest_btc_price().price
+    markets = ingest.get("markets", [])
+    selection = select_farthest_band_market(spot=spot, markets=markets, config=config)
+    client = KalshiClient()
+    result = execute_farthest_band_trade(client=client, selection=selection, config=config)
+    return {
+        "spot": spot,
+        "ingest_run_id": ingest.get("id"),
+        "ingest_ts": ingest.get("ts"),
+        "event_ticker": ingest.get("event_ticker"),
+        "result": result,
+    }
+
+
+def _farthest_band_worker():
+    while not _farthest_auto_stop.is_set():
+        with _farthest_auto_lock:
+            cfg_dict = dict(_farthest_auto_state.get("config") or {})
+        if not cfg_dict:
+            break
+
+        config = FarthestBandConfig(**cfg_dict)
+        run_at = datetime.datetime.now(timezone.utc).isoformat()
+        try:
+            out = _run_farthest_band_once(config)
+        except Exception as exc:
+            out = {"action": "error", "reason": str(exc)}
+
+        with _farthest_auto_lock:
+            _farthest_auto_state["last_run_at"] = run_at
+            _farthest_auto_state["last_result"] = out
+
+        wait_seconds = max(int(config.interval_minutes) * 60, 60)
+        if _farthest_auto_stop.wait(timeout=wait_seconds):
+            break
+
+    with _farthest_auto_lock:
+        _farthest_auto_state["running"] = False
 
 
 def _parse_dollar_str_to_cents(value):
@@ -389,6 +491,127 @@ def get_portfolio_positions_debug():
     }
 
 
+@app.get("/strategy/farthest_band/preview")
+def strategy_farthest_band_preview(
+    side: str = "yes",
+    ask_min_cents: int = 95,
+    ask_max_cents: int = 99,
+    max_cost_cents: int = 500,
+):
+    config = FarthestBandConfig(
+        direction="lower",
+        side=side,
+        ask_min_cents=ask_min_cents,
+        ask_max_cents=ask_max_cents,
+        max_cost_cents=max_cost_cents,
+        mode="paper",
+    )
+    ingest = _latest_ingest_record()
+    if not ingest:
+        return {"error": "No ingest record found. Start ingest first."}
+
+    spot = KrakenClient().latest_btc_price().price
+    selection = select_farthest_band_market(
+        spot=spot,
+        markets=ingest.get("markets", []),
+        config=config,
+    )
+    return {
+        "spot": spot,
+        "ingest_run_id": ingest.get("id"),
+        "ingest_ts": ingest.get("ts"),
+        "event_ticker": ingest.get("event_ticker"),
+        "selection": selection,
+    }
+
+
+@app.get("/strategy/farthest_band/run")
+def strategy_farthest_band_run(
+    side: str = "yes",
+    ask_min_cents: int = 95,
+    ask_max_cents: int = 99,
+    max_cost_cents: int = 500,
+    mode: str = "paper",
+):
+    config = FarthestBandConfig(
+        direction="lower",
+        side=side,
+        ask_min_cents=ask_min_cents,
+        ask_max_cents=ask_max_cents,
+        max_cost_cents=max_cost_cents,
+        mode=mode,
+    )
+    try:
+        return _run_farthest_band_once(config)
+    except Exception as exc:
+        return {"action": "error", "reason": str(exc)}
+
+
+@app.get("/strategy/farthest_band/auto/start")
+def strategy_farthest_band_auto_start(
+    side: str = "yes",
+    ask_min_cents: int = 95,
+    ask_max_cents: int = 99,
+    max_cost_cents: int = 500,
+    mode: str = "paper",
+    interval_minutes: int = 15,
+):
+    global _farthest_auto_thread
+
+    config = FarthestBandConfig(
+        direction="lower",
+        side=side,
+        ask_min_cents=ask_min_cents,
+        ask_max_cents=ask_max_cents,
+        max_cost_cents=max_cost_cents,
+        mode=mode,
+        interval_minutes=interval_minutes,
+    )
+
+    with _farthest_auto_lock:
+        if _farthest_auto_thread and _farthest_auto_thread.is_alive():
+            return {
+                "running": True,
+                "message": "Auto strategy already running",
+                "state": _farthest_auto_state,
+            }
+
+        _farthest_auto_stop.clear()
+        _farthest_auto_state["running"] = True
+        _farthest_auto_state["config"] = config.__dict__.copy()
+        _farthest_auto_state["last_run_at"] = None
+        _farthest_auto_state["last_result"] = None
+        _farthest_auto_thread = threading.Thread(
+            target=_farthest_band_worker,
+            name="farthest-band-auto",
+            daemon=True,
+        )
+        _farthest_auto_thread.start()
+
+    return {
+        "running": True,
+        "message": "Auto strategy started",
+        "state": _farthest_auto_state,
+    }
+
+
+@app.get("/strategy/farthest_band/auto/stop")
+def strategy_farthest_band_auto_stop():
+    _farthest_auto_stop.set()
+    with _farthest_auto_lock:
+        _farthest_auto_state["running"] = False
+    return {"running": False, "message": "Auto strategy stop requested"}
+
+
+@app.get("/strategy/farthest_band/auto/status")
+def strategy_farthest_band_auto_status():
+    with _farthest_auto_lock:
+        thread_alive = bool(_farthest_auto_thread and _farthest_auto_thread.is_alive())
+        state = dict(_farthest_auto_state)
+        state["running"] = thread_alive
+    return state
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
     return """
@@ -513,6 +736,16 @@ def dashboard():
         padding: 12px;
         min-height: 260px;
       }
+      .side-stack {
+        display: grid;
+        gap: 12px;
+      }
+      .strategy-panel {
+        background: rgba(10, 16, 32, 0.6);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 12px;
+      }
       .portfolio-summary {
         font-size: 12px;
         color: var(--muted);
@@ -582,6 +815,10 @@ def dashboard():
       .btn:hover {
         background: rgba(244, 196, 48, 0.26);
       }
+      .btn.secondary {
+        background: rgba(255, 255, 255, 0.07);
+        color: var(--text);
+      }
       .btn.trade {
         padding: 4px 8px;
         font-size: 11px;
@@ -612,6 +849,67 @@ def dashboard():
       }
       .markets tr:last-child td {
         border-bottom: none;
+      }
+      .strategy-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+      }
+      .field {
+        display: grid;
+        gap: 4px;
+      }
+      .field label {
+        font-size: 11px;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+      }
+      .field input,
+      .field select {
+        width: 100%;
+        padding: 6px 8px;
+        border-radius: 8px;
+        border: 1px solid var(--border);
+        background: rgba(255, 255, 255, 0.06);
+        color: var(--text);
+        font-size: 12px;
+      }
+      .strategy-actions {
+        margin-top: 10px;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+      .strategy-status {
+        margin-top: 10px;
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .planned-order {
+        margin-top: 10px;
+        font-size: 12px;
+        color: var(--text);
+        background: rgba(255, 255, 255, 0.05);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 10px;
+        padding: 8px;
+        white-space: pre-wrap;
+      }
+      .candidate-list {
+        margin-top: 10px;
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .candidate-list table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+      .candidate-list th,
+      .candidate-list td {
+        text-align: left;
+        padding: 4px 2px;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
       }
       .stat {
         background: rgba(255, 255, 255, 0.04);
@@ -697,26 +995,75 @@ def dashboard():
                 </tbody>
               </table>
             </div>
-            <div class="portfolio-panel">
-              <div class="markets-header">
-                <h3>Current Portfolio</h3>
-                <button id="refresh-portfolio" class="btn" type="button">Refresh</button>
+            <div class="side-stack">
+              <div class="portfolio-panel">
+                <div class="markets-header">
+                  <h3>Current Portfolio</h3>
+                  <button id="refresh-portfolio" class="btn" type="button">Refresh</button>
+                </div>
+                <div id="portfolio-summary" class="portfolio-summary">No data loaded.</div>
+                <table class="portfolio-table">
+                  <thead>
+                    <tr>
+                      <th>Ticker</th>
+                      <th>Side</th>
+                      <th>Cost</th>
+                      <th>P/L</th>
+                      <th>Max</th>
+                    </tr>
+                  </thead>
+                  <tbody id="portfolio-body">
+                    <tr><td colspan="5">Click Refresh to load orders.</td></tr>
+                  </tbody>
+                </table>
               </div>
-              <div id="portfolio-summary" class="portfolio-summary">No data loaded.</div>
-              <table class="portfolio-table">
-                <thead>
-                  <tr>
-                    <th>Ticker</th>
-                    <th>Side</th>
-                    <th>Cost</th>
-                    <th>P/L</th>
-                    <th>Max</th>
-                  </tr>
-                </thead>
-                <tbody id="portfolio-body">
-                  <tr><td colspan="5">Click Refresh to load orders.</td></tr>
-                </tbody>
-              </table>
+              <div class="strategy-panel">
+                <div class="markets-header">
+                  <h3>Farthest Band Strategy</h3>
+                </div>
+                <div class="strategy-grid">
+                  <div class="field">
+                    <label for="strategy-mode">Mode</label>
+                    <select id="strategy-mode">
+                      <option value="paper" selected>paper</option>
+                      <option value="live">live</option>
+                    </select>
+                  </div>
+                  <div class="field">
+                    <label for="strategy-side">Side</label>
+                    <select id="strategy-side">
+                      <option value="yes" selected>yes</option>
+                      <option value="no">no</option>
+                    </select>
+                  </div>
+                  <div class="field">
+                    <label for="strategy-ask-min">Ask Min (c)</label>
+                    <input id="strategy-ask-min" type="number" min="1" max="99" value="95" />
+                  </div>
+                  <div class="field">
+                    <label for="strategy-ask-max">Ask Max (c)</label>
+                    <input id="strategy-ask-max" type="number" min="1" max="99" value="99" />
+                  </div>
+                  <div class="field">
+                    <label for="strategy-max-cost">Max Cost (c)</label>
+                    <input id="strategy-max-cost" type="number" min="1" value="500" />
+                  </div>
+                  <div class="field">
+                    <label for="strategy-interval">Auto Interval (min)</label>
+                    <input id="strategy-interval" type="number" min="1" value="15" />
+                  </div>
+                </div>
+                <div class="strategy-actions">
+                  <button id="strategy-preview" class="btn secondary" type="button">Preview</button>
+                  <button id="strategy-run" class="btn" type="button">Run Once</button>
+                  <button id="strategy-auto-start" class="btn" type="button">Auto Start</button>
+                  <button id="strategy-auto-status" class="btn secondary" type="button">Auto Status</button>
+                  <button id="strategy-auto-stop" class="btn secondary" type="button">Auto Stop</button>
+                </div>
+                <div id="strategy-status" class="strategy-status">Strategy idle.</div>
+                <div id="strategy-planned-order" class="planned-order">Planned order will appear after Preview.</div>
+                <div id="strategy-candidates" class="candidate-list"></div>
+              </div>
             </div>
           </div>
         </div>
@@ -737,6 +1084,20 @@ def dashboard():
       const refreshPortfolioBtn = document.getElementById("refresh-portfolio");
       const portfolioSummaryEl = document.getElementById("portfolio-summary");
       const portfolioBody = document.getElementById("portfolio-body");
+      const strategyModeEl = document.getElementById("strategy-mode");
+      const strategySideEl = document.getElementById("strategy-side");
+      const strategyAskMinEl = document.getElementById("strategy-ask-min");
+      const strategyAskMaxEl = document.getElementById("strategy-ask-max");
+      const strategyMaxCostEl = document.getElementById("strategy-max-cost");
+      const strategyIntervalEl = document.getElementById("strategy-interval");
+      const strategyPreviewBtn = document.getElementById("strategy-preview");
+      const strategyRunBtn = document.getElementById("strategy-run");
+      const strategyAutoStartBtn = document.getElementById("strategy-auto-start");
+      const strategyAutoStatusBtn = document.getElementById("strategy-auto-status");
+      const strategyAutoStopBtn = document.getElementById("strategy-auto-stop");
+      const strategyStatusEl = document.getElementById("strategy-status");
+      const strategyPlannedOrderEl = document.getElementById("strategy-planned-order");
+      const strategyCandidatesEl = document.getElementById("strategy-candidates");
 
       function resizeCanvas() {
         const rect = canvas.getBoundingClientRect();
@@ -924,6 +1285,145 @@ def dashboard():
         return `${sign}$${Math.abs(dollars).toFixed(2)}`;
       }
 
+      function strategyParams(includeMode = false, includeInterval = false) {
+        const params = new URLSearchParams();
+        params.set("side", strategySideEl.value || "yes");
+        params.set("ask_min_cents", String(Number(strategyAskMinEl.value || 95)));
+        params.set("ask_max_cents", String(Number(strategyAskMaxEl.value || 99)));
+        params.set("max_cost_cents", String(Number(strategyMaxCostEl.value || 500)));
+        if (includeMode) params.set("mode", strategyModeEl.value || "paper");
+        if (includeInterval) params.set("interval_minutes", String(Number(strategyIntervalEl.value || 15)));
+        return params.toString();
+      }
+
+      function renderStrategyCandidates(candidates) {
+        if (!candidates || !candidates.length) {
+          strategyCandidatesEl.innerHTML = "";
+          return;
+        }
+        const strikeText = (v) => {
+          const n = Number(v);
+          return Number.isFinite(n) ? n.toLocaleString("en-US", { style: "currency", currency: "USD" }) : "--";
+        };
+        const rows = candidates.map(c => `
+          <tr>
+            <td>${c.ticker || "--"}</td>
+            <td>${strikeText(c.strike)}</td>
+            <td>${c.ask_cents ?? "--"}c</td>
+            <td>${c.ask_band_distance_cents ?? "--"}c</td>
+          </tr>
+        `).join("");
+        strategyCandidatesEl.innerHTML = `
+          <div>Nearest candidates</div>
+          <table>
+            <thead>
+              <tr>
+                <th>Ticker</th>
+                <th>Strike</th>
+                <th>Ask</th>
+                <th>Band Gap</th>
+              </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+          </table>
+        `;
+      }
+
+      function renderStrategySelection(payload, label) {
+        const selection = payload?.selection || payload?.result?.selection || null;
+        const selected = selection?.selected || null;
+        const count = selection?.count ?? null;
+        const estCost = selection?.estimated_cost_cents ?? null;
+        const mode = strategyModeEl.value || "paper";
+        if (!selection) {
+          strategyPlannedOrderEl.textContent = "No strategy selection returned.";
+          strategyCandidatesEl.innerHTML = "";
+          return;
+        }
+        if (!selected) {
+          strategyPlannedOrderEl.textContent = `${label}: no exact match. ${selection.reason || ""}`;
+          renderStrategyCandidates(selection.nearest_candidates || []);
+          return;
+        }
+        const lines = [
+          `${label} (${mode})`,
+          `Ticker: ${selected.ticker}`,
+          `Strike: ${Number(selected.strike || 0).toLocaleString("en-US", { style: "currency", currency: "USD" })}`,
+          `Ask: ${selected.ask_cents}c (${selected.ask_key})`,
+          `Planned Count: ${count ?? "--"}`,
+          `Planned Cost: ${estCost !== null ? `${estCost}c / ${formatCents(estCost)}` : "--"}`,
+          `Expected Return: ${selected.expected_return_pct !== null && selected.expected_return_pct !== undefined ? `${(selected.expected_return_pct * 100).toFixed(2)}%` : "--"}`,
+        ];
+        strategyPlannedOrderEl.textContent = lines.join("\\n");
+        renderStrategyCandidates(selection.nearest_candidates || []);
+      }
+
+      async function strategyPreview() {
+        strategyStatusEl.textContent = "Previewing strategy...";
+        try {
+          const res = await fetch(`/strategy/farthest_band/preview?${strategyParams(false, false)}`);
+          const data = await res.json();
+          if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
+          strategyStatusEl.textContent = `Preview OK. Spot ${Number(data.spot || 0).toLocaleString("en-US", { style: "currency", currency: "USD" })}`;
+          renderStrategySelection(data, "Planned order");
+        } catch (err) {
+          strategyStatusEl.textContent = `Preview failed: ${err.message || "error"}`;
+        }
+      }
+
+      async function strategyRun() {
+        strategyStatusEl.textContent = `Running once (${strategyModeEl.value})...`;
+        try {
+          const res = await fetch(`/strategy/farthest_band/run?${strategyParams(true, false)}`);
+          const data = await res.json();
+          if (!res.ok || data.error || data.action === "error") throw new Error(data.error || data.reason || `HTTP ${res.status}`);
+          const action = data?.result?.action || data?.action || "ok";
+          strategyStatusEl.textContent = `Run complete: ${action}`;
+          renderStrategySelection(data, "Order placed/plan");
+        } catch (err) {
+          strategyStatusEl.textContent = `Run failed: ${err.message || "error"}`;
+        }
+      }
+
+      async function strategyAutoStart() {
+        strategyStatusEl.textContent = `Starting auto (${strategyModeEl.value})...`;
+        try {
+          const res = await fetch(`/strategy/farthest_band/auto/start?${strategyParams(true, true)}`);
+          const data = await res.json();
+          if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
+          strategyStatusEl.textContent = data.message || "Auto started";
+        } catch (err) {
+          strategyStatusEl.textContent = `Auto start failed: ${err.message || "error"}`;
+        }
+      }
+
+      async function strategyAutoStatus() {
+        strategyStatusEl.textContent = "Loading auto status...";
+        try {
+          const res = await fetch("/strategy/farthest_band/auto/status");
+          const data = await res.json();
+          if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
+          const mode = data?.config?.mode || strategyModeEl.value;
+          const running = data.running ? "running" : "stopped";
+          strategyStatusEl.textContent = `Auto ${running} (${mode}). Last run: ${data.last_run_at || "n/a"}`;
+          if (data.last_result) renderStrategySelection(data.last_result, "Last auto plan");
+        } catch (err) {
+          strategyStatusEl.textContent = `Auto status failed: ${err.message || "error"}`;
+        }
+      }
+
+      async function strategyAutoStop() {
+        strategyStatusEl.textContent = "Stopping auto...";
+        try {
+          const res = await fetch("/strategy/farthest_band/auto/stop");
+          const data = await res.json();
+          if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
+          strategyStatusEl.textContent = data.message || "Auto stopped";
+        } catch (err) {
+          strategyStatusEl.textContent = `Auto stop failed: ${err.message || "error"}`;
+        }
+      }
+
       async function refreshPortfolio() {
         portfolioSummaryEl.textContent = "Loading portfolio...";
         try {
@@ -967,10 +1467,16 @@ def dashboard():
       refreshChart();
       refreshMarketsBtn.addEventListener("click", refreshMarkets);
       refreshPortfolioBtn.addEventListener("click", refreshPortfolio);
+      strategyPreviewBtn.addEventListener("click", strategyPreview);
+      strategyRunBtn.addEventListener("click", strategyRun);
+      strategyAutoStartBtn.addEventListener("click", strategyAutoStart);
+      strategyAutoStatusBtn.addEventListener("click", strategyAutoStatus);
+      strategyAutoStopBtn.addEventListener("click", strategyAutoStop);
       setInterval(() => {
         refresh();
         refreshChart();
       }, 1000);
+      strategyPreview();
       window.addEventListener("resize", refreshChart);
     </script>
   </body>

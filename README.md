@@ -14,6 +14,12 @@ The dashboard shows:
 - Latest Kalshi markets for the current event
 - One-click YES/NO buttons per market with a configurable max cost (cents)
 - Current portfolio panel with balance and open positions (cost, P/L, max payout) and refresh button
+- Strategy panel for farthest-band execution:
+  - `paper` or `live` mode toggle
+  - Configurable side, ask band (`95-99c` default), max cost, and auto interval
+  - Preview of planned order (ticker, strike, ask, count, planned cost, expected return)
+  - Nearest candidate list when no exact ask-band match exists
+  - Run once + auto start/status/stop controls
 
 
 ## Highlights
@@ -74,8 +80,6 @@ python -m src.api
   - Returns the most recent Kalshi ingest snapshots (last 2 hours).
 - `GET /kalshi_ingest/last_hour`
   - Returns BTC price samples for the last hour.
-- `GET /kalshi/place_yes_ask_order`
-  - Places a sample YES order at the ask (real order if keys are live). Use with caution.
 - `GET /kalshi/place_best_ask_order?side=yes|no&ticker=...&max_cost_cents=...`
   - Places a best-ask limit order for YES/NO based on the current order book.
 - `GET /kalshi/portfolio/balance`
@@ -84,8 +88,20 @@ python -m src.api
   - Returns current orders (filter with `status`, `ticker`, `limit`).
 - `GET /kalshi/portfolio/current`
   - Returns portfolio balance and current positions/orders with estimated cost, mark-based P/L, and max payout.
-- `GET /kalshi/portfolio/net_profit`
-  - Returns net profit across all settled transactions (payout - cost - fees).
+- `GET /kalshi/portfolio/positions_debug`
+  - Returns raw positions payload plus a small sample for debugging field mappings.
+- `GET /strategy/farthest_band/preview?side=yes|no&ask_min_cents=95&ask_max_cents=99&max_cost_cents=500`
+  - Uses latest spot + latest ingest snapshot to show the planned order (lower-direction strategy only).
+  - If no exact band match exists, returns nearest candidates.
+- `GET /strategy/farthest_band/run?side=yes|no&ask_min_cents=95&ask_max_cents=99&max_cost_cents=500&mode=paper|live`
+  - Executes one strategy cycle immediately.
+  - `mode=paper` returns planned action only; `mode=live` places a real order.
+- `GET /strategy/farthest_band/auto/start?side=yes|no&ask_min_cents=95&ask_max_cents=99&max_cost_cents=500&mode=paper|live&interval_minutes=15`
+  - Starts background auto-execution on interval (default 15 minutes).
+- `GET /strategy/farthest_band/auto/status`
+  - Returns running state, active config, last run time, and last result.
+- `GET /strategy/farthest_band/auto/stop`
+  - Stops background auto-execution.
 
 
 ## Repository Layout
