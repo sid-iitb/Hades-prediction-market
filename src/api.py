@@ -1,4 +1,5 @@
 import datetime
+import json
 import os
 import sqlite3
 import threading
@@ -45,6 +46,161 @@ DEFAULT_DB_PATH = os.path.join(
 
 def get_db_path():
     return os.getenv("KALSHI_DB_PATH") or DEFAULT_DB_PATH
+
+
+def _open_ledger_db():
+    db_path = get_db_path()
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _ensure_trade_ledger(conn):
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS trade_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            source TEXT,
+            run_mode TEXT,
+            action TEXT,
+            side TEXT,
+            ticker TEXT,
+            price_cents INTEGER,
+            count INTEGER,
+            cost_cents INTEGER,
+            status_code INTEGER,
+            success INTEGER,
+            note TEXT,
+            payload_json TEXT
+        )
+        """
+    )
+    conn.commit()
+
+
+def _log_trade_ledger(
+    source: str,
+    run_mode: str | None,
+    action: str | None,
+    side: str | None,
+    ticker: str | None,
+    price_cents: int | None,
+    count: int | None,
+    status_code: int | None = None,
+    success: bool | None = None,
+    note: str | None = None,
+    payload: dict | list | str | None = None,
+):
+    cost_cents = int(price_cents * count) if isinstance(price_cents, int) and isinstance(count, int) else None
+    payload_json = None
+    if payload is not None:
+        try:
+            payload_json = json.dumps(payload)
+        except Exception:
+            payload_json = str(payload)
+    conn = _open_ledger_db()
+    try:
+        _ensure_trade_ledger(conn)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO trade_ledger (
+                ts, source, run_mode, action, side, ticker, price_cents, count, cost_cents,
+                status_code, success, note, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                datetime.datetime.now(timezone.utc).isoformat(),
+                source,
+                run_mode,
+                action,
+                side,
+                ticker,
+                price_cents,
+                count,
+                cost_cents,
+                status_code,
+                1 if success is True else (0 if success is False else None),
+                note,
+                payload_json,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _maybe_int(v):
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except Exception:
+        return None
+
+
+def _record_strategy_ledger(out: dict, source: str):
+    cycle = (out or {}).get("result") or {}
+    spot = (out or {}).get("spot")
+    mode_hint = (
+        cycle.get("entry", {}).get("mode")
+        or cycle.get("reentry", {}).get("mode")
+        or cycle.get("exit", {}).get("mode")
+        or None
+    )
+
+    entry = cycle.get("entry")
+    if isinstance(entry, dict) and entry.get("active_position"):
+        ap = entry.get("active_position") or {}
+        _log_trade_ledger(
+            source=source,
+            run_mode=entry.get("mode") or mode_hint,
+            action="buy",
+            side=ap.get("side"),
+            ticker=ap.get("ticker"),
+            price_cents=_maybe_int(ap.get("entry_price_cents")),
+            count=_maybe_int(ap.get("count")),
+            status_code=_maybe_int(entry.get("status_code")),
+            success=(entry.get("mode") != "live") or (_maybe_int(entry.get("status_code")) in {200, 201}),
+            note=f"strategy_action={cycle.get('action')} spot={spot}",
+            payload=entry,
+        )
+
+    if cycle.get("action") == "stop_loss_rotate":
+        exited = cycle.get("exited_position") or {}
+        exit_leg = cycle.get("exit") or {}
+        _log_trade_ledger(
+            source=source,
+            run_mode=exit_leg.get("mode") or mode_hint,
+            action="sell",
+            side=exited.get("side"),
+            ticker=exited.get("ticker"),
+            price_cents=_maybe_int(exit_leg.get("exit_price_cents")),
+            count=_maybe_int(exited.get("count")),
+            status_code=_maybe_int(exit_leg.get("status_code")),
+            success=(exit_leg.get("mode") != "live") or (_maybe_int(exit_leg.get("status_code")) in {200, 201}),
+            note=f"stop_loss pnl_pct={cycle.get('pnl_pct')}",
+            payload=exit_leg,
+        )
+        reentry = cycle.get("reentry") or {}
+        ap = reentry.get("active_position") or {}
+        if ap:
+            _log_trade_ledger(
+                source=source,
+                run_mode=reentry.get("mode") or mode_hint,
+                action="buy",
+                side=ap.get("side"),
+                ticker=ap.get("ticker"),
+                price_cents=_maybe_int(ap.get("entry_price_cents")),
+                count=_maybe_int(ap.get("count")),
+                status_code=_maybe_int(reentry.get("status_code")),
+                success=(reentry.get("mode") != "live") or (_maybe_int(reentry.get("status_code")) in {200, 201}),
+                note="stop_loss_reentry_further",
+                payload=reentry,
+            )
 
 
 _ingest_thread: threading.Thread | None = None
@@ -273,6 +429,7 @@ def _farthest_band_worker():
                 out = _run_farthest_band_once(config, active_position=active_position)
             except Exception as exc:
                 out = {"action": "error", "reason": str(exc)}
+            _record_strategy_ledger(out, source="/strategy/farthest_band/auto")
 
             if is_scheduled_run:
                 interval_seconds = max(int(config.interval_minutes) * 60, 60)
@@ -309,6 +466,7 @@ def _parse_dollar_str_to_cents(value):
 @app.get("/kalshi/place_best_ask_order")
 def place_best_ask_order(side: str, ticker: str, max_cost_cents: int = 500):
     client = KalshiClient()
+    resp = None
     if side.lower() == "yes":
         resp = client.place_yes_limit_at_best_ask(
             ticker=ticker,
@@ -326,6 +484,27 @@ def place_best_ask_order(side: str, ticker: str, max_cost_cents: int = 500):
         body = resp.json()
     except Exception:
         body = resp.text
+    body_obj = body if isinstance(body, dict) else {}
+    price_cents = _maybe_int(
+        body_obj.get("yes_price")
+        or body_obj.get("no_price")
+        or body_obj.get("price")
+        or body_obj.get("limit_price")
+    )
+    count = _maybe_int(body_obj.get("count") or body_obj.get("quantity") or body_obj.get("filled_count"))
+    _log_trade_ledger(
+        source="/kalshi/place_best_ask_order",
+        run_mode="live",
+        action="buy",
+        side=str(side).lower(),
+        ticker=ticker,
+        price_cents=price_cents,
+        count=count,
+        status_code=resp.status_code if resp is not None else None,
+        success=bool(resp is not None and resp.status_code in {200, 201}),
+        note=f"max_cost_cents={max_cost_cents}",
+        payload=body,
+    )
     return {"status_code": resp.status_code, "response": body}
 
 
@@ -585,6 +764,7 @@ def strategy_farthest_band_run(
             else:
                 active_position = None
         out = _run_farthest_band_once(config, active_position=active_position)
+        _record_strategy_ledger(out, source="/strategy/farthest_band/run")
         with _farthest_auto_lock:
             _farthest_auto_state["active_position"] = out.get("active_position")
             _farthest_auto_state["active_position_mode"] = cfg_mode if out.get("active_position") else None
@@ -676,6 +856,28 @@ def strategy_farthest_band_auto_status():
         state = dict(_farthest_auto_state)
         state["running"] = thread_alive
     return state
+
+
+@app.get("/ledger/trades")
+def get_trade_ledger(limit: int = 200):
+    limit = max(1, min(int(limit), 2000))
+    conn = _open_ledger_db()
+    try:
+        _ensure_trade_ledger(conn)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, ts, source, run_mode, action, side, ticker, price_cents, count,
+                   cost_cents, status_code, success, note, payload_json
+            FROM trade_ledger
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return {"records": [dict(r) for r in cur.fetchall()]}
+    finally:
+        conn.close()
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
@@ -819,6 +1021,35 @@ def dashboard():
         width: 100%;
         border-collapse: collapse;
         font-size: 12px;
+      }
+      .ledger-panel {
+        background: rgba(10, 16, 32, 0.6);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 12px;
+      }
+      .ledger-table-wrap {
+        max-height: 260px;
+        overflow-y: auto;
+      }
+      .ledger-table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 12px;
+      }
+      .ledger-table th,
+      .ledger-table td {
+        padding: 6px 4px;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+        text-align: left;
+        white-space: nowrap;
+      }
+      .ledger-table th {
+        color: var(--muted);
+        font-weight: 600;
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
       }
       .portfolio-table th,
       .portfolio-table td {
@@ -1162,6 +1393,33 @@ def dashboard():
               </tbody>
             </table>
           </div>
+          <div class="ledger-panel">
+            <div class="markets-header">
+              <h3>Trade Ledger</h3>
+              <button id="refresh-ledger" class="btn" type="button">Refresh</button>
+            </div>
+            <div class="ledger-table-wrap">
+              <table class="ledger-table">
+                <thead>
+                  <tr>
+                    <th>Time</th>
+                    <th>Source</th>
+                    <th>Action</th>
+                    <th>Side</th>
+                    <th>Ticker</th>
+                    <th>Price</th>
+                    <th>Count</th>
+                    <th>Cost</th>
+                    <th>Status</th>
+                    <th>Note</th>
+                  </tr>
+                </thead>
+                <tbody id="ledger-body">
+                  <tr><td colspan="10">Click Refresh to load ledger.</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -1180,6 +1438,8 @@ def dashboard():
       const refreshPortfolioBtn = document.getElementById("refresh-portfolio");
       const portfolioSummaryEl = document.getElementById("portfolio-summary");
       const portfolioBody = document.getElementById("portfolio-body");
+      const refreshLedgerBtn = document.getElementById("refresh-ledger");
+      const ledgerBody = document.getElementById("ledger-body");
       const strategyModeEl = document.getElementById("strategy-mode");
       const strategySideEl = document.getElementById("strategy-side");
       const strategyAskMinEl = document.getElementById("strategy-ask-min");
@@ -1546,6 +1806,7 @@ def dashboard():
           strategyStatusEl.textContent = `Run complete: ${action}`;
           renderStrategySelection(data, "Order placed/plan");
           refreshPortfolio();
+          refreshLedger();
         } catch (err) {
           strategyStatusEl.textContent = `Run failed: ${err.message || "error"}`;
         }
@@ -1635,10 +1896,54 @@ def dashboard():
         }
       }
 
+      async function refreshLedger() {
+        ledgerBody.innerHTML = "<tr><td colspan=\\"10\\">Loading ledger...</td></tr>";
+        try {
+          const res = await fetch("/ledger/trades?limit=50");
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const data = await res.json();
+          const records = data.records || [];
+          if (!records.length) {
+            ledgerBody.innerHTML = "<tr><td colspan=\\"10\\">No ledger records.</td></tr>";
+            return;
+          }
+          const rows = records.map(r => {
+            const ts = r.ts || "--";
+            const source = r.source || "--";
+            const action = r.action || "--";
+            const side = r.side || "--";
+            const ticker = r.ticker || "--";
+            const price = r.price_cents !== null && r.price_cents !== undefined ? `${r.price_cents}c` : "--";
+            const count = r.count ?? "--";
+            const cost = r.cost_cents !== null && r.cost_cents !== undefined ? formatCents(r.cost_cents) : "--";
+            const status = r.status_code ?? "--";
+            const note = r.note || "--";
+            return `
+              <tr>
+                <td>${ts}</td>
+                <td>${source}</td>
+                <td>${action}</td>
+                <td>${String(side).toUpperCase()}</td>
+                <td>${ticker}</td>
+                <td>${price}</td>
+                <td>${count}</td>
+                <td>${cost}</td>
+                <td>${status}</td>
+                <td>${note}</td>
+              </tr>
+            `;
+          }).join("");
+          ledgerBody.innerHTML = rows;
+        } catch (err) {
+          ledgerBody.innerHTML = "<tr><td colspan=\\"10\\">Error loading ledger.</td></tr>";
+        }
+      }
+
       refresh();
       refreshChart();
       refreshMarketsBtn.addEventListener("click", refreshMarkets);
       refreshPortfolioBtn.addEventListener("click", refreshPortfolio);
+      refreshLedgerBtn.addEventListener("click", refreshLedger);
       strategyPreviewBtn.addEventListener("click", strategyPreview);
       strategyRunBtn.addEventListener("click", strategyRun);
       strategyAutoStartBtn.addEventListener("click", strategyAutoStart);
@@ -1653,6 +1958,7 @@ def dashboard():
         strategyAutoStatus(true);
       }, 1000);
       strategyPreview();
+      refreshLedger();
       window.addEventListener("resize", refreshChart);
     </script>
   </body>

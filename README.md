@@ -23,6 +23,9 @@ The dashboard shows:
   - Preview of planned order (ticker, strike, ask, count, planned cost, expected return)
   - Nearest candidate list when no exact ask-band match exists
   - Run once + auto start/status/stop controls
+- Trade Ledger panel:
+  - Shows recent buy/sell calls from direct and strategy routes
+  - Includes a dedicated refresh button to reload latest entries
 
 
 ## Highlights
@@ -30,6 +33,7 @@ The dashboard shows:
 - Kalshi market discovery for the current hour.
 - Continuous ingest pipeline with SQLite storage.
 - FastAPI service with JSON endpoints and a built-in dashboard.
+- Persistent trade ledger in SQLite for buy/sell calls (timestamp, price, side, ticker, status, payload).
 
 ## Requirements
 - Python 3.11+
@@ -110,6 +114,9 @@ python -m src.api
   - Returns running state, active config, last run time, and last result.
 - `GET /strategy/farthest_band/auto/stop`
   - Stops background auto-execution.
+- `GET /ledger/trades?limit=200`
+  - Returns the latest ledger records for buy/sell calls from direct order route and strategy runs/auto cycles.
+  - Fields include timestamp, action, side, ticker, price/count/cost, status, source, and payload snapshot.
 
 
 ## Repository Layout
