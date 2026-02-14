@@ -55,14 +55,14 @@ Copy your `.env` file and set:
 - `KALSHI_API_KEY`
 - `KALSHI_PRIVATE_KEY`
 - `KALSHI_BASE_URL`
+- `KALSHI_DB_PATH`
 - `OPENAI_API_KEY` (optional, future use)
 - `XAI_API_KEY` (optional, future use)
 
 Notes:
 - `KALSHI_PRIVATE_KEY` should point to your private key PEM.
+- set `KALSHI_DB_PATH` to override the default SQLite path.
 - Do not commit secrets. `.env` is already ignored by git.
-- Optional: set `KALSHI_DB_PATH` to override the default SQLite path.
-- Optional: set `KALSHI_AUTO_INGEST=false` to disable auto-starting the ingest loop when the API boots.
 
 
 
