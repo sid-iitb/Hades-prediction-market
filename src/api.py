@@ -458,8 +458,13 @@ def _farthest_band_worker():
                 _farthest_auto_state["active_position"] = out.get("active_position")
                 _farthest_auto_state["active_position_mode"] = cfg_mode if out.get("active_position") else None
 
-        # Risk checks run every 5 minutes while auto mode is running.
-        if _farthest_auto_stop.wait(timeout=300):
+        # Wake at the earlier of:
+        # - next scheduled interval execution
+        # - 5-minute risk-check cadence
+        now_after = datetime.datetime.now(timezone.utc)
+        seconds_until_schedule = max(1, int((next_scheduled_at - now_after).total_seconds()))
+        wait_seconds = min(300, seconds_until_schedule)
+        if _farthest_auto_stop.wait(timeout=wait_seconds):
             break
 
     with _farthest_auto_lock:
