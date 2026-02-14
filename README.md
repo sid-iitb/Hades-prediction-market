@@ -18,6 +18,7 @@ The dashboard shows:
   - `paper` or `live` mode toggle
   - Configurable side, ask band (`95-99c` default), max cost, and auto interval
   - Active position tracking with stop-loss rotation: if mark drops below `-20%`, strategy exits and attempts to rebuy a farther strike
+  - Event rollover handling: when ingest switches to a new hourly event ticker, strategy exits stale ticker and re-enters using latest event markets
   - Live auto-schedule countdown with progress bar (time remaining until next cycle)
   - 1-second preview refresh showing the next probable order continuously
   - Preview of planned order (ticker, strike, ask, count, planned cost, expected return)
@@ -117,6 +118,31 @@ python -m src.api
 - `GET /ledger/trades?limit=200`
   - Returns the latest ledger records for buy/sell calls from direct order route and strategy runs/auto cycles.
   - Fields include timestamp, action, side, ticker, price/count/cost, status, source, and payload snapshot.
+
+## Stop-Loss Behavior
+- Threshold:
+  - Triggered when unrealized PnL is `<= -20%` from entry price.
+  - PnL formula: `(mark_price_cents - entry_price_cents) / entry_price_cents`.
+- Mark source:
+  - YES positions use `yes_bid` (fallback `yes_ask`).
+  - NO positions use `no_bid` (fallback `no_ask`).
+- `Preview`:
+  - Selection only, no orders, no stop-loss actions.
+- `Run Once`:
+  - If no active tracked position, enters selected candidate.
+  - If active position exists, evaluates stop-loss; on trigger, exits then re-enters farther strike.
+  - With `force_new_order=1`, ignores active tracked state and enters fresh immediately.
+- `Auto`:
+  - Scheduled interval runs follow `interval_minutes`.
+  - Stop-loss checks run every 5 minutes while auto is active.
+  - On trigger, exits active position and re-enters a farther candidate.
+  - On hourly event rollover, exits stale ticker and re-enters from latest ingest markets.
+- Execution modes:
+  - `paper`: decision path only, no exchange order.
+  - `live`: real Kalshi orders are submitted for exit/re-entry.
+- Visibility:
+  - Every buy/sell leg (run, auto, and direct order route) is written to `trade_ledger`.
+  - Use `GET /ledger/trades` or the dashboard Trade Ledger panel to verify actions.
 
 
 ## Repository Layout

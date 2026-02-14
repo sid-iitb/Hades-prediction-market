@@ -16,6 +16,7 @@ class FarthestBandConfig:
     mode: str = "paper"  # "paper" or "live"
     interval_minutes: int = 15
     stop_loss_pct: float = 0.20
+    rebalance_each_interval: bool = True
 
 
 def _safe_json(resp):
@@ -320,11 +321,66 @@ def run_farthest_band_cycle(
     markets: list[dict],
     config: FarthestBandConfig,
     active_position: dict | None = None,
+    force_rebalance: bool = False,
 ) -> dict:
     active = dict(active_position) if active_position else None
     stop_loss_pct = abs(float(config.stop_loss_pct))
+    current_tickers = {str(m.get("ticker")) for m in (markets or []) if m.get("ticker")}
 
     if active:
+        if force_rebalance:
+            exit_result = _exit_position(client, active, config, reason="scheduled_rebalance_exit")
+            if str(config.mode).lower() == "live" and exit_result.get("action") == "hold":
+                return {
+                    "action": "hold_active",
+                    "reason": "Scheduled rebalance due but exit could not be placed",
+                    "exit": exit_result,
+                    "active_position": active,
+                }
+            selection = select_farthest_band_market(spot=spot, markets=markets, config=config)
+            entry = _enter_position(
+                client=client,
+                selection=selection,
+                config=config,
+                spot=spot,
+                reason="scheduled_rebalance_reenter",
+            )
+            return {
+                "action": "scheduled_rebalance",
+                "reason": "Scheduled interval rebalance",
+                "exited_position": active,
+                "exit": exit_result,
+                "entry": entry,
+                "active_position": entry.get("active_position"),
+            }
+
+        # If the active ticker is not in the latest ingest market set, roll to current event.
+        if str(active.get("ticker")) not in current_tickers:
+            exit_result = _exit_position(client, active, config, reason="rollover_exit_stale_ticker")
+            if str(config.mode).lower() == "live" and exit_result.get("action") == "hold":
+                return {
+                    "action": "hold_active",
+                    "reason": "Active ticker stale but live exit could not be placed",
+                    "exit": exit_result,
+                    "active_position": active,
+                }
+            selection = select_farthest_band_market(spot=spot, markets=markets, config=config)
+            entry = _enter_position(
+                client=client,
+                selection=selection,
+                config=config,
+                spot=spot,
+                reason="rollover_reenter_latest_event",
+            )
+            return {
+                "action": "rollover_reenter",
+                "reason": "Active ticker not present in latest ingest markets",
+                "exited_position": active,
+                "exit": exit_result,
+                "entry": entry,
+                "active_position": entry.get("active_position"),
+            }
+
         mark_state = _mark_price_and_pnl(client, active)
         pnl_pct = mark_state.get("pnl_pct")
         if pnl_pct is not None and pnl_pct <= -stop_loss_pct:

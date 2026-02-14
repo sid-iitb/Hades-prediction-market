@@ -169,7 +169,7 @@ def _record_strategy_ledger(out: dict, source: str):
             payload=entry,
         )
 
-    if cycle.get("action") == "stop_loss_rotate":
+    if cycle.get("action") in {"stop_loss_rotate", "rollover_reenter", "scheduled_rebalance"}:
         exited = cycle.get("exited_position") or {}
         exit_leg = cycle.get("exit") or {}
         _log_trade_ledger(
@@ -185,7 +185,7 @@ def _record_strategy_ledger(out: dict, source: str):
             note=f"stop_loss pnl_pct={cycle.get('pnl_pct')}",
             payload=exit_leg,
         )
-        reentry = cycle.get("reentry") or {}
+        reentry = cycle.get("reentry") or cycle.get("entry") or {}
         ap = reentry.get("active_position") or {}
         if ap:
             _log_trade_ledger(
@@ -198,7 +198,7 @@ def _record_strategy_ledger(out: dict, source: str):
                 count=_maybe_int(ap.get("count")),
                 status_code=_maybe_int(reentry.get("status_code")),
                 success=(reentry.get("mode") != "live") or (_maybe_int(reentry.get("status_code")) in {200, 201}),
-                note="stop_loss_reentry_further",
+                note="reentry_after_exit",
                 payload=reentry,
             )
 
@@ -377,7 +377,11 @@ def _latest_ingest_record():
         conn.close()
 
 
-def _run_farthest_band_once(config: FarthestBandConfig, active_position: dict | None = None):
+def _run_farthest_band_once(
+    config: FarthestBandConfig,
+    active_position: dict | None = None,
+    force_rebalance: bool = False,
+):
     ingest = _latest_ingest_record()
     if not ingest:
         return {"action": "hold", "reason": "No ingest record found", "active_position": active_position}
@@ -392,6 +396,7 @@ def _run_farthest_band_once(config: FarthestBandConfig, active_position: dict | 
         markets=markets,
         config=config,
         active_position=active_position,
+        force_rebalance=force_rebalance,
     )
     return {
         "spot": spot,
@@ -426,7 +431,16 @@ def _farthest_band_worker():
         if should_run:
             run_at = datetime.datetime.now(timezone.utc).isoformat()
             try:
-                out = _run_farthest_band_once(config, active_position=active_position)
+                force_rebalance = bool(
+                    is_scheduled_run
+                    and active_position
+                    and bool(getattr(config, "rebalance_each_interval", True))
+                )
+                out = _run_farthest_band_once(
+                    config,
+                    active_position=active_position,
+                    force_rebalance=force_rebalance,
+                )
             except Exception as exc:
                 out = {"action": "error", "reason": str(exc)}
             _record_strategy_ledger(out, source="/strategy/farthest_band/auto")
@@ -1012,6 +1026,11 @@ def dashboard():
         border-radius: 14px;
         padding: 12px;
       }
+      .strategy-stack {
+        display: grid;
+        gap: 12px;
+        align-content: start;
+      }
       .portfolio-summary {
         font-size: 12px;
         color: var(--muted);
@@ -1181,6 +1200,15 @@ def dashboard():
         font-size: 12px;
         color: var(--muted);
       }
+      .auto-trade-badge {
+        margin-top: 8px;
+        font-size: 12px;
+        color: var(--text);
+        background: rgba(255, 255, 255, 0.05);
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        border-radius: 10px;
+        padding: 8px;
+      }
       .strategy-schedule {
         margin-top: 8px;
       }
@@ -1318,58 +1346,102 @@ def dashboard():
                 </tbody>
               </table>
             </div>
-            <div class="strategy-panel">
-              <div class="markets-header">
-                <h3>Farthest Band Strategy</h3>
+            <div class="strategy-stack">
+              <div class="strategy-panel">
+                <div class="markets-header">
+                  <h3>Farthest Strategy: Manual</h3>
+                </div>
+                <div class="strategy-grid">
+                  <div class="field">
+                    <label for="manual-strategy-mode">Mode</label>
+                    <select id="manual-strategy-mode">
+                      <option value="paper" selected>paper</option>
+                      <option value="live">live</option>
+                    </select>
+                  </div>
+                  <div class="field">
+                    <label for="manual-strategy-side">Side</label>
+                    <select id="manual-strategy-side">
+                      <option value="yes" selected>yes</option>
+                      <option value="no">no</option>
+                    </select>
+                  </div>
+                  <div class="field">
+                    <label for="manual-strategy-ask-min">Ask Min (c)</label>
+                    <input id="manual-strategy-ask-min" type="number" min="1" max="99" value="95" />
+                  </div>
+                  <div class="field">
+                    <label for="manual-strategy-ask-max">Ask Max (c)</label>
+                    <input id="manual-strategy-ask-max" type="number" min="1" max="99" value="99" />
+                  </div>
+                  <div class="field">
+                    <label for="manual-strategy-max-cost">Max Cost (c)</label>
+                    <input id="manual-strategy-max-cost" type="number" min="1" value="500" />
+                  </div>
+                  <div class="field">
+                    <label for="manual-strategy-interval">Auto Interval (min)</label>
+                    <input id="manual-strategy-interval" type="number" min="1" value="15" />
+                  </div>
+                </div>
+                <div class="strategy-actions">
+                  <button id="strategy-preview" class="btn secondary" type="button">Preview</button>
+                  <button id="strategy-run" class="btn" type="button">Run Once</button>
+                </div>
+                <div id="manual-strategy-planned-order" class="planned-order">Manual planned order will appear after Preview.</div>
+                <div id="manual-strategy-candidates" class="candidate-list"></div>
               </div>
-              <div class="strategy-grid">
-                <div class="field">
-                  <label for="strategy-mode">Mode</label>
-                  <select id="strategy-mode">
-                    <option value="paper" selected>paper</option>
-                    <option value="live">live</option>
-                  </select>
+              <div class="strategy-panel">
+                <div class="markets-header">
+                  <h3>Farthest Strategy: Auto</h3>
                 </div>
-                <div class="field">
-                  <label for="strategy-side">Side</label>
-                  <select id="strategy-side">
-                    <option value="yes" selected>yes</option>
-                    <option value="no">no</option>
-                  </select>
+                <div class="strategy-grid">
+                  <div class="field">
+                    <label for="strategy-mode">Mode</label>
+                    <select id="strategy-mode">
+                      <option value="paper" selected>paper</option>
+                      <option value="live">live</option>
+                    </select>
+                  </div>
+                  <div class="field">
+                    <label for="strategy-side">Side</label>
+                    <select id="strategy-side">
+                      <option value="yes" selected>yes</option>
+                      <option value="no">no</option>
+                    </select>
+                  </div>
+                  <div class="field">
+                    <label for="strategy-ask-min">Ask Min (c)</label>
+                    <input id="strategy-ask-min" type="number" min="1" max="99" value="95" />
+                  </div>
+                  <div class="field">
+                    <label for="strategy-ask-max">Ask Max (c)</label>
+                    <input id="strategy-ask-max" type="number" min="1" max="99" value="99" />
+                  </div>
+                  <div class="field">
+                    <label for="strategy-max-cost">Max Cost (c)</label>
+                    <input id="strategy-max-cost" type="number" min="1" value="500" />
+                  </div>
+                  <div class="field">
+                    <label for="strategy-interval">Auto Interval (min)</label>
+                    <input id="strategy-interval" type="number" min="1" value="15" />
+                  </div>
                 </div>
-                <div class="field">
-                  <label for="strategy-ask-min">Ask Min (c)</label>
-                  <input id="strategy-ask-min" type="number" min="1" max="99" value="95" />
+                <div class="strategy-actions">
+                  <button id="strategy-auto-start" class="btn" type="button">Auto Start</button>
+                  <button id="strategy-auto-status" class="btn secondary" type="button">Auto Status</button>
+                  <button id="strategy-auto-stop" class="btn secondary" type="button">Auto Stop</button>
                 </div>
-                <div class="field">
-                  <label for="strategy-ask-max">Ask Max (c)</label>
-                  <input id="strategy-ask-max" type="number" min="1" max="99" value="99" />
+                <div id="strategy-status" class="strategy-status">Strategy idle.</div>
+                <div id="auto-last-trade-badge" class="auto-trade-badge">Last Auto Trade: none yet.</div>
+                <div class="strategy-schedule">
+                  <div id="strategy-next-run" class="strategy-next-run">Next schedule: --</div>
+                  <div class="progress-track">
+                    <div id="strategy-progress-fill" class="progress-fill"></div>
+                  </div>
                 </div>
-                <div class="field">
-                  <label for="strategy-max-cost">Max Cost (c)</label>
-                  <input id="strategy-max-cost" type="number" min="1" value="500" />
-                </div>
-                <div class="field">
-                  <label for="strategy-interval">Auto Interval (min)</label>
-                  <input id="strategy-interval" type="number" min="1" value="15" />
-                </div>
+                <div id="auto-strategy-planned-order" class="planned-order">Auto plan will appear after Auto Status.</div>
+                <div id="auto-strategy-candidates" class="candidate-list"></div>
               </div>
-              <div class="strategy-actions">
-                <button id="strategy-preview" class="btn secondary" type="button">Preview</button>
-                <button id="strategy-run" class="btn" type="button">Run Once</button>
-                <button id="strategy-auto-start" class="btn" type="button">Auto Start</button>
-                <button id="strategy-auto-status" class="btn secondary" type="button">Auto Status</button>
-                <button id="strategy-auto-stop" class="btn secondary" type="button">Auto Stop</button>
-              </div>
-              <div id="strategy-status" class="strategy-status">Strategy idle.</div>
-              <div class="strategy-schedule">
-                <div id="strategy-next-run" class="strategy-next-run">Next schedule: --</div>
-                <div class="progress-track">
-                  <div id="strategy-progress-fill" class="progress-fill"></div>
-                </div>
-              </div>
-              <div id="strategy-planned-order" class="planned-order">Planned order will appear after Preview.</div>
-              <div id="strategy-candidates" class="candidate-list"></div>
             </div>
           </div>
           <div class="portfolio-panel">
@@ -1446,18 +1518,45 @@ def dashboard():
       const strategyAskMaxEl = document.getElementById("strategy-ask-max");
       const strategyMaxCostEl = document.getElementById("strategy-max-cost");
       const strategyIntervalEl = document.getElementById("strategy-interval");
+      const manualStrategyModeEl = document.getElementById("manual-strategy-mode");
+      const manualStrategySideEl = document.getElementById("manual-strategy-side");
+      const manualStrategyAskMinEl = document.getElementById("manual-strategy-ask-min");
+      const manualStrategyAskMaxEl = document.getElementById("manual-strategy-ask-max");
+      const manualStrategyMaxCostEl = document.getElementById("manual-strategy-max-cost");
+      const manualStrategyIntervalEl = document.getElementById("manual-strategy-interval");
       const strategyPreviewBtn = document.getElementById("strategy-preview");
       const strategyRunBtn = document.getElementById("strategy-run");
       const strategyAutoStartBtn = document.getElementById("strategy-auto-start");
       const strategyAutoStatusBtn = document.getElementById("strategy-auto-status");
       const strategyAutoStopBtn = document.getElementById("strategy-auto-stop");
       const strategyStatusEl = document.getElementById("strategy-status");
+      const autoLastTradeBadgeEl = document.getElementById("auto-last-trade-badge");
       const strategyNextRunEl = document.getElementById("strategy-next-run");
       const strategyProgressFillEl = document.getElementById("strategy-progress-fill");
-      const strategyPlannedOrderEl = document.getElementById("strategy-planned-order");
-      const strategyCandidatesEl = document.getElementById("strategy-candidates");
+      const manualStrategyPlannedOrderEl = document.getElementById("manual-strategy-planned-order");
+      const manualStrategyCandidatesEl = document.getElementById("manual-strategy-candidates");
+      const autoStrategyPlannedOrderEl = document.getElementById("auto-strategy-planned-order");
+      const autoStrategyCandidatesEl = document.getElementById("auto-strategy-candidates");
       let strategyPreviewInflight = false;
       let strategyAutoStatusInflight = false;
+
+      function syncStrategyControls(fromManual) {
+        if (fromManual) {
+          strategyModeEl.value = manualStrategyModeEl.value;
+          strategySideEl.value = manualStrategySideEl.value;
+          strategyAskMinEl.value = manualStrategyAskMinEl.value;
+          strategyAskMaxEl.value = manualStrategyAskMaxEl.value;
+          strategyMaxCostEl.value = manualStrategyMaxCostEl.value;
+          strategyIntervalEl.value = manualStrategyIntervalEl.value;
+          return;
+        }
+        manualStrategyModeEl.value = strategyModeEl.value;
+        manualStrategySideEl.value = strategySideEl.value;
+        manualStrategyAskMinEl.value = strategyAskMinEl.value;
+        manualStrategyAskMaxEl.value = strategyAskMaxEl.value;
+        manualStrategyMaxCostEl.value = strategyMaxCostEl.value;
+        manualStrategyIntervalEl.value = strategyIntervalEl.value;
+      }
 
       function resizeCanvas() {
         const rect = canvas.getBoundingClientRect();
@@ -1692,9 +1791,9 @@ def dashboard():
         strategyProgressFillEl.style.width = `${progressPct.toFixed(1)}%`;
       }
 
-      function renderStrategyCandidates(candidates) {
+      function renderStrategyCandidates(candidates, targetEl) {
         if (!candidates || !candidates.length) {
-          strategyCandidatesEl.innerHTML = "";
+          targetEl.innerHTML = "";
           return;
         }
         const strikeText = (v) => {
@@ -1709,7 +1808,7 @@ def dashboard():
             <td>${c.ask_band_distance_cents ?? "--"}c</td>
           </tr>
         `).join("");
-        strategyCandidatesEl.innerHTML = `
+        targetEl.innerHTML = `
           <div>Nearest candidates</div>
           <table>
             <thead>
@@ -1725,7 +1824,9 @@ def dashboard():
         `;
       }
 
-      function renderStrategySelection(payload, label) {
+      function renderStrategySelection(payload, label, panel = "manual") {
+        const plannedEl = panel === "auto" ? autoStrategyPlannedOrderEl : manualStrategyPlannedOrderEl;
+        const candidatesEl = panel === "auto" ? autoStrategyCandidatesEl : manualStrategyCandidatesEl;
         const cycle = payload?.result || payload || {};
         const selection =
           payload?.selection ||
@@ -1745,7 +1846,7 @@ def dashboard():
         if (!selection) {
           const active = cycle?.active_position || payload?.active_position || null;
           if (active) {
-            strategyPlannedOrderEl.textContent = [
+            plannedEl.textContent = [
               `${label} (${mode})`,
               `No new order selected.`,
               `Active Position: ${active.ticker || "--"} (${String(active.side || "--").toUpperCase()})`,
@@ -1754,14 +1855,14 @@ def dashboard():
               `Reason: ${cycle?.reason || "holding active position"}`,
             ].join("\\n");
           } else {
-            strategyPlannedOrderEl.textContent = `No strategy selection returned. ${cycle?.reason || ""}`.trim();
+            plannedEl.textContent = `No strategy selection returned. ${cycle?.reason || ""}`.trim();
           }
-          strategyCandidatesEl.innerHTML = "";
+          candidatesEl.innerHTML = "";
           return;
         }
         if (!selected) {
-          strategyPlannedOrderEl.textContent = `${label}: no exact match. ${selection.reason || ""}`;
-          renderStrategyCandidates(selection.nearest_candidates || []);
+          plannedEl.textContent = `${label}: no exact match. ${selection.reason || ""}`;
+          renderStrategyCandidates(selection.nearest_candidates || [], candidatesEl);
           return;
         }
         const lines = [
@@ -1773,8 +1874,8 @@ def dashboard():
           `Planned Cost: ${estCost !== null ? `${estCost}c / ${formatCents(estCost)}` : "--"}`,
           `Expected Return: ${selected.expected_return_pct !== null && selected.expected_return_pct !== undefined ? `${(selected.expected_return_pct * 100).toFixed(2)}%` : "--"}`,
         ];
-        strategyPlannedOrderEl.textContent = lines.join("\\n");
-        renderStrategyCandidates(selection.nearest_candidates || []);
+        plannedEl.textContent = lines.join("\\n");
+        renderStrategyCandidates(selection.nearest_candidates || [], candidatesEl);
       }
 
       async function strategyPreview(quiet = false) {
@@ -1788,7 +1889,7 @@ def dashboard():
           if (!quiet) {
             strategyStatusEl.textContent = `Preview OK. Spot ${Number(data.spot || 0).toLocaleString("en-US", { style: "currency", currency: "USD" })}`;
           }
-          renderStrategySelection(data, "Planned order");
+          renderStrategySelection(data, "Planned order", "manual");
         } catch (err) {
           if (!quiet) strategyStatusEl.textContent = `Preview failed: ${err.message || "error"}`;
         } finally {
@@ -1804,7 +1905,7 @@ def dashboard():
           if (!res.ok || data.error || data.action === "error") throw new Error(data.error || data.reason || `HTTP ${res.status}`);
           const action = data?.result?.action || data?.action || "ok";
           strategyStatusEl.textContent = `Run complete: ${action}`;
-          renderStrategySelection(data, "Order placed/plan");
+          renderStrategySelection(data, "Order placed/plan", "manual");
           refreshPortfolio();
           refreshLedger();
         } catch (err) {
@@ -1836,7 +1937,7 @@ def dashboard():
           const running = data.running ? "running" : "stopped";
           if (!quiet) strategyStatusEl.textContent = `Auto ${running} (${mode}). Last run: ${data.last_run_at || "n/a"}`;
           updateScheduleProgress(data);
-          if (data.last_result) renderStrategySelection(data.last_result, "Last auto plan");
+          if (data.last_result) renderStrategySelection(data.last_result, "Last auto plan", "auto");
         } catch (err) {
           if (!quiet) strategyStatusEl.textContent = `Auto status failed: ${err.message || "error"}`;
           updateScheduleProgress(null);
@@ -1903,6 +2004,18 @@ def dashboard():
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
           const data = await res.json();
           const records = data.records || [];
+          const lastAuto = records.find(r => r.source === "/strategy/farthest_band/auto");
+          if (lastAuto) {
+            const side = String(lastAuto.side || "--").toUpperCase();
+            const action = String(lastAuto.action || "--").toUpperCase();
+            const ticker = lastAuto.ticker || "--";
+            const px = lastAuto.price_cents !== null && lastAuto.price_cents !== undefined ? `${lastAuto.price_cents}c` : "--";
+            const cnt = lastAuto.count ?? "--";
+            const at = lastAuto.ts || "--";
+            autoLastTradeBadgeEl.textContent = `Last Auto Trade: ${action} ${side} ${ticker} @ ${px} x ${cnt} (${at})`;
+          } else {
+            autoLastTradeBadgeEl.textContent = "Last Auto Trade: none yet.";
+          }
           if (!records.length) {
             ledgerBody.innerHTML = "<tr><td colspan=\\"10\\">No ledger records.</td></tr>";
             return;
@@ -1944,6 +2057,10 @@ def dashboard():
       refreshMarketsBtn.addEventListener("click", refreshMarkets);
       refreshPortfolioBtn.addEventListener("click", refreshPortfolio);
       refreshLedgerBtn.addEventListener("click", refreshLedger);
+      [manualStrategyModeEl, manualStrategySideEl, manualStrategyAskMinEl, manualStrategyAskMaxEl, manualStrategyMaxCostEl, manualStrategyIntervalEl]
+        .forEach(el => el.addEventListener("change", () => syncStrategyControls(true)));
+      [strategyModeEl, strategySideEl, strategyAskMinEl, strategyAskMaxEl, strategyMaxCostEl, strategyIntervalEl]
+        .forEach(el => el.addEventListener("change", () => syncStrategyControls(false)));
       strategyPreviewBtn.addEventListener("click", strategyPreview);
       strategyRunBtn.addEventListener("click", strategyRun);
       strategyAutoStartBtn.addEventListener("click", strategyAutoStart);
@@ -1957,6 +2074,7 @@ def dashboard():
         strategyPreview(true);
         strategyAutoStatus(true);
       }, 1000);
+      syncStrategyControls(false);
       strategyPreview();
       refreshLedger();
       window.addEventListener("resize", refreshChart);
