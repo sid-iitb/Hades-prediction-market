@@ -17,6 +17,9 @@ The dashboard shows:
 - Strategy panel for farthest-band execution:
   - `paper` or `live` mode toggle
   - Configurable side, ask band (`95-99c` default), max cost, and auto interval
+  - Active position tracking with stop-loss rotation: if mark drops below `-20%`, strategy exits and attempts to rebuy a farther strike
+  - Live auto-schedule countdown with progress bar (time remaining until next cycle)
+  - 1-second preview refresh showing the next probable order continuously
   - Preview of planned order (ticker, strike, ask, count, planned cost, expected return)
   - Nearest candidate list when no exact ask-band match exists
   - Run once + auto start/status/stop controls
@@ -96,8 +99,12 @@ python -m src.api
 - `GET /strategy/farthest_band/run?side=yes|no&ask_min_cents=95&ask_max_cents=99&max_cost_cents=500&mode=paper|live`
   - Executes one strategy cycle immediately.
   - `mode=paper` returns planned action only; `mode=live` places a real order.
+  - If an active tracked position is down `20%` or more, it exits and attempts to rebuy a farther strike.
+- `GET /strategy/farthest_band/run?side=yes|no&ask_min_cents=95&ask_max_cents=99&max_cost_cents=500&mode=paper|live&force_new_order=1`
+  - Forces a fresh entry on run-once (ignores currently tracked active position state).
 - `GET /strategy/farthest_band/auto/start?side=yes|no&ask_min_cents=95&ask_max_cents=99&max_cost_cents=500&mode=paper|live&interval_minutes=15`
   - Starts background auto-execution on interval (default 15 minutes).
+  - Auto cycles apply the same `-20%` stop-loss exit-and-rotate behavior.
 - `GET /strategy/farthest_band/auto/status`
   - Returns running state, active config, last run time, and last result.
 - `GET /strategy/farthest_band/auto/stop`

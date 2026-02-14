@@ -15,7 +15,7 @@ from src.client.kraken_client import KrakenClient
 from src.offline_processing.ingest_kalshi import ingest_loop
 from src.strategy.farthest_band import (
     FarthestBandConfig,
-    execute_farthest_band_trade,
+    run_farthest_band_cycle,
     select_farthest_band_market,
 )
 from dotenv import load_dotenv
@@ -56,6 +56,8 @@ _farthest_auto_state = {
     "config": None,
     "last_run_at": None,
     "last_result": None,
+    "active_position": None,
+    "active_position_mode": None,
 }
 
 
@@ -217,23 +219,29 @@ def _latest_ingest_record():
         conn.close()
 
 
-def _run_farthest_band_once(config: FarthestBandConfig):
+def _run_farthest_band_once(config: FarthestBandConfig, active_position: dict | None = None):
     ingest = _latest_ingest_record()
     if not ingest:
-        return {"action": "hold", "reason": "No ingest record found"}
+        return {"action": "hold", "reason": "No ingest record found", "active_position": active_position}
 
     kraken = KrakenClient()
     spot = kraken.latest_btc_price().price
     markets = ingest.get("markets", [])
-    selection = select_farthest_band_market(spot=spot, markets=markets, config=config)
     client = KalshiClient()
-    result = execute_farthest_band_trade(client=client, selection=selection, config=config)
+    cycle = run_farthest_band_cycle(
+        client=client,
+        spot=spot,
+        markets=markets,
+        config=config,
+        active_position=active_position,
+    )
     return {
         "spot": spot,
         "ingest_run_id": ingest.get("id"),
         "ingest_ts": ingest.get("ts"),
         "event_ticker": ingest.get("event_ticker"),
-        "result": result,
+        "result": cycle,
+        "active_position": cycle.get("active_position"),
     }
 
 
@@ -241,19 +249,27 @@ def _farthest_band_worker():
     while not _farthest_auto_stop.is_set():
         with _farthest_auto_lock:
             cfg_dict = dict(_farthest_auto_state.get("config") or {})
+            active_mode = _farthest_auto_state.get("active_position_mode")
+            cfg_mode = str(cfg_dict.get("mode") or "").lower()
+            if active_mode == cfg_mode:
+                active_position = dict(_farthest_auto_state.get("active_position") or {}) or None
+            else:
+                active_position = None
         if not cfg_dict:
             break
 
         config = FarthestBandConfig(**cfg_dict)
         run_at = datetime.datetime.now(timezone.utc).isoformat()
         try:
-            out = _run_farthest_band_once(config)
+            out = _run_farthest_band_once(config, active_position=active_position)
         except Exception as exc:
             out = {"action": "error", "reason": str(exc)}
 
         with _farthest_auto_lock:
             _farthest_auto_state["last_run_at"] = run_at
             _farthest_auto_state["last_result"] = out
+            _farthest_auto_state["active_position"] = out.get("active_position")
+            _farthest_auto_state["active_position_mode"] = cfg_mode if out.get("active_position") else None
 
         wait_seconds = max(int(config.interval_minutes) * 60, 60)
         if _farthest_auto_stop.wait(timeout=wait_seconds):
@@ -532,6 +548,7 @@ def strategy_farthest_band_run(
     ask_max_cents: int = 99,
     max_cost_cents: int = 500,
     mode: str = "paper",
+    force_new_order: bool = False,
 ):
     config = FarthestBandConfig(
         direction="lower",
@@ -542,7 +559,22 @@ def strategy_farthest_band_run(
         mode=mode,
     )
     try:
-        return _run_farthest_band_once(config)
+        with _farthest_auto_lock:
+            active_mode = _farthest_auto_state.get("active_position_mode")
+            cfg_mode = str(config.mode).lower()
+            if force_new_order:
+                active_position = None
+            elif active_mode == cfg_mode:
+                active_position = dict(_farthest_auto_state.get("active_position") or {}) or None
+            else:
+                active_position = None
+        out = _run_farthest_band_once(config, active_position=active_position)
+        with _farthest_auto_lock:
+            _farthest_auto_state["active_position"] = out.get("active_position")
+            _farthest_auto_state["active_position_mode"] = cfg_mode if out.get("active_position") else None
+            _farthest_auto_state["last_run_at"] = datetime.datetime.now(timezone.utc).isoformat()
+            _farthest_auto_state["last_result"] = out
+        return out
     except Exception as exc:
         return {"action": "error", "reason": str(exc)}
 
@@ -581,6 +613,8 @@ def strategy_farthest_band_auto_start(
         _farthest_auto_state["config"] = config.__dict__.copy()
         _farthest_auto_state["last_run_at"] = None
         _farthest_auto_state["last_result"] = None
+        _farthest_auto_state["active_position"] = None
+        _farthest_auto_state["active_position_mode"] = None
         _farthest_auto_thread = threading.Thread(
             target=_farthest_band_worker,
             name="farthest-band-auto",
@@ -600,7 +634,21 @@ def strategy_farthest_band_auto_stop():
     _farthest_auto_stop.set()
     with _farthest_auto_lock:
         _farthest_auto_state["running"] = False
-    return {"running": False, "message": "Auto strategy stop requested"}
+        active_position = _farthest_auto_state.get("active_position")
+    return {
+        "running": False,
+        "message": "Auto strategy stop requested",
+        "active_position": active_position,
+    }
+
+
+@app.get("/strategy/farthest_band/reset")
+def strategy_farthest_band_reset():
+    with _farthest_auto_lock:
+        _farthest_auto_state["active_position"] = None
+        _farthest_auto_state["active_position_mode"] = None
+        _farthest_auto_state["last_result"] = None
+    return {"ok": True, "message": "Strategy active position reset"}
 
 
 @app.get("/strategy/farthest_band/auto/status")
@@ -725,9 +773,9 @@ def dashboard():
         padding: 12px;
         align-self: start;
       }
-      .panel-grid {
+      .top-panels {
         display: grid;
-        grid-template-columns: minmax(0, 3fr) minmax(0, 1.2fr);
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1.35fr);
         gap: 16px;
         align-items: start;
       }
@@ -737,11 +785,6 @@ def dashboard():
         border-radius: 14px;
         padding: 12px;
         min-height: 260px;
-      }
-      .side-stack {
-        display: grid;
-        gap: 12px;
-        align-content: start;
       }
       .strategy-panel {
         background: rgba(10, 16, 32, 0.6);
@@ -889,6 +932,28 @@ def dashboard():
         font-size: 12px;
         color: var(--muted);
       }
+      .strategy-schedule {
+        margin-top: 8px;
+      }
+      .strategy-next-run {
+        font-size: 12px;
+        color: var(--muted);
+        margin-bottom: 6px;
+      }
+      .progress-track {
+        width: 100%;
+        height: 8px;
+        background: rgba(255, 255, 255, 0.08);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 999px;
+        overflow: hidden;
+      }
+      .progress-fill {
+        height: 100%;
+        width: 0%;
+        background: linear-gradient(90deg, #f4c430, #f97316);
+        transition: width 0.3s ease;
+      }
       .planned-order {
         margin-top: 10px;
         font-size: 12px;
@@ -898,11 +963,17 @@ def dashboard():
         border-radius: 10px;
         padding: 8px;
         white-space: pre-wrap;
+        min-height: 112px;
+        max-height: 112px;
+        overflow-y: scroll;
       }
       .candidate-list {
         margin-top: 10px;
         font-size: 12px;
         color: var(--muted);
+        min-height: 170px;
+        max-height: 170px;
+        overflow-y: scroll;
       }
       .candidate-list table {
         width: 100%;
@@ -934,7 +1005,7 @@ def dashboard():
         .card { padding: 22px; }
         .meta { gap: 10px; }
         .stats { grid-template-columns: 1fr; }
-        .panel-grid { grid-template-columns: 1fr; }
+        .top-panels { grid-template-columns: 1fr; }
       }
     </style>
   </head>
@@ -971,7 +1042,7 @@ def dashboard():
               <div id="count" class="value">--</div>
             </div>
           </div>
-          <div class="panel-grid">
+          <div class="top-panels">
             <div class="markets">
               <div class="markets-header">
                 <h3>Latest 10 Kalshi Markets</h3>
@@ -998,76 +1069,80 @@ def dashboard():
                 </tbody>
               </table>
             </div>
-            <div class="side-stack">
-              <div class="portfolio-panel">
-                <div class="markets-header">
-                  <h3>Current Portfolio</h3>
-                  <button id="refresh-portfolio" class="btn" type="button">Refresh</button>
-                </div>
-                <div id="portfolio-summary" class="portfolio-summary">No data loaded.</div>
-                <table class="portfolio-table">
-                  <thead>
-                    <tr>
-                      <th>Ticker</th>
-                      <th>Side</th>
-                      <th>Cost</th>
-                      <th>P/L</th>
-                      <th>Max</th>
-                    </tr>
-                  </thead>
-                  <tbody id="portfolio-body">
-                    <tr><td colspan="5">Click Refresh to load orders.</td></tr>
-                  </tbody>
-                </table>
+            <div class="strategy-panel">
+              <div class="markets-header">
+                <h3>Farthest Band Strategy</h3>
               </div>
-              <div class="strategy-panel">
-                <div class="markets-header">
-                  <h3>Farthest Band Strategy</h3>
+              <div class="strategy-grid">
+                <div class="field">
+                  <label for="strategy-mode">Mode</label>
+                  <select id="strategy-mode">
+                    <option value="paper" selected>paper</option>
+                    <option value="live">live</option>
+                  </select>
                 </div>
-                <div class="strategy-grid">
-                  <div class="field">
-                    <label for="strategy-mode">Mode</label>
-                    <select id="strategy-mode">
-                      <option value="paper" selected>paper</option>
-                      <option value="live">live</option>
-                    </select>
-                  </div>
-                  <div class="field">
-                    <label for="strategy-side">Side</label>
-                    <select id="strategy-side">
-                      <option value="yes" selected>yes</option>
-                      <option value="no">no</option>
-                    </select>
-                  </div>
-                  <div class="field">
-                    <label for="strategy-ask-min">Ask Min (c)</label>
-                    <input id="strategy-ask-min" type="number" min="1" max="99" value="95" />
-                  </div>
-                  <div class="field">
-                    <label for="strategy-ask-max">Ask Max (c)</label>
-                    <input id="strategy-ask-max" type="number" min="1" max="99" value="99" />
-                  </div>
-                  <div class="field">
-                    <label for="strategy-max-cost">Max Cost (c)</label>
-                    <input id="strategy-max-cost" type="number" min="1" value="500" />
-                  </div>
-                  <div class="field">
-                    <label for="strategy-interval">Auto Interval (min)</label>
-                    <input id="strategy-interval" type="number" min="1" value="15" />
-                  </div>
+                <div class="field">
+                  <label for="strategy-side">Side</label>
+                  <select id="strategy-side">
+                    <option value="yes" selected>yes</option>
+                    <option value="no">no</option>
+                  </select>
                 </div>
-                <div class="strategy-actions">
-                  <button id="strategy-preview" class="btn secondary" type="button">Preview</button>
-                  <button id="strategy-run" class="btn" type="button">Run Once</button>
-                  <button id="strategy-auto-start" class="btn" type="button">Auto Start</button>
-                  <button id="strategy-auto-status" class="btn secondary" type="button">Auto Status</button>
-                  <button id="strategy-auto-stop" class="btn secondary" type="button">Auto Stop</button>
+                <div class="field">
+                  <label for="strategy-ask-min">Ask Min (c)</label>
+                  <input id="strategy-ask-min" type="number" min="1" max="99" value="95" />
                 </div>
-                <div id="strategy-status" class="strategy-status">Strategy idle.</div>
-                <div id="strategy-planned-order" class="planned-order">Planned order will appear after Preview.</div>
-                <div id="strategy-candidates" class="candidate-list"></div>
+                <div class="field">
+                  <label for="strategy-ask-max">Ask Max (c)</label>
+                  <input id="strategy-ask-max" type="number" min="1" max="99" value="99" />
+                </div>
+                <div class="field">
+                  <label for="strategy-max-cost">Max Cost (c)</label>
+                  <input id="strategy-max-cost" type="number" min="1" value="500" />
+                </div>
+                <div class="field">
+                  <label for="strategy-interval">Auto Interval (min)</label>
+                  <input id="strategy-interval" type="number" min="1" value="15" />
+                </div>
               </div>
+              <div class="strategy-actions">
+                <button id="strategy-preview" class="btn secondary" type="button">Preview</button>
+                <button id="strategy-run" class="btn" type="button">Run Once</button>
+                <button id="strategy-auto-start" class="btn" type="button">Auto Start</button>
+                <button id="strategy-auto-status" class="btn secondary" type="button">Auto Status</button>
+                <button id="strategy-auto-stop" class="btn secondary" type="button">Auto Stop</button>
+              </div>
+              <div id="strategy-status" class="strategy-status">Strategy idle.</div>
+              <div class="strategy-schedule">
+                <div id="strategy-next-run" class="strategy-next-run">Next schedule: --</div>
+                <div class="progress-track">
+                  <div id="strategy-progress-fill" class="progress-fill"></div>
+                </div>
+              </div>
+              <div id="strategy-planned-order" class="planned-order">Planned order will appear after Preview.</div>
+              <div id="strategy-candidates" class="candidate-list"></div>
             </div>
+          </div>
+          <div class="portfolio-panel">
+            <div class="markets-header">
+              <h3>Current Portfolio</h3>
+              <button id="refresh-portfolio" class="btn" type="button">Refresh</button>
+            </div>
+            <div id="portfolio-summary" class="portfolio-summary">No data loaded.</div>
+            <table class="portfolio-table">
+              <thead>
+                <tr>
+                  <th>Ticker</th>
+                  <th>Side</th>
+                  <th>Cost</th>
+                  <th>P/L</th>
+                  <th>Max</th>
+                </tr>
+              </thead>
+              <tbody id="portfolio-body">
+                <tr><td colspan="5">Click Refresh to load orders.</td></tr>
+              </tbody>
+            </table>
           </div>
         </div>
       </div>
@@ -1099,8 +1174,12 @@ def dashboard():
       const strategyAutoStatusBtn = document.getElementById("strategy-auto-status");
       const strategyAutoStopBtn = document.getElementById("strategy-auto-stop");
       const strategyStatusEl = document.getElementById("strategy-status");
+      const strategyNextRunEl = document.getElementById("strategy-next-run");
+      const strategyProgressFillEl = document.getElementById("strategy-progress-fill");
       const strategyPlannedOrderEl = document.getElementById("strategy-planned-order");
       const strategyCandidatesEl = document.getElementById("strategy-candidates");
+      let strategyPreviewInflight = false;
+      let strategyAutoStatusInflight = false;
 
       function resizeCanvas() {
         const rect = canvas.getBoundingClientRect();
@@ -1299,6 +1378,38 @@ def dashboard():
         return params.toString();
       }
 
+      function formatDuration(sec) {
+        const s = Math.max(0, Math.floor(Number(sec || 0)));
+        const m = Math.floor(s / 60);
+        const r = s % 60;
+        return `${m}m ${String(r).padStart(2, "0")}s`;
+      }
+
+      function updateScheduleProgress(statusData) {
+        if (!statusData || !statusData.running) {
+          strategyNextRunEl.textContent = "Next schedule: auto not running";
+          strategyProgressFillEl.style.width = "0%";
+          return;
+        }
+
+        const intervalMin = Number(statusData?.config?.interval_minutes || strategyIntervalEl.value || 15);
+        const intervalSec = Math.max(60, Math.floor(intervalMin * 60));
+        const lastRunAt = statusData?.last_run_at ? Date.parse(statusData.last_run_at) : NaN;
+        if (!Number.isFinite(lastRunAt)) {
+          strategyNextRunEl.textContent = `Next schedule: waiting first run (every ${intervalMin}m)`;
+          strategyProgressFillEl.style.width = "0%";
+          return;
+        }
+
+        const nowMs = Date.now();
+        const elapsedSec = Math.max(0, (nowMs - lastRunAt) / 1000);
+        const clampedElapsed = Math.min(intervalSec, elapsedSec);
+        const remainingSec = Math.max(0, intervalSec - clampedElapsed);
+        const progressPct = Math.max(0, Math.min(100, (clampedElapsed / intervalSec) * 100));
+        strategyNextRunEl.textContent = `Next schedule in ${formatDuration(remainingSec)} (every ${intervalMin}m)`;
+        strategyProgressFillEl.style.width = `${progressPct.toFixed(1)}%`;
+      }
+
       function renderStrategyCandidates(candidates) {
         if (!candidates || !candidates.length) {
           strategyCandidatesEl.innerHTML = "";
@@ -1333,13 +1444,36 @@ def dashboard():
       }
 
       function renderStrategySelection(payload, label) {
-        const selection = payload?.selection || payload?.result?.selection || null;
+        const cycle = payload?.result || payload || {};
+        const selection =
+          payload?.selection ||
+          cycle?.selection ||
+          cycle?.entry?.selection ||
+          cycle?.reentry?.selection ||
+          null;
         const selected = selection?.selected || null;
-        const count = selection?.count ?? null;
+        const count = selection?.count ?? cycle?.entry?.selection?.count ?? cycle?.reentry?.selection?.count ?? null;
         const estCost = selection?.estimated_cost_cents ?? null;
-        const mode = strategyModeEl.value || "paper";
+        const mode =
+          cycle?.entry?.mode ||
+          cycle?.reentry?.mode ||
+          cycle?.mode ||
+          strategyModeEl.value ||
+          "paper";
         if (!selection) {
-          strategyPlannedOrderEl.textContent = "No strategy selection returned.";
+          const active = cycle?.active_position || payload?.active_position || null;
+          if (active) {
+            strategyPlannedOrderEl.textContent = [
+              `${label} (${mode})`,
+              `No new order selected.`,
+              `Active Position: ${active.ticker || "--"} (${String(active.side || "--").toUpperCase()})`,
+              `Entry: ${active.entry_price_cents ?? "--"}c`,
+              `Count: ${active.count ?? "--"}`,
+              `Reason: ${cycle?.reason || "holding active position"}`,
+            ].join("\\n");
+          } else {
+            strategyPlannedOrderEl.textContent = `No strategy selection returned. ${cycle?.reason || ""}`.trim();
+          }
           strategyCandidatesEl.innerHTML = "";
           return;
         }
@@ -1361,28 +1495,35 @@ def dashboard():
         renderStrategyCandidates(selection.nearest_candidates || []);
       }
 
-      async function strategyPreview() {
-        strategyStatusEl.textContent = "Previewing strategy...";
+      async function strategyPreview(quiet = false) {
+        if (strategyPreviewInflight) return;
+        strategyPreviewInflight = true;
+        if (!quiet) strategyStatusEl.textContent = "Previewing strategy...";
         try {
           const res = await fetch(`/strategy/farthest_band/preview?${strategyParams(false, false)}`);
           const data = await res.json();
           if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
-          strategyStatusEl.textContent = `Preview OK. Spot ${Number(data.spot || 0).toLocaleString("en-US", { style: "currency", currency: "USD" })}`;
+          if (!quiet) {
+            strategyStatusEl.textContent = `Preview OK. Spot ${Number(data.spot || 0).toLocaleString("en-US", { style: "currency", currency: "USD" })}`;
+          }
           renderStrategySelection(data, "Planned order");
         } catch (err) {
-          strategyStatusEl.textContent = `Preview failed: ${err.message || "error"}`;
+          if (!quiet) strategyStatusEl.textContent = `Preview failed: ${err.message || "error"}`;
+        } finally {
+          strategyPreviewInflight = false;
         }
       }
 
       async function strategyRun() {
         strategyStatusEl.textContent = `Running once (${strategyModeEl.value})...`;
         try {
-          const res = await fetch(`/strategy/farthest_band/run?${strategyParams(true, false)}`);
+          const res = await fetch(`/strategy/farthest_band/run?${strategyParams(true, false)}&force_new_order=1`);
           const data = await res.json();
           if (!res.ok || data.error || data.action === "error") throw new Error(data.error || data.reason || `HTTP ${res.status}`);
           const action = data?.result?.action || data?.action || "ok";
           strategyStatusEl.textContent = `Run complete: ${action}`;
           renderStrategySelection(data, "Order placed/plan");
+          refreshPortfolio();
         } catch (err) {
           strategyStatusEl.textContent = `Run failed: ${err.message || "error"}`;
         }
@@ -1400,18 +1541,24 @@ def dashboard():
         }
       }
 
-      async function strategyAutoStatus() {
-        strategyStatusEl.textContent = "Loading auto status...";
+      async function strategyAutoStatus(quiet = false) {
+        if (strategyAutoStatusInflight) return;
+        strategyAutoStatusInflight = true;
+        if (!quiet) strategyStatusEl.textContent = "Loading auto status...";
         try {
           const res = await fetch("/strategy/farthest_band/auto/status");
           const data = await res.json();
           if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
           const mode = data?.config?.mode || strategyModeEl.value;
           const running = data.running ? "running" : "stopped";
-          strategyStatusEl.textContent = `Auto ${running} (${mode}). Last run: ${data.last_run_at || "n/a"}`;
+          if (!quiet) strategyStatusEl.textContent = `Auto ${running} (${mode}). Last run: ${data.last_run_at || "n/a"}`;
+          updateScheduleProgress(data);
           if (data.last_result) renderStrategySelection(data.last_result, "Last auto plan");
         } catch (err) {
-          strategyStatusEl.textContent = `Auto status failed: ${err.message || "error"}`;
+          if (!quiet) strategyStatusEl.textContent = `Auto status failed: ${err.message || "error"}`;
+          updateScheduleProgress(null);
+        } finally {
+          strategyAutoStatusInflight = false;
         }
       }
 
@@ -1478,6 +1625,10 @@ def dashboard():
       setInterval(() => {
         refresh();
         refreshChart();
+      }, 1000);
+      setInterval(() => {
+        strategyPreview(true);
+        strategyAutoStatus(true);
       }, 1000);
       strategyPreview();
       window.addEventListener("resize", refreshChart);

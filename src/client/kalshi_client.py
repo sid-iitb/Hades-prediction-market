@@ -252,6 +252,31 @@ class KalshiClient:
         headers = self._headers("POST", path)
         return requests.post(self.base_url + path, headers=headers, json=order)
 
+    def place_limit_order(self, ticker, action, side, price_cents, count, client_order_id=None):
+        side = str(side).lower().strip()
+        action = str(action).lower().strip()
+        if side not in {"yes", "no"}:
+            raise ValueError("side must be 'yes' or 'no'")
+        if action not in {"buy", "sell"}:
+            raise ValueError("action must be 'buy' or 'sell'")
+        if int(count) < 1:
+            raise ValueError("count must be >= 1")
+        if int(price_cents) < 1 or int(price_cents) > 99:
+            raise ValueError("price_cents must be between 1 and 99")
+
+        path = "/trade-api/v2/portfolio/orders"
+        order = {
+            "ticker": ticker,
+            "action": action,
+            "side": side,
+            "count": int(count),
+            "type": "limit",
+            f"{side}_price": int(price_cents),
+            "client_order_id": client_order_id or str(uuid.uuid4()),
+        }
+        headers = self._headers("POST", path)
+        return requests.post(self.base_url + path, headers=headers, json=order)
+
     def place_yes_limit_at_best_ask(self, ticker, max_cost_cents=500):
         return self.place_limit_at_best_ask(
             ticker=ticker,

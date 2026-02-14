@@ -15,6 +15,7 @@ class FarthestBandConfig:
     max_cost_cents: int = 500
     mode: str = "paper"  # "paper" or "live"
     interval_minutes: int = 15
+    stop_loss_pct: float = 0.20
 
 
 def _safe_json(resp):
@@ -47,7 +48,13 @@ def _normalize_side(side: str) -> str:
     return v
 
 
-def select_farthest_band_market(spot: float, markets: list[dict], config: FarthestBandConfig) -> dict:
+def select_farthest_band_market(
+    spot: float,
+    markets: list[dict],
+    config: FarthestBandConfig,
+    min_distance_from_spot: float = 0.0,
+    exclude_ticker: str | None = None,
+) -> dict:
     direction = _normalize_direction(config.direction)
     side = _normalize_side(config.side)
     ask_key = f"{side}_ask"
@@ -63,6 +70,8 @@ def select_farthest_band_market(spot: float, markets: list[dict], config: Farthe
         ticker = market.get("ticker")
         if strike is None or ask is None or not ticker:
             continue
+        if exclude_ticker and str(ticker) == str(exclude_ticker):
+            continue
 
         ask_cents = int(round(ask))
         if direction == "lower" and strike > float(spot):
@@ -71,6 +80,8 @@ def select_farthest_band_market(spot: float, markets: list[dict], config: Farthe
             continue
 
         distance = abs(float(spot) - strike)
+        if distance <= float(min_distance_from_spot):
+            continue
         expected_return_pct = (100.0 - float(ask_cents)) / float(ask_cents) if ask_cents > 0 else None
         row = {
             "ticker": ticker,
@@ -192,4 +203,182 @@ def execute_farthest_band_trade(client: KalshiClient, selection: dict, config: F
         "status_code": resp.status_code,
         "response": _safe_json(resp),
         "selection": selection,
+    }
+
+
+def _mark_price_and_pnl(client: KalshiClient, active_position: dict) -> dict:
+    side = str(active_position.get("side") or "").lower()
+    if side not in {"yes", "no"}:
+        return {"error": "active_position side must be yes/no"}
+
+    top = client.get_top_of_book(active_position["ticker"])
+    bid_key = f"{side}_bid"
+    ask_key = f"{side}_ask"
+    mark_cents = top.get(bid_key)
+    if mark_cents is None:
+        mark_cents = top.get(ask_key)
+
+    entry = int(active_position.get("entry_price_cents") or 0)
+    pnl_pct = None
+    if entry > 0 and mark_cents is not None:
+        pnl_pct = (float(mark_cents) - float(entry)) / float(entry)
+    return {
+        "top_of_book": top,
+        "mark_cents": mark_cents,
+        "pnl_pct": pnl_pct,
+    }
+
+
+def _enter_position(client: KalshiClient, selection: dict, config: FarthestBandConfig, spot: float, reason: str) -> dict:
+    selected = (selection or {}).get("selected")
+    count = int((selection or {}).get("count", 0))
+    if not selected or count < 1:
+        return {
+            "action": "hold",
+            "reason": (selection or {}).get("reason", "No candidate"),
+            "selection": selection,
+            "active_position": None,
+        }
+
+    side = str(config.side).lower()
+    ask_cents = int(selected["ask_cents"])
+    active = {
+        "ticker": selected["ticker"],
+        "strike": float(selected["strike"]),
+        "side": side,
+        "entry_price_cents": ask_cents,
+        "count": count,
+        "opened_spot": float(spot),
+    }
+
+    if str(config.mode).lower() != "live":
+        return {
+            "action": reason,
+            "mode": "paper",
+            "selection": selection,
+            "active_position": active,
+        }
+
+    resp = client.place_limit_order(
+        ticker=active["ticker"],
+        action="buy",
+        side=side,
+        price_cents=ask_cents,
+        count=count,
+    )
+    return {
+        "action": reason,
+        "mode": "live",
+        "status_code": resp.status_code,
+        "response": _safe_json(resp),
+        "selection": selection,
+        "active_position": active,
+    }
+
+
+def _exit_position(client: KalshiClient, active_position: dict, config: FarthestBandConfig, reason: str) -> dict:
+    side = str(active_position.get("side") or "").lower()
+    count = int(active_position.get("count") or 0)
+    if side not in {"yes", "no"} or count < 1:
+        return {"action": "hold", "reason": "Invalid active position for exit"}
+
+    top = client.get_top_of_book(active_position["ticker"])
+    bid_cents = top.get(f"{side}_bid")
+    if bid_cents is None:
+        bid_cents = top.get(f"{side}_ask")
+    if bid_cents is None or int(bid_cents) < 1:
+        return {"action": "hold", "reason": "No bid/mark available to exit", "top_of_book": top}
+
+    if str(config.mode).lower() != "live":
+        return {
+            "action": reason,
+            "mode": "paper",
+            "exit_price_cents": int(bid_cents),
+            "top_of_book": top,
+        }
+
+    resp = client.place_limit_order(
+        ticker=active_position["ticker"],
+        action="sell",
+        side=side,
+        price_cents=int(bid_cents),
+        count=count,
+    )
+    return {
+        "action": reason,
+        "mode": "live",
+        "status_code": resp.status_code,
+        "response": _safe_json(resp),
+        "exit_price_cents": int(bid_cents),
+        "top_of_book": top,
+    }
+
+
+def run_farthest_band_cycle(
+    client: KalshiClient,
+    spot: float,
+    markets: list[dict],
+    config: FarthestBandConfig,
+    active_position: dict | None = None,
+) -> dict:
+    active = dict(active_position) if active_position else None
+    stop_loss_pct = abs(float(config.stop_loss_pct))
+
+    if active:
+        mark_state = _mark_price_and_pnl(client, active)
+        pnl_pct = mark_state.get("pnl_pct")
+        if pnl_pct is not None and pnl_pct <= -stop_loss_pct:
+            exit_result = _exit_position(client, active, config, reason="stop_loss_exit")
+            if exit_result.get("action") == "hold":
+                return {
+                    "action": "hold_active",
+                    "reason": "Stop-loss triggered but exit could not be placed",
+                    "pnl_pct": pnl_pct,
+                    "exit": exit_result,
+                    "active_position": active,
+                }
+            previous_distance = abs(float(spot) - float(active.get("strike") or 0.0))
+            next_selection = select_farthest_band_market(
+                spot=spot,
+                markets=markets,
+                config=config,
+                min_distance_from_spot=previous_distance,
+                exclude_ticker=active.get("ticker"),
+            )
+            reentry_result = _enter_position(
+                client=client,
+                selection=next_selection,
+                config=config,
+                spot=spot,
+                reason="stop_loss_rebuy_further",
+            )
+            return {
+                "action": "stop_loss_rotate",
+                "stop_loss_trigger_pct": -stop_loss_pct,
+                "pnl_pct": pnl_pct,
+                "exited_position": active,
+                "exit": exit_result,
+                "reentry": reentry_result,
+                "active_position": reentry_result.get("active_position"),
+            }
+
+        return {
+            "action": "hold_active",
+            "reason": "Stop-loss not triggered",
+            "active_position": active,
+            "mark": mark_state,
+        }
+
+    selection = select_farthest_band_market(spot=spot, markets=markets, config=config)
+    entry = _enter_position(
+        client=client,
+        selection=selection,
+        config=config,
+        spot=spot,
+        reason="enter_farthest_band",
+    )
+    return {
+        "action": entry.get("action", "hold"),
+        "entry": entry,
+        "active_position": entry.get("active_position"),
     }
