@@ -105,6 +105,7 @@ python -m src.api
 - `GET /strategy/farthest_band/auto/start?side=yes|no&ask_min_cents=95&ask_max_cents=99&max_cost_cents=500&mode=paper|live&interval_minutes=15`
   - Starts background auto-execution on interval (default 15 minutes).
   - Auto cycles apply the same `-20%` stop-loss exit-and-rotate behavior.
+  - Stop-loss evaluation runs every 5 minutes while auto mode is active; new scheduled entries still follow `interval_minutes`.
 - `GET /strategy/farthest_band/auto/status`
   - Returns running state, active config, last run time, and last result.
 - `GET /strategy/farthest_band/auto/stop`

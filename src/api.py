@@ -55,6 +55,8 @@ _farthest_auto_state = {
     "running": False,
     "config": None,
     "last_run_at": None,
+    "last_scheduled_run_at": None,
+    "next_scheduled_run_at": None,
     "last_result": None,
     "active_position": None,
     "active_position_mode": None,
@@ -246,7 +248,9 @@ def _run_farthest_band_once(config: FarthestBandConfig, active_position: dict | 
 
 
 def _farthest_band_worker():
+    next_scheduled_at = datetime.datetime.now(timezone.utc)
     while not _farthest_auto_stop.is_set():
+        now_utc = datetime.datetime.now(timezone.utc)
         with _farthest_auto_lock:
             cfg_dict = dict(_farthest_auto_state.get("config") or {})
             active_mode = _farthest_auto_state.get("active_position_mode")
@@ -255,24 +259,36 @@ def _farthest_band_worker():
                 active_position = dict(_farthest_auto_state.get("active_position") or {}) or None
             else:
                 active_position = None
+            _farthest_auto_state["next_scheduled_run_at"] = next_scheduled_at.isoformat()
         if not cfg_dict:
             break
 
         config = FarthestBandConfig(**cfg_dict)
-        run_at = datetime.datetime.now(timezone.utc).isoformat()
-        try:
-            out = _run_farthest_band_once(config, active_position=active_position)
-        except Exception as exc:
-            out = {"action": "error", "reason": str(exc)}
+        should_run = bool(active_position) or (now_utc >= next_scheduled_at)
+        is_scheduled_run = now_utc >= next_scheduled_at
 
-        with _farthest_auto_lock:
-            _farthest_auto_state["last_run_at"] = run_at
-            _farthest_auto_state["last_result"] = out
-            _farthest_auto_state["active_position"] = out.get("active_position")
-            _farthest_auto_state["active_position_mode"] = cfg_mode if out.get("active_position") else None
+        if should_run:
+            run_at = datetime.datetime.now(timezone.utc).isoformat()
+            try:
+                out = _run_farthest_band_once(config, active_position=active_position)
+            except Exception as exc:
+                out = {"action": "error", "reason": str(exc)}
 
-        wait_seconds = max(int(config.interval_minutes) * 60, 60)
-        if _farthest_auto_stop.wait(timeout=wait_seconds):
+            if is_scheduled_run:
+                interval_seconds = max(int(config.interval_minutes) * 60, 60)
+                next_scheduled_at = now_utc + timedelta(seconds=interval_seconds)
+
+            with _farthest_auto_lock:
+                _farthest_auto_state["last_run_at"] = run_at
+                if is_scheduled_run:
+                    _farthest_auto_state["last_scheduled_run_at"] = run_at
+                _farthest_auto_state["next_scheduled_run_at"] = next_scheduled_at.isoformat()
+                _farthest_auto_state["last_result"] = out
+                _farthest_auto_state["active_position"] = out.get("active_position")
+                _farthest_auto_state["active_position_mode"] = cfg_mode if out.get("active_position") else None
+
+        # Risk checks run every 5 minutes while auto mode is running.
+        if _farthest_auto_stop.wait(timeout=300):
             break
 
     with _farthest_auto_lock:
@@ -612,6 +628,8 @@ def strategy_farthest_band_auto_start(
         _farthest_auto_state["running"] = True
         _farthest_auto_state["config"] = config.__dict__.copy()
         _farthest_auto_state["last_run_at"] = None
+        _farthest_auto_state["last_scheduled_run_at"] = None
+        _farthest_auto_state["next_scheduled_run_at"] = datetime.datetime.now(timezone.utc).isoformat()
         _farthest_auto_state["last_result"] = None
         _farthest_auto_state["active_position"] = None
         _farthest_auto_state["active_position_mode"] = None
@@ -1394,17 +1412,21 @@ def dashboard():
 
         const intervalMin = Number(statusData?.config?.interval_minutes || strategyIntervalEl.value || 15);
         const intervalSec = Math.max(60, Math.floor(intervalMin * 60));
-        const lastRunAt = statusData?.last_run_at ? Date.parse(statusData.last_run_at) : NaN;
-        if (!Number.isFinite(lastRunAt)) {
-          strategyNextRunEl.textContent = `Next schedule: waiting first run (every ${intervalMin}m)`;
+        const nextRunAt = statusData?.next_scheduled_run_at ? Date.parse(statusData.next_scheduled_run_at) : NaN;
+        const lastScheduledAt = statusData?.last_scheduled_run_at ? Date.parse(statusData.last_scheduled_run_at) : NaN;
+        if (!Number.isFinite(nextRunAt)) {
+          strategyNextRunEl.textContent = `Next schedule: waiting schedule (every ${intervalMin}m)`;
           strategyProgressFillEl.style.width = "0%";
           return;
         }
 
         const nowMs = Date.now();
-        const elapsedSec = Math.max(0, (nowMs - lastRunAt) / 1000);
-        const clampedElapsed = Math.min(intervalSec, elapsedSec);
-        const remainingSec = Math.max(0, intervalSec - clampedElapsed);
+        const remainingSec = Math.max(0, (nextRunAt - nowMs) / 1000);
+        let elapsedSec = intervalSec - remainingSec;
+        if (Number.isFinite(lastScheduledAt)) {
+          elapsedSec = Math.max(0, Math.min(intervalSec, (nowMs - lastScheduledAt) / 1000));
+        }
+        const clampedElapsed = Math.max(0, Math.min(intervalSec, elapsedSec));
         const progressPct = Math.max(0, Math.min(100, (clampedElapsed / intervalSec) * 100));
         strategyNextRunEl.textContent = `Next schedule in ${formatDuration(remainingSec)} (every ${intervalMin}m)`;
         strategyProgressFillEl.style.width = `${progressPct.toFixed(1)}%`;
