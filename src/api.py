@@ -723,11 +723,13 @@ def dashboard():
         border: 1px solid var(--border);
         border-radius: 14px;
         padding: 12px;
+        align-self: start;
       }
       .panel-grid {
         display: grid;
         grid-template-columns: minmax(0, 3fr) minmax(0, 1.2fr);
         gap: 16px;
+        align-items: start;
       }
       .portfolio-panel {
         background: rgba(10, 16, 32, 0.6);
@@ -739,6 +741,7 @@ def dashboard():
       .side-stack {
         display: grid;
         gap: 12px;
+        align-content: start;
       }
       .strategy-panel {
         background: rgba(10, 16, 32, 0.6);
