@@ -742,6 +742,19 @@ def _price_to_cents(value):
         return int(round(v))
     return None
 
+def _price_to_cents_float(value):
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except Exception:
+        return None
+    if 0 < v <= 1.0:
+        return v * 100.0
+    if 0 < v <= 100:
+        return v
+    return v
+
 
 @app.get("/kalshi/portfolio/current")
 def get_portfolio_current_orders(status: str | None = "open", limit: int = 200):
@@ -768,23 +781,46 @@ def get_portfolio_current_orders(status: str | None = "open", limit: int = 200):
             side = "yes" if raw_side > 0 else "no"
 
         avg_price = p.get("avg_price") or p.get("average_price")
+        avg_price_cents_float = _price_to_cents_float(avg_price)
         price_cents = _price_to_cents(avg_price)
         if price_cents is None:
             price_cents = _extract_order_price_cents({"avg_price": avg_price})
 
-        cost_cents = (
+        fee_cents = (
+            _parse_dollar_str_to_cents(p.get("fees_paid_dollars"))
+            or _parse_dollar_str_to_cents(p.get("fees_paid"))
+            or _parse_dollar_str_to_cents(p.get("total_fees_dollars"))
+            or _parse_dollar_str_to_cents(p.get("total_fees"))
+            or 0
+        )
+        total_traded_cents = (
+            _parse_dollar_str_to_cents(p.get("total_traded_dollars"))
+            or _parse_dollar_str_to_cents(p.get("total_traded"))
+        )
+        total_cost_cents = (
             _parse_dollar_str_to_cents(p.get("total_cost_dollars"))
             or _parse_dollar_str_to_cents(p.get("total_cost"))
-            or _parse_dollar_str_to_cents(p.get("market_exposure_dollars"))
-            or _parse_dollar_str_to_cents(p.get("market_exposure"))
-            or _parse_dollar_str_to_cents(p.get("total_traded_dollars"))
-            or _parse_dollar_str_to_cents(p.get("total_traded"))
             or _parse_dollar_str_to_cents(p.get("cost"))
         )
+
+        cost_cents = None
+        # Prefer explicit fee-inclusive total cost if available.
+        if total_cost_cents is not None:
+            cost_cents = total_cost_cents
+        # Otherwise derive fee-inclusive cost from traded + fees.
+        if cost_cents is None and total_traded_cents is not None:
+            cost_cents = int(total_traded_cents) + int(fee_cents or 0)
+        # Fallback to avg_price * contracts.
+        if cost_cents is None and avg_price_cents_float is not None and count:
+            cost_cents = int(round(float(avg_price_cents_float) * int(count)))
         if cost_cents is None and price_cents is not None and count:
             cost_cents = price_cents * int(count)
         max_payout_cents = 100 * int(count) if count else None
-        market_value_cents = _parse_dollar_str_to_cents(p.get("market_value"))
+        market_value_cents = (
+            _parse_dollar_str_to_cents(p.get("market_value"))
+            or _parse_dollar_str_to_cents(p.get("market_exposure_dollars"))
+            or _parse_dollar_str_to_cents(p.get("market_exposure"))
+        )
         pnl_cents = (
             _parse_dollar_str_to_cents(p.get("unrealized_pnl_dollars"))
             or _parse_dollar_str_to_cents(p.get("unrealized_pnl"))
@@ -797,7 +833,6 @@ def get_portfolio_current_orders(status: str | None = "open", limit: int = 200):
         if cost_cents is None and market_value_cents is not None and pnl_cents is not None:
             cost_cents = market_value_cents - pnl_cents
         if pnl_cents is None and ticker and count:
-            total_traded_cents = _parse_dollar_str_to_cents(p.get("total_traded_dollars")) or _parse_dollar_str_to_cents(p.get("total_traded"))
             if price_cents is None and total_traded_cents is not None and count:
                 price_cents = int(round(total_traded_cents / int(count)))
             try:
@@ -1104,10 +1139,10 @@ def dashboard():
         font-family: "Space Grotesk", "IBM Plex Sans", "Segoe UI", sans-serif;
         display: grid;
         place-items: center;
-        padding: 24px;
+        padding: 12px;
       }
       .wrap {
-        width: min(1500px, 100%);
+        width: min(2200px, 100%);
       }
       .card {
         background: var(--card);
@@ -1223,7 +1258,7 @@ def dashboard():
       }
       .top-panels {
         display: grid;
-        grid-template-columns: repeat(4, minmax(0, 1fr));
+        grid-template-columns: minmax(0, 1.35fr) minmax(0, 1.55fr) minmax(0, 1.55fr) minmax(0, 1.35fr);
         grid-template-areas:
           "markets manual auto portfolio";
         gap: 16px;
