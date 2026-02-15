@@ -674,13 +674,40 @@ def place_best_ask_order(side: str, ticker: str, max_cost_cents: int = 500):
             body = resp.text
 
         body_obj = body if isinstance(body, dict) else {}
-        price_cents = _maybe_int(
-            body_obj.get("yes_price")
-            or body_obj.get("no_price")
-            or body_obj.get("price")
-            or body_obj.get("limit_price")
-        )
-        count = _maybe_int(body_obj.get("count") or body_obj.get("quantity") or body_obj.get("filled_count"))
+
+        def _deep_find_first_number(obj, keys):
+            if isinstance(obj, dict):
+                for k in keys:
+                    v = obj.get(k)
+                    if isinstance(v, (int, float)):
+                        return int(v)
+                for v in obj.values():
+                    found = _deep_find_first_number(v, keys)
+                    if found is not None:
+                        return found
+            elif isinstance(obj, list):
+                for item in obj:
+                    found = _deep_find_first_number(item, keys)
+                    if found is not None:
+                        return found
+            return None
+
+        price_keys = [f"{side_norm}_price", "yes_price", "no_price", "price", "limit_price", "avg_price"]
+        count_keys = ["filled_count", "matched_count", "executed_count", "count", "quantity"]
+        price_cents = _deep_find_first_number(body_obj, price_keys)
+        count = _deep_find_first_number(body_obj, count_keys)
+
+        # Fallback to submitted best-ask intent when exchange response omits fill/order fields.
+        if price_cents is None or count is None:
+            try:
+                top = client.get_top_of_book(ticker)
+                ask = top.get(f"{side_norm}_ask")
+                if price_cents is None and ask is not None:
+                    price_cents = int(ask)
+                if count is None and ask is not None and int(ask) > 0:
+                    count = int(int(max_cost_cents) // int(ask))
+            except Exception:
+                pass
         _log_trade_ledger(
             source="/kalshi/place_best_ask_order",
             run_mode="live",
