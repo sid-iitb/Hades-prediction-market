@@ -1223,29 +1223,32 @@ def dashboard():
       }
       .top-panels {
         display: grid;
-        grid-template-columns: minmax(0, 1.05fr) minmax(0, 1.95fr);
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        grid-template-areas:
+          "markets manual auto portfolio";
         gap: 16px;
         align-items: start;
       }
+      .markets { grid-area: markets; }
       .portfolio-panel {
         background: rgba(10, 16, 32, 0.6);
         border: 1px solid var(--border);
         border-radius: 14px;
         padding: 12px;
         min-height: 260px;
+        grid-area: portfolio;
+      }
+      .manual-panel {
+        grid-area: manual;
+      }
+      .auto-panel {
+        grid-area: auto;
       }
       .strategy-panel {
         background: rgba(10, 16, 32, 0.6);
         border: 1px solid var(--border);
         border-radius: 14px;
         padding: 12px;
-      }
-      .strategy-stack {
-        display: grid;
-        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-        gap: 16px;
-        align-content: start;
-        align-items: start;
       }
       .portfolio-summary {
         font-size: 12px;
@@ -1353,6 +1356,12 @@ def dashboard():
         padding: 4px 8px;
         font-size: 11px;
         margin-left: 6px;
+      }
+      .markets tr.row-hot td {
+        background: rgba(34, 211, 238, 0.08);
+      }
+      .markets tr.row-hot td:first-child {
+        box-shadow: inset 2px 0 0 rgba(34, 211, 238, 0.55);
       }
       .trade-status {
         margin-top: 8px;
@@ -1508,8 +1517,14 @@ def dashboard():
         .card { padding: 22px; }
         .hero { grid-template-columns: 1fr; }
         .expiry-card { justify-items: start; }
-        .top-panels { grid-template-columns: 1fr; }
-        .strategy-stack { grid-template-columns: 1fr; }
+        .top-panels {
+          grid-template-columns: 1fr;
+          grid-template-areas:
+            "markets"
+            "manual"
+            "auto"
+            "portfolio";
+        }
       }
     </style>
   </head>
@@ -1552,19 +1567,17 @@ def dashboard():
                 <thead>
                   <tr>
                     <th>Strike</th>
-                    <th>Ticker</th>
                     <th>Yes Ask</th>
                     <th>No Ask</th>
                     <th>Subtitle</th>
                   </tr>
                 </thead>
                 <tbody id="markets-body">
-                  <tr><td colspan="5">Click Refresh to load markets.</td></tr>
+                  <tr><td colspan="4">Click Refresh to load markets.</td></tr>
                 </tbody>
               </table>
             </div>
-            <div class="strategy-stack">
-              <div class="strategy-panel">
+              <div class="strategy-panel manual-panel">
                 <div class="markets-header">
                   <h3>Farthest Strategy: Manual</h3>
                 </div>
@@ -1607,7 +1620,7 @@ def dashboard():
                 <div id="manual-strategy-planned-order" class="planned-order">Manual planned order will appear after Preview.</div>
                 <div id="manual-strategy-candidates" class="candidate-list"></div>
               </div>
-              <div class="strategy-panel">
+              <div class="strategy-panel auto-panel">
                 <div class="markets-header">
                   <h3>Farthest Strategy: Auto</h3>
                 </div>
@@ -1667,28 +1680,33 @@ def dashboard():
                 <div id="auto-strategy-planned-order" class="planned-order">Auto plan will appear after Auto Status.</div>
                 <div id="auto-strategy-candidates" class="candidate-list"></div>
               </div>
-            </div>
-          </div>
-          <div class="portfolio-panel">
-            <div class="markets-header">
-              <h3>Current Portfolio</h3>
-              <button id="refresh-portfolio" class="btn" type="button">Refresh</button>
-            </div>
-            <div id="portfolio-summary" class="portfolio-summary">No data loaded.</div>
-            <table class="portfolio-table">
-              <thead>
-                <tr>
-                  <th>Ticker</th>
-                  <th>Side</th>
-                  <th>Cost</th>
-                  <th>P/L</th>
-                  <th>Max</th>
-                </tr>
-              </thead>
-              <tbody id="portfolio-body">
-                <tr><td colspan="5">Click Refresh to load orders.</td></tr>
-              </tbody>
-            </table>
+              <div class="portfolio-panel">
+                <div class="markets-header">
+                  <h3>Current Portfolio</h3>
+                  <div class="markets-actions">
+                    <label class="max-cost">
+                      <input id="portfolio-btc-only" type="checkbox" checked />
+                      BTC only
+                    </label>
+                    <button id="refresh-portfolio" class="btn" type="button">Refresh</button>
+                  </div>
+                </div>
+                <div id="portfolio-summary" class="portfolio-summary">No data loaded.</div>
+                <table class="portfolio-table">
+                  <thead>
+                    <tr>
+                      <th>Ticker</th>
+                      <th>Side</th>
+                      <th>Cost</th>
+                      <th>P/L</th>
+                      <th>Max</th>
+                    </tr>
+                  </thead>
+                  <tbody id="portfolio-body">
+                    <tr><td colspan="5">Click Refresh to load orders.</td></tr>
+                  </tbody>
+                </table>
+              </div>
           </div>
           <div class="ledger-panel">
             <div class="markets-header">
@@ -1732,6 +1750,7 @@ def dashboard():
       const refreshMarketsBtn = document.getElementById("refresh-markets");
       const maxCostEl = document.getElementById("max-cost");
       const refreshPortfolioBtn = document.getElementById("refresh-portfolio");
+      const portfolioBtcOnlyEl = document.getElementById("portfolio-btc-only");
       const portfolioSummaryEl = document.getElementById("portfolio-summary");
       const portfolioBody = document.getElementById("portfolio-body");
       const refreshLedgerBtn = document.getElementById("refresh-ledger");
@@ -1911,7 +1930,7 @@ def dashboard():
 
       function renderMarkets(markets) {
         if (!markets || !markets.length) {
-          marketsBody.innerHTML = "<tr><td colspan=\\"5\\">No markets found.</td></tr>";
+          marketsBody.innerHTML = "<tr><td colspan=\\"4\\">No markets found.</td></tr>";
           return;
         }
         const rows = markets.slice(0, 20).map(m => {
@@ -1919,11 +1938,12 @@ def dashboard():
           const ticker = m.ticker || "";
           const yesAsk = m.yes_ask ?? "--";
           const noAsk = m.no_ask ?? "--";
+          const yesNum = Number(yesAsk);
+          const rowHot = Number.isFinite(yesNum) && yesNum >= 90 && yesNum <= 99;
           const subtitle = m.subtitle || "";
           return `
-            <tr>
+            <tr class="${rowHot ? "row-hot" : ""}">
               <td>${strike ? strike.toLocaleString("en-US", { style: "currency", currency: "USD" }) : "--"}</td>
-              <td>${ticker}</td>
               <td>
                 ${yesAsk}c
                 <button class="btn trade" data-side="yes" data-ticker="${ticker}">YES</button>
@@ -1936,7 +1956,7 @@ def dashboard():
             </tr>
           `;
         }).join("");
-        marketsBody.innerHTML = rows + `<tr><td colspan="5"><div id="trade-status" class="trade-status">Ready.</div></td></tr>`;
+        marketsBody.innerHTML = rows + `<tr><td colspan="4"><div id="trade-status" class="trade-status">Ready.</div></td></tr>`;
         marketsBody.querySelectorAll("button.trade").forEach(btn => {
           btn.addEventListener("click", () => {
             const side = btn.getAttribute("data-side");
@@ -2003,6 +2023,44 @@ def dashboard():
         const dollars = cents / 100;
         const sign = dollars >= 0 ? "" : "-";
         return `${sign}$${Math.abs(dollars).toFixed(2)}`;
+      }
+
+      function asIntOrNull(v) {
+        if (v === null || v === undefined) return null;
+        const n = Number(v);
+        if (!Number.isFinite(n)) return null;
+        return Math.round(n);
+      }
+
+      function dollarsToCentsOrNull(v) {
+        if (v === null || v === undefined) return null;
+        if (typeof v === "string") {
+          const raw = v.trim();
+          const cleaned = raw.replace(/[$,]/g, "");
+          if (!cleaned) return null;
+          const n = Number(cleaned);
+          if (!Number.isFinite(n)) return null;
+          // Heuristic: whole numbers >= 1000 are often cent-denominated even without _cents suffix.
+          if (/^-?\d+$/.test(cleaned) && Math.abs(n) >= 1000) return Math.round(n);
+          return Math.round(n * 100);
+        }
+        const n = Number(v);
+        if (!Number.isFinite(n)) return null;
+        // Heuristic: large whole numbers are likely cents.
+        if (Number.isInteger(n) && Math.abs(n) >= 1000) return Math.round(n);
+        return Math.round(n * 100);
+      }
+
+      function pickBalanceCents(balance, centsKeys, dollarKeys) {
+        for (const k of centsKeys) {
+          const v = asIntOrNull(balance?.[k]);
+          if (v !== null) return v;
+        }
+        for (const k of dollarKeys) {
+          const v = dollarsToCentsOrNull(balance?.[k]);
+          if (v !== null) return v;
+        }
+        return null;
       }
 
       function strategyParams(includeMode = false, includeInterval = false) {
@@ -2316,11 +2374,62 @@ def dashboard():
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
           const data = await res.json();
           const balance = data.balance || {};
-          const cash = formatCents(balance.cash_balance_cents ?? balance.cash_balance);
-          const portfolio = formatCents(balance.portfolio_value_cents ?? balance.portfolio_value);
-          portfolioSummaryEl.textContent = `Cash: ${cash} | Portfolio: ${portfolio}`;
+          const cashCents = pickBalanceCents(
+            balance,
+            ["cash_balance_cents", "available_cash_cents", "free_balance_cents", "spendable_balance_cents", "balance_cents"],
+            ["cash_balance", "available_cash", "free_balance", "spendable_balance", "balance"],
+          );
+          const portfolioCents = pickBalanceCents(
+            balance,
+            ["portfolio_value_cents", "account_value_cents", "net_liquidation_value_cents", "total_value_cents", "portfolio_balance_cents"],
+            ["portfolio_value", "account_value", "net_liquidation_value", "total_value", "portfolio_balance"],
+          );
+          const balancePositionCents = pickBalanceCents(
+            balance,
+            ["market_value_cents", "position_value_cents", "positions_value_cents"],
+            ["market_value", "position_value", "positions_value"],
+          );
 
-          const orders = data.orders || [];
+          const allOrders = data.orders || [];
+          const btcOnly = Boolean(portfolioBtcOnlyEl?.checked);
+          const orders = btcOnly
+            ? allOrders.filter(o => String(o?.ticker || "").toUpperCase().startsWith("KXBTCD-"))
+            : allOrders;
+          let rowsPositionCents = null;
+          if (orders.length) {
+            let acc = 0;
+            let seen = 0;
+            for (const o of orders) {
+              const cnt = asIntOrNull(o?.count) || 0;
+              if (cnt <= 0) continue;
+              const c = asIntOrNull(o?.cost_cents);
+              const p = asIntOrNull(o?.pnl_cents);
+              if (c !== null && p !== null) {
+                acc += (c + p);
+                seen += 1;
+              }
+            }
+            if (seen > 0) rowsPositionCents = acc;
+          }
+
+          let positionValueCents = rowsPositionCents;
+          if (positionValueCents === null) positionValueCents = balancePositionCents;
+          if (positionValueCents === null && portfolioCents !== null && cashCents !== null) {
+            positionValueCents = portfolioCents - cashCents;
+          }
+
+          let portfolioDisplayCents = null;
+          if (cashCents !== null && positionValueCents !== null) {
+            portfolioDisplayCents = cashCents + positionValueCents;
+          } else {
+            portfolioDisplayCents = portfolioCents;
+          }
+
+          const cash = formatCents(cashCents);
+          const portfolio = formatCents(portfolioDisplayCents);
+          const positionValue = formatCents(positionValueCents);
+          portfolioSummaryEl.textContent = `Cash: ${cash} | Portfolio: ${portfolio} | Position Value: ${positionValue}${btcOnly ? " | Filter: BTC only" : ""}`;
+
           if (!orders.length) {
             portfolioBody.innerHTML = "<tr><td colspan=\\"5\\">No orders found.</td></tr>";
             return;
@@ -2440,6 +2549,7 @@ def dashboard():
       refreshChart();
       refreshMarketsBtn.addEventListener("click", refreshMarkets);
       refreshPortfolioBtn.addEventListener("click", refreshPortfolio);
+      portfolioBtcOnlyEl.addEventListener("change", refreshPortfolio);
       refreshLedgerBtn.addEventListener("click", refreshLedger);
       [manualStrategyModeEl, manualStrategySideEl, manualStrategyAskMinEl, manualStrategyAskMaxEl, manualStrategyMaxCostEl, manualStrategyIntervalEl]
         .forEach(el => el.addEventListener("change", () => syncStrategyControls(true)));
