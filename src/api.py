@@ -145,6 +145,7 @@ def _maybe_int(v):
 def _record_strategy_ledger(out: dict, source: str):
     cycle = (out or {}).get("result") or {}
     spot = (out or {}).get("spot")
+    action_name = cycle.get("action")
     mode_hint = (
         cycle.get("entry", {}).get("mode")
         or cycle.get("reentry", {}).get("mode")
@@ -153,7 +154,8 @@ def _record_strategy_ledger(out: dict, source: str):
     )
 
     entry = cycle.get("entry")
-    if isinstance(entry, dict) and entry.get("active_position"):
+    multi_leg_actions = {"stop_loss_rotate", "rollover_reenter", "scheduled_rebalance"}
+    if isinstance(entry, dict) and entry.get("active_position") and action_name not in multi_leg_actions:
         ap = entry.get("active_position") or {}
         _log_trade_ledger(
             source=source,
@@ -165,13 +167,22 @@ def _record_strategy_ledger(out: dict, source: str):
             count=_maybe_int(ap.get("count")),
             status_code=_maybe_int(entry.get("status_code")),
             success=(entry.get("mode") != "live") or (_maybe_int(entry.get("status_code")) in {200, 201}),
-            note=f"strategy_action={cycle.get('action')} spot={spot}",
+            note=f"strategy_action={action_name} spot={spot}",
             payload=entry,
         )
 
-    if cycle.get("action") in {"stop_loss_rotate", "rollover_reenter", "scheduled_rebalance"}:
+    if action_name in multi_leg_actions:
         exited = cycle.get("exited_position") or {}
         exit_leg = cycle.get("exit") or {}
+        if action_name == "stop_loss_rotate":
+            exit_note = f"stop_loss pnl_pct={cycle.get('pnl_pct')}"
+            reentry_note = "reentry_after_stop_loss"
+        elif action_name == "scheduled_rebalance":
+            exit_note = "scheduled_rebalance_exit"
+            reentry_note = "scheduled_rebalance_reentry"
+        else:
+            exit_note = "rollover_exit_stale_ticker"
+            reentry_note = "rollover_reentry_latest_event"
         _log_trade_ledger(
             source=source,
             run_mode=exit_leg.get("mode") or mode_hint,
@@ -182,7 +193,7 @@ def _record_strategy_ledger(out: dict, source: str):
             count=_maybe_int(exited.get("count")),
             status_code=_maybe_int(exit_leg.get("status_code")),
             success=(exit_leg.get("mode") != "live") or (_maybe_int(exit_leg.get("status_code")) in {200, 201}),
-            note=f"stop_loss pnl_pct={cycle.get('pnl_pct')}",
+            note=exit_note,
             payload=exit_leg,
         )
         reentry = cycle.get("reentry") or cycle.get("entry") or {}
@@ -198,7 +209,7 @@ def _record_strategy_ledger(out: dict, source: str):
                 count=_maybe_int(ap.get("count")),
                 status_code=_maybe_int(reentry.get("status_code")),
                 success=(reentry.get("mode") != "live") or (_maybe_int(reentry.get("status_code")) in {200, 201}),
-                note="reentry_after_exit",
+                note=reentry_note,
                 payload=reentry,
             )
 
@@ -1014,7 +1025,7 @@ def dashboard():
       }
       .top-panels {
         display: grid;
-        grid-template-columns: minmax(0, 1fr) minmax(0, 1.35fr);
+        grid-template-columns: minmax(0, 1.05fr) minmax(0, 1.95fr);
         gap: 16px;
         align-items: start;
       }
@@ -1033,8 +1044,10 @@ def dashboard():
       }
       .strategy-stack {
         display: grid;
-        gap: 12px;
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+        gap: 16px;
         align-content: start;
+        align-items: start;
       }
       .portfolio-summary {
         font-size: 12px;
@@ -1288,6 +1301,7 @@ def dashboard():
         .meta { gap: 10px; }
         .stats { grid-template-columns: 1fr; }
         .top-panels { grid-template-columns: 1fr; }
+        .strategy-stack { grid-template-columns: 1fr; }
       }
     </style>
   </head>

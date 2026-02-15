@@ -16,7 +16,7 @@ class FarthestBandConfig:
     mode: str = "paper"  # "paper" or "live"
     interval_minutes: int = 15
     stop_loss_pct: float = 0.20
-    rebalance_each_interval: bool = True
+    rebalance_each_interval: bool = False
 
 
 def _safe_json(resp):

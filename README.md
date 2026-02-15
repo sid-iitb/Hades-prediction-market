@@ -111,6 +111,7 @@ python -m src.api
   - Starts background auto-execution on interval (default 15 minutes).
   - Auto cycles apply the same `-20%` stop-loss exit-and-rotate behavior.
   - Stop-loss evaluation runs every 5 minutes while auto mode is active; new scheduled entries still follow `interval_minutes`.
+  - Positions are held across intervals by default; exits happen on stop-loss or ticker rollover.
 - `GET /strategy/farthest_band/auto/status`
   - Returns running state, active config, last run time, and last result.
 - `GET /strategy/farthest_band/auto/stop`
