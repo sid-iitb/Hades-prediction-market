@@ -283,11 +283,23 @@ def _enter_position(client: KalshiClient, selection: dict, config: FarthestBandC
         price_cents=ask_cents,
         count=count,
     )
+    status_code = int(resp.status_code)
+    body = _safe_json(resp)
+    if status_code not in {200, 201}:
+        return {
+            "action": "hold",
+            "reason": f"Live buy failed with status {status_code}",
+            "mode": "live",
+            "status_code": status_code,
+            "response": body,
+            "selection": selection,
+            "active_position": None,
+        }
     return {
         "action": reason,
         "mode": "live",
-        "status_code": resp.status_code,
-        "response": _safe_json(resp),
+        "status_code": status_code,
+        "response": body,
         "selection": selection,
         "active_position": active,
     }
@@ -321,11 +333,23 @@ def _exit_position(client: KalshiClient, active_position: dict, config: Farthest
         price_cents=int(bid_cents),
         count=count,
     )
+    status_code = int(resp.status_code)
+    body = _safe_json(resp)
+    if status_code not in {200, 201}:
+        return {
+            "action": "hold",
+            "reason": f"Live sell failed with status {status_code}",
+            "mode": "live",
+            "status_code": status_code,
+            "response": body,
+            "exit_price_cents": int(bid_cents),
+            "top_of_book": top,
+        }
     return {
         "action": reason,
         "mode": "live",
-        "status_code": resp.status_code,
-        "response": _safe_json(resp),
+        "status_code": status_code,
+        "response": body,
         "exit_price_cents": int(bid_cents),
         "top_of_book": top,
     }
