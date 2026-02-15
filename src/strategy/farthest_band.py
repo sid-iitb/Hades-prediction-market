@@ -229,10 +229,11 @@ def _mark_price_and_pnl(client: KalshiClient, active_position: dict) -> dict:
 
     top = client.get_top_of_book(active_position["ticker"])
     bid_key = f"{side}_bid"
-    ask_key = f"{side}_ask"
     mark_cents = top.get(bid_key)
+    # Stop-loss should be based on executable downside (bid), not optimistic ask.
+    # If bid is unavailable, treat mark as 0 so risk control remains conservative.
     if mark_cents is None:
-        mark_cents = top.get(ask_key)
+        mark_cents = 0
 
     entry = int(active_position.get("entry_price_cents") or 0)
     pnl_pct = None
@@ -343,23 +344,6 @@ def run_farthest_band_cycle(
     current_tickers = {str(m.get("ticker")) for m in (markets or []) if m.get("ticker")}
 
     if active:
-        if force_rebalance:
-            selection = select_farthest_band_market(spot=spot, markets=markets, config=config)
-            entry = _enter_position(
-                client=client,
-                selection=selection,
-                config=config,
-                spot=spot,
-                reason="scheduled_add_entry",
-            )
-            return {
-                "action": "scheduled_add_entry",
-                "reason": "Scheduled interval add entry (no sell)",
-                "previous_active_position": active,
-                "entry": entry,
-                "active_position": entry.get("active_position"),
-            }
-
         # If the active ticker is not in the latest ingest market set, roll to current event.
         if str(active.get("ticker")) not in current_tickers:
             exit_result = _exit_position(client, active, config, reason="rollover_exit_stale_ticker")
@@ -422,6 +406,25 @@ def run_farthest_band_cycle(
                 "exit": exit_result,
                 "reentry": reentry_result,
                 "active_position": reentry_result.get("active_position"),
+            }
+
+        if force_rebalance:
+            selection = select_farthest_band_market(spot=spot, markets=markets, config=config)
+            entry = _enter_position(
+                client=client,
+                selection=selection,
+                config=config,
+                spot=spot,
+                reason="scheduled_add_entry",
+            )
+            # Keep the current active position if no new order was selected/placed.
+            next_active = entry.get("active_position") or active
+            return {
+                "action": "scheduled_add_entry",
+                "reason": "Scheduled interval add entry (no sell)",
+                "previous_active_position": active,
+                "entry": entry,
+                "active_position": next_active,
             }
 
         return {

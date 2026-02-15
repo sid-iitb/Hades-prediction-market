@@ -223,6 +223,7 @@ _farthest_auto_state = {
     "next_scheduled_run_at": None,
     "last_result": None,
     "active_position": None,
+    "active_positions": [],
     "active_position_mode": None,
 }
 
@@ -416,6 +417,127 @@ def _run_farthest_band_once(
     }
 
 
+def _normalize_active_positions(raw_positions):
+    normalized = []
+    for p in raw_positions or []:
+        if not isinstance(p, dict):
+            continue
+        ticker = str(p.get("ticker") or "").strip()
+        side = str(p.get("side") or "").strip().lower()
+        count = _maybe_int(p.get("count")) or 0
+        entry_price = _maybe_int(p.get("entry_price_cents")) or 0
+        if not ticker or side not in {"yes", "no"} or count < 1 or entry_price < 1:
+            continue
+        row = dict(p)
+        row["ticker"] = ticker
+        row["side"] = side
+        row["count"] = int(count)
+        row["entry_price_cents"] = int(entry_price)
+        normalized.append(row)
+    return normalized
+
+
+def _market_event_prefix(ticker: str | None) -> str | None:
+    t = str(ticker or "").strip()
+    if not t:
+        return None
+    i = t.rfind("-T")
+    if i > 0:
+        return t[:i]
+    return None
+
+
+def _seed_active_positions_from_portfolio(config: FarthestBandConfig) -> list[dict]:
+    """
+    Recover strategy-tracked positions from live portfolio so stop-loss can
+    continue protecting positions after API restarts.
+    """
+    if str(config.mode).lower() != "live":
+        return []
+
+    client = KalshiClient()
+    try:
+        positions = client.get_positions()
+    except Exception:
+        return []
+
+    ingest = _latest_ingest_record() or {}
+    latest_event = str(ingest.get("event_ticker") or "").strip()
+    markets = ingest.get("markets") or []
+    latest_market_tickers = {str(m.get("ticker")) for m in markets if m.get("ticker")}
+
+    side_filter = str(config.side or "").lower()
+    rows = positions.get("market_positions") or positions.get("positions") or []
+    recovered = []
+    def _to_float(v):
+        try:
+            if v is None:
+                return None
+            return float(v)
+        except Exception:
+            return None
+
+    for p in rows:
+        ticker = str(p.get("ticker") or p.get("market_ticker") or p.get("event_ticker") or "").strip()
+        if not ticker:
+            continue
+
+        # Restrict recovery to BTC contract family and, when available, current event set.
+        if not ticker.startswith("KXBTCD-"):
+            continue
+        if latest_market_tickers and ticker not in latest_market_tickers:
+            prefix = _market_event_prefix(ticker)
+            if latest_event and prefix != latest_event:
+                continue
+
+        raw_side = p.get("side") if p.get("side") is not None else p.get("position")
+        side = str(raw_side).lower() if raw_side is not None else ""
+        if isinstance(raw_side, (int, float)) and raw_side != 0:
+            side = "yes" if raw_side > 0 else "no"
+        if side not in {"yes", "no"}:
+            continue
+        if side != side_filter:
+            continue
+
+        count = p.get("contracts") or p.get("quantity") or p.get("count") or 0
+        if not count and isinstance(raw_side, (int, float)):
+            count = int(abs(raw_side))
+        count = _maybe_int(count) or 0
+        if count < 1:
+            continue
+
+        avg_price = p.get("avg_price") or p.get("average_price")
+        entry_price = _price_to_cents(avg_price)
+        if entry_price is None:
+            traded = (
+                _parse_dollar_str_to_cents(p.get("total_traded_dollars"))
+                or _parse_dollar_str_to_cents(p.get("total_traded"))
+            )
+            if traded is not None and count > 0:
+                entry_price = int(round(float(traded) / float(count)))
+        if entry_price is None or entry_price < 1:
+            continue
+
+        strike = _to_float(p.get("strike"))
+        if strike is None:
+            strike = _to_float(p.get("floor_strike"))
+        if strike is None:
+            strike = _to_float(p.get("cap_strike"))
+
+        recovered.append(
+            {
+                "ticker": ticker,
+                "strike": float(strike) if strike is not None else None,
+                "side": side,
+                "entry_price_cents": int(entry_price),
+                "count": int(count),
+                "opened_spot": None,
+            }
+        )
+
+    return _normalize_active_positions(recovered)
+
+
 def _farthest_band_worker():
     next_scheduled_at = datetime.datetime.now(timezone.utc)
     while not _farthest_auto_stop.is_set():
@@ -425,46 +547,72 @@ def _farthest_band_worker():
             active_mode = _farthest_auto_state.get("active_position_mode")
             cfg_mode = str(cfg_dict.get("mode") or "").lower()
             if active_mode == cfg_mode:
-                active_position = dict(_farthest_auto_state.get("active_position") or {}) or None
+                tracked = _normalize_active_positions(_farthest_auto_state.get("active_positions") or [])
+                if not tracked:
+                    single = dict(_farthest_auto_state.get("active_position") or {}) or None
+                    tracked = _normalize_active_positions([single] if single else [])
+                active_positions = tracked
             else:
-                active_position = None
+                active_positions = []
             _farthest_auto_state["next_scheduled_run_at"] = next_scheduled_at.isoformat()
         if not cfg_dict:
             break
 
         config = FarthestBandConfig(**cfg_dict)
-        should_run = bool(active_position) or (now_utc >= next_scheduled_at)
         is_scheduled_run = now_utc >= next_scheduled_at
+        did_run = False
+        run_at = None
+        latest_out = None
+        next_active_positions = []
 
-        if should_run:
+        if active_positions or is_scheduled_run:
+            did_run = True
             run_at = datetime.datetime.now(timezone.utc).isoformat()
-            try:
-                force_rebalance = bool(
-                    is_scheduled_run
-                    and active_position
-                    and bool(getattr(config, "rebalance_each_interval", True))
-                )
-                out = _run_farthest_band_once(
-                    config,
-                    active_position=active_position,
-                    force_rebalance=force_rebalance,
-                )
-            except Exception as exc:
-                out = {"action": "error", "reason": str(exc)}
-            _record_strategy_ledger(out, source="/strategy/farthest_band/auto")
+            for pos in active_positions:
+                try:
+                    out = _run_farthest_band_once(
+                        config,
+                        active_position=pos,
+                        force_rebalance=False,
+                    )
+                except Exception as exc:
+                    out = {"action": "error", "reason": str(exc), "active_position": pos}
+                _record_strategy_ledger(out, source="/strategy/farthest_band/auto")
+                latest_out = out
+                next_pos = out.get("active_position")
+                if isinstance(next_pos, dict):
+                    next_active_positions.append(next_pos)
+
+            if is_scheduled_run:
+                try:
+                    scheduled_out = _run_farthest_band_once(
+                        config,
+                        active_position=None,
+                        force_rebalance=False,
+                    )
+                except Exception as exc:
+                    scheduled_out = {"action": "error", "reason": str(exc)}
+                _record_strategy_ledger(scheduled_out, source="/strategy/farthest_band/auto")
+                latest_out = scheduled_out
+                scheduled_pos = scheduled_out.get("active_position")
+                if isinstance(scheduled_pos, dict):
+                    next_active_positions.append(scheduled_pos)
 
             if is_scheduled_run:
                 interval_seconds = max(int(config.interval_minutes) * 60, 60)
                 next_scheduled_at = now_utc + timedelta(seconds=interval_seconds)
 
+        if did_run:
+            normalized_positions = _normalize_active_positions(next_active_positions)
             with _farthest_auto_lock:
                 _farthest_auto_state["last_run_at"] = run_at
                 if is_scheduled_run:
                     _farthest_auto_state["last_scheduled_run_at"] = run_at
                 _farthest_auto_state["next_scheduled_run_at"] = next_scheduled_at.isoformat()
-                _farthest_auto_state["last_result"] = out
-                _farthest_auto_state["active_position"] = out.get("active_position")
-                _farthest_auto_state["active_position_mode"] = cfg_mode if out.get("active_position") else None
+                _farthest_auto_state["last_result"] = latest_out
+                _farthest_auto_state["active_positions"] = normalized_positions
+                _farthest_auto_state["active_position"] = normalized_positions[-1] if normalized_positions else None
+                _farthest_auto_state["active_position_mode"] = cfg_mode if normalized_positions else None
 
         # Wake at the earlier of:
         # - next scheduled interval execution
@@ -812,6 +960,7 @@ def strategy_farthest_band_auto_start(
     interval_minutes: int = 15,
 ):
     global _farthest_auto_thread
+    cfg_mode = str(mode or "").lower()
 
     config = FarthestBandConfig(
         direction="lower",
@@ -838,8 +987,10 @@ def strategy_farthest_band_auto_start(
         _farthest_auto_state["last_scheduled_run_at"] = None
         _farthest_auto_state["next_scheduled_run_at"] = datetime.datetime.now(timezone.utc).isoformat()
         _farthest_auto_state["last_result"] = None
-        _farthest_auto_state["active_position"] = None
-        _farthest_auto_state["active_position_mode"] = None
+        seeded_positions = _seed_active_positions_from_portfolio(config)
+        _farthest_auto_state["active_positions"] = seeded_positions
+        _farthest_auto_state["active_position"] = seeded_positions[-1] if seeded_positions else None
+        _farthest_auto_state["active_position_mode"] = cfg_mode if seeded_positions else None
         _farthest_auto_thread = threading.Thread(
             target=_farthest_band_worker,
             name="farthest-band-auto",
@@ -850,6 +1001,7 @@ def strategy_farthest_band_auto_start(
     return {
         "running": True,
         "message": "Auto strategy started",
+        "seeded_active_positions": len(_farthest_auto_state.get("active_positions") or []),
         "state": _farthest_auto_state,
     }
 
@@ -860,10 +1012,12 @@ def strategy_farthest_band_auto_stop():
     with _farthest_auto_lock:
         _farthest_auto_state["running"] = False
         active_position = _farthest_auto_state.get("active_position")
+        active_positions = list(_farthest_auto_state.get("active_positions") or [])
     return {
         "running": False,
         "message": "Auto strategy stop requested",
         "active_position": active_position,
+        "active_positions": active_positions,
     }
 
 
@@ -871,6 +1025,7 @@ def strategy_farthest_band_auto_stop():
 def strategy_farthest_band_reset():
     with _farthest_auto_lock:
         _farthest_auto_state["active_position"] = None
+        _farthest_auto_state["active_positions"] = []
         _farthest_auto_state["active_position_mode"] = None
         _farthest_auto_state["last_result"] = None
     return {"ok": True, "message": "Strategy active position reset"}
