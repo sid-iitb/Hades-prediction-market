@@ -1122,11 +1122,12 @@ def dashboard():
         gap: 18px;
       }
       .chart-wrap {
-        height: 260px;
+        height: 150px;
         background: rgba(7, 12, 24, 0.45);
         border: 1px solid var(--border);
         border-radius: 14px;
         padding: 12px;
+        position: relative;
       }
       canvas {
         width: 100%;
@@ -1153,17 +1154,53 @@ def dashboard():
         font-weight: 700;
         margin: 18px 0 8px 0;
       }
+      .hero {
+        display: grid;
+        grid-template-columns: minmax(0, 1.8fr) minmax(0, 1fr);
+        gap: 20px;
+        align-items: end;
+      }
+      .expiry-card {
+        display: grid;
+        justify-items: end;
+        gap: 8px;
+      }
+      .expiry-label {
+        color: var(--muted);
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+      }
+      .expiry-ticker {
+        color: var(--text);
+        font-size: 12px;
+        opacity: 0.85;
+      }
+      .expiry-value {
+        font-size: clamp(32px, 4.6vw, 62px);
+        font-weight: 700;
+        color: #ffd36a;
+        line-height: 1;
+        text-shadow: 0 0 18px rgba(244, 196, 48, 0.28);
+      }
+      .chart-tooltip {
+        position: absolute;
+        pointer-events: none;
+        transform: translate(-50%, -120%);
+        background: rgba(10, 16, 32, 0.95);
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        border-radius: 8px;
+        color: var(--text);
+        font-size: 11px;
+        line-height: 1.25;
+        padding: 6px 8px;
+        white-space: nowrap;
+        display: none;
+        z-index: 2;
+      }
       .sub {
         color: var(--muted);
         font-size: 14px;
-      }
-      .meta {
-        margin-top: 18px;
-        display: flex;
-        gap: 18px;
-        flex-wrap: wrap;
-        font-size: 13px;
-        color: var(--muted);
       }
       .pill {
         padding: 6px 10px;
@@ -1172,10 +1209,10 @@ def dashboard():
         color: var(--accent);
         border: 1px solid rgba(244, 196, 48, 0.35);
       }
-      .stats {
-        display: grid;
-        grid-template-columns: repeat(3, minmax(0, 1fr));
-        gap: 12px;
+      .pill.secondary {
+        background: rgba(255, 255, 255, 0.08);
+        color: var(--text);
+        border: 1px solid rgba(255, 255, 255, 0.18);
       }
       .markets {
         background: rgba(10, 16, 32, 0.6);
@@ -1467,26 +1504,10 @@ def dashboard():
         padding: 4px 2px;
         border-bottom: 1px solid rgba(255, 255, 255, 0.08);
       }
-      .stat {
-        background: rgba(255, 255, 255, 0.04);
-        border: 1px solid var(--border);
-        border-radius: 12px;
-        padding: 12px;
-      }
-      .stat .label {
-        color: var(--muted);
-        font-size: 11px;
-        text-transform: uppercase;
-        letter-spacing: 0.06em;
-      }
-      .stat .value {
-        font-size: 18px;
-        margin-top: 6px;
-      }
       @media (max-width: 520px) {
         .card { padding: 22px; }
-        .meta { gap: 10px; }
-        .stats { grid-template-columns: 1fr; }
+        .hero { grid-template-columns: 1fr; }
+        .expiry-card { justify-items: start; }
         .top-panels { grid-template-columns: 1fr; }
         .strategy-stack { grid-template-columns: 1fr; }
       }
@@ -1496,34 +1517,24 @@ def dashboard():
     <div class="wrap">
       <div class="card">
         <div class="grid">
-          <div>
-            <div class="title">
-              <span class="dot"></span>
-              Live BTC Ticker
+          <div class="hero">
+            <div>
+              <div class="title">
+                <span class="dot"></span>
+                Live BTC Ticker
+              </div>
+              <div id="price" class="price">$--</div>
+              <div id="ts" class="sub">Last update: --</div>
             </div>
-            <div id="price" class="price">$--</div>
-            <div id="ts" class="sub">Last update: --</div>
-            <div class="meta">
-              <span class="pill">Refresh: 5s</span>
-              <span id="status">Status: waiting</span>
+            <div class="expiry-card">
+              <div class="expiry-label">Ticker Expiry</div>
+              <div id="event-ticker-name" class="expiry-ticker">--</div>
+              <div id="event-expiry" class="expiry-value">--</div>
             </div>
           </div>
           <div class="chart-wrap">
             <canvas id="chart"></canvas>
-          </div>
-          <div class="stats">
-            <div class="stat">
-              <div class="label">Last Hour High</div>
-              <div id="high" class="value">--</div>
-            </div>
-            <div class="stat">
-              <div class="label">Last Hour Low</div>
-              <div id="low" class="value">--</div>
-            </div>
-            <div class="stat">
-              <div class="label">Samples</div>
-              <div id="count" class="value">--</div>
-            </div>
+            <div id="chart-tooltip" class="chart-tooltip"></div>
           </div>
           <div class="top-panels">
             <div class="markets">
@@ -1712,12 +1723,11 @@ def dashboard():
     <script>
       const priceEl = document.getElementById("price");
       const tsEl = document.getElementById("ts");
-      const statusEl = document.getElementById("status");
-      const highEl = document.getElementById("high");
-      const lowEl = document.getElementById("low");
-      const countEl = document.getElementById("count");
+      const eventExpiryEl = document.getElementById("event-expiry");
+      const eventTickerNameEl = document.getElementById("event-ticker-name");
       const canvas = document.getElementById("chart");
       const ctx = canvas.getContext("2d");
+      const chartTooltipEl = document.getElementById("chart-tooltip");
       const marketsBody = document.getElementById("markets-body");
       const refreshMarketsBtn = document.getElementById("refresh-markets");
       const maxCostEl = document.getElementById("max-cost");
@@ -1756,6 +1766,10 @@ def dashboard():
       const autoStrategyCandidatesEl = document.getElementById("auto-strategy-candidates");
       let strategyPreviewInflight = false;
       let strategyAutoStatusInflight = false;
+      let currentEventTicker = null;
+      let currentEventExpiryMs = null;
+      let chartScreenPoints = [];
+      let chartBounds = { left: 0, top: 0, width: 0, height: 0 };
 
       function syncStrategyControls(fromManual) {
         if (fromManual) {
@@ -1787,7 +1801,16 @@ def dashboard():
         resizeCanvas();
         const w = canvas.getBoundingClientRect().width;
         const h = canvas.getBoundingClientRect().height;
+        chartBounds = canvas.getBoundingClientRect();
         ctx.clearRect(0, 0, w, h);
+        chartScreenPoints = [];
+
+        const leftPad = 8;
+        const rightPad = 8;
+        const topPad = 6;
+        const bottomPad = 18;
+        const graphW = Math.max(1, w - leftPad - rightPad);
+        const graphH = Math.max(1, h - topPad - bottomPad);
 
         if (!points.length) {
           ctx.fillStyle = "rgba(255,255,255,0.6)";
@@ -1803,19 +1826,41 @@ def dashboard():
         const minY = min - pad;
         const maxY = max + pad;
 
-        const stepX = w / Math.max(points.length - 1, 1);
+        const stepX = graphW / Math.max(points.length - 1, 1);
 
         const gradient = ctx.createLinearGradient(0, 0, w, 0);
         gradient.addColorStop(0, getComputedStyle(document.documentElement).getPropertyValue("--graph-1").trim());
         gradient.addColorStop(0.5, getComputedStyle(document.documentElement).getPropertyValue("--graph-2").trim());
         gradient.addColorStop(1, getComputedStyle(document.documentElement).getPropertyValue("--graph-3").trim());
 
+        const firstTs = Number(points[0]?.tsMs || 0);
+        const lastTs = Number(points[points.length - 1]?.tsMs || 0);
+        if (firstTs > 0 && lastTs > firstTs) {
+          const fiveMinMs = 5 * 60 * 1000;
+          const firstTick = Math.ceil(firstTs / fiveMinMs) * fiveMinMs;
+          ctx.strokeStyle = "rgba(255,255,255,0.08)";
+          ctx.fillStyle = "rgba(255,255,255,0.45)";
+          ctx.font = "10px system-ui";
+          for (let t = firstTick; t <= lastTs; t += fiveMinMs) {
+            const x = leftPad + ((t - firstTs) / (lastTs - firstTs)) * graphW;
+            ctx.beginPath();
+            ctx.moveTo(x, topPad);
+            ctx.lineTo(x, topPad + graphH);
+            ctx.stroke();
+            const d = new Date(t);
+            const hh = String(d.getHours()).padStart(2, "0");
+            const mm = String(d.getMinutes()).padStart(2, "0");
+            ctx.fillText(`${hh}:${mm}`, x - 14, h - 3);
+          }
+        }
+
         ctx.lineWidth = 2;
         ctx.strokeStyle = gradient;
         ctx.beginPath();
         points.forEach((p, i) => {
-          const x = i * stepX;
-          const y = h - ((p.price - minY) / (maxY - minY)) * h;
+          const x = leftPad + i * stepX;
+          const y = topPad + graphH - ((p.price - minY) / (maxY - minY)) * graphH;
+          chartScreenPoints.push({ x, y, ts: p.ts, price: p.price });
           if (i === 0) ctx.moveTo(x, y);
           else ctx.lineTo(x, y);
         });
@@ -1824,13 +1869,13 @@ def dashboard():
         ctx.fillStyle = "rgba(255,255,255,0.08)";
         ctx.beginPath();
         points.forEach((p, i) => {
-          const x = i * stepX;
-          const y = h - ((p.price - minY) / (maxY - minY)) * h;
+          const x = leftPad + i * stepX;
+          const y = topPad + graphH - ((p.price - minY) / (maxY - minY)) * graphH;
           if (i === 0) ctx.moveTo(x, y);
           else ctx.lineTo(x, y);
         });
-        ctx.lineTo(w, h);
-        ctx.lineTo(0, h);
+        ctx.lineTo(leftPad + graphW, topPad + graphH);
+        ctx.lineTo(leftPad, topPad + graphH);
         ctx.closePath();
         ctx.fill();
       }
@@ -1845,10 +1890,7 @@ def dashboard():
             ? price.toLocaleString("en-US", { style: "currency", currency: "USD" })
             : "$--";
           tsEl.textContent = `Last update: ${data.Timestamp || "n/a"}`;
-          statusEl.textContent = "Status: live";
-        } catch (err) {
-          statusEl.textContent = "Status: error";
-        }
+        } catch (err) {}
       }
 
       async function refreshChart() {
@@ -1858,20 +1900,9 @@ def dashboard():
           const data = await res.json();
           const points = (data.records || []).map(r => ({
             ts: r.ts,
+            tsMs: Date.parse(r.ts || ""),
             price: Number(r.current_price || 0),
           })).filter(p => p.price > 0);
-
-          const prices = points.map(p => p.price);
-          if (prices.length) {
-            const high = Math.max(...prices);
-            const low = Math.min(...prices);
-            highEl.textContent = high.toLocaleString("en-US", { style: "currency", currency: "USD" });
-            lowEl.textContent = low.toLocaleString("en-US", { style: "currency", currency: "USD" });
-          } else {
-            highEl.textContent = "--";
-            lowEl.textContent = "--";
-          }
-          countEl.textContent = String(points.length);
           drawChart(points);
         } catch (err) {
           drawChart([]);
@@ -1922,10 +1953,23 @@ def dashboard():
           const data = await res.json();
           const records = data.records || [];
           const latest = records.length ? records[0] : null;
+          setEventExpiryFromIngest(latest);
+          updateEventExpiryCountdown();
           renderMarkets(latest ? (latest.markets || []) : []);
         } catch (err) {
           renderMarkets([]);
         }
+      }
+
+      async function refreshExpiryMeta() {
+        try {
+          const res = await fetch("/kalshi_ingest/latest");
+          if (!res.ok) return;
+          const data = await res.json();
+          const latest = (data.records || [])[0] || null;
+          setEventExpiryFromIngest(latest);
+          updateEventExpiryCountdown();
+        } catch (_) {}
       }
 
       async function placeBestAskOrder(side, ticker) {
@@ -1977,6 +2021,52 @@ def dashboard():
         const m = Math.floor(s / 60);
         const r = s % 60;
         return `${m}m ${String(r).padStart(2, "0")}s`;
+      }
+
+      function parseEventExpiryMs(eventTicker, ingestTs) {
+        const raw = String(eventTicker || "");
+        const parts = raw.split("-");
+        if (parts.length < 2) return null;
+        const token = String(parts[1] || "").toUpperCase();
+        const match = token.match(/^(\\d{2})([A-Z]{3})(\\d{2})(\\d{2})$/);
+        if (!match) return null;
+        // Kalshi BTC event token format: YYMONDDHH (e.g., 26FEB1505).
+        const year = 2000 + Number(match[1]);
+        const monTxt = match[2];
+        const day = Number(match[3]);
+        const hour = Number(match[4]);
+        const minute = 0;
+        const monthMap = { JAN: 0, FEB: 1, MAR: 2, APR: 3, MAY: 4, JUN: 5, JUL: 6, AUG: 7, SEP: 8, OCT: 9, NOV: 10, DEC: 11 };
+        const month = monthMap[monTxt];
+        if (month === undefined) return null;
+        // Ticker time token is interpreted as EST (UTC-5), then converted to UTC.
+        const expiryMs = Date.UTC(year, month, day, hour + 5, minute, 0, 0);
+        return Number.isFinite(expiryMs) ? expiryMs : null;
+      }
+
+      function setEventExpiryFromIngest(latest) {
+        if (!latest) {
+          currentEventTicker = null;
+          currentEventExpiryMs = null;
+          eventTickerNameEl.textContent = "--";
+          return;
+        }
+        currentEventTicker = latest.event_ticker || null;
+        eventTickerNameEl.textContent = currentEventTicker || "--";
+        currentEventExpiryMs = parseEventExpiryMs(latest.event_ticker, latest.ts);
+      }
+
+      function updateEventExpiryCountdown() {
+        if (!currentEventTicker || !currentEventExpiryMs) {
+          eventExpiryEl.textContent = "--";
+          return;
+        }
+        const remSec = Math.floor((currentEventExpiryMs - Date.now()) / 1000);
+        if (remSec <= 0) {
+          eventExpiryEl.textContent = "Expired";
+          return;
+        }
+        eventExpiryEl.textContent = formatDuration(remSec);
       }
 
       function updateScheduleProgress(statusData) {
@@ -2313,6 +2403,39 @@ def dashboard():
         }
       }
 
+      function hideChartTooltip() {
+        chartTooltipEl.style.display = "none";
+      }
+
+      function showChartTooltip(clientX) {
+        if (!chartScreenPoints.length) {
+          hideChartTooltip();
+          return;
+        }
+        const x = clientX - chartBounds.left;
+        let best = chartScreenPoints[0];
+        let bestDist = Math.abs(best.x - x);
+        for (let i = 1; i < chartScreenPoints.length; i += 1) {
+          const d = Math.abs(chartScreenPoints[i].x - x);
+          if (d < bestDist) {
+            bestDist = d;
+            best = chartScreenPoints[i];
+          }
+        }
+        if (!best || !Number.isFinite(best.price)) {
+          hideChartTooltip();
+          return;
+        }
+        const t = new Date(best.ts || Date.now());
+        const hh = String(t.getHours()).padStart(2, "0");
+        const mm = String(t.getMinutes()).padStart(2, "0");
+        const priceText = Number(best.price).toLocaleString("en-US", { style: "currency", currency: "USD" });
+        chartTooltipEl.textContent = `${hh}:${mm}  ${priceText}`;
+        chartTooltipEl.style.left = `${best.x}px`;
+        chartTooltipEl.style.top = `${best.y}px`;
+        chartTooltipEl.style.display = "block";
+      }
+
       refresh();
       refreshChart();
       refreshMarketsBtn.addEventListener("click", refreshMarkets);
@@ -2327,15 +2450,21 @@ def dashboard():
       strategyAutoStartBtn.addEventListener("click", strategyAutoStart);
       strategyAutoStatusBtn.addEventListener("click", strategyAutoStatus);
       strategyAutoStopBtn.addEventListener("click", strategyAutoStop);
+      canvas.addEventListener("mousemove", (e) => showChartTooltip(e.clientX));
+      canvas.addEventListener("mouseleave", hideChartTooltip);
       setInterval(() => {
         refresh();
         refreshChart();
+        updateEventExpiryCountdown();
       }, 1000);
       setInterval(() => {
         strategyPreview(true);
         strategyAutoStatus(true);
       }, 1000);
+      setInterval(refreshExpiryMeta, 30000);
       syncStrategyControls(false);
+      refreshMarkets();
+      refreshExpiryMeta();
       strategyPreview();
       refreshLedger();
       window.addEventListener("resize", refreshChart);
