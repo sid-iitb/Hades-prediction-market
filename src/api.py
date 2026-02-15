@@ -220,7 +220,9 @@ _farthest_auto_state = {
     "config": None,
     "last_run_at": None,
     "last_scheduled_run_at": None,
+    "last_risk_check_at": None,
     "next_scheduled_run_at": None,
+    "next_risk_check_at": None,
     "last_result": None,
     "active_position": None,
     "active_positions": [],
@@ -608,6 +610,8 @@ def _farthest_band_worker():
                 _farthest_auto_state["last_run_at"] = run_at
                 if is_scheduled_run:
                     _farthest_auto_state["last_scheduled_run_at"] = run_at
+                if active_positions:
+                    _farthest_auto_state["last_risk_check_at"] = run_at
                 _farthest_auto_state["next_scheduled_run_at"] = next_scheduled_at.isoformat()
                 _farthest_auto_state["last_result"] = latest_out
                 _farthest_auto_state["active_positions"] = normalized_positions
@@ -620,6 +624,9 @@ def _farthest_band_worker():
         now_after = datetime.datetime.now(timezone.utc)
         seconds_until_schedule = max(1, int((next_scheduled_at - now_after).total_seconds()))
         wait_seconds = min(300, seconds_until_schedule)
+        next_risk_check_at = now_after + timedelta(seconds=wait_seconds)
+        with _farthest_auto_lock:
+            _farthest_auto_state["next_risk_check_at"] = next_risk_check_at.isoformat()
         if _farthest_auto_stop.wait(timeout=wait_seconds):
             break
 
@@ -985,7 +992,9 @@ def strategy_farthest_band_auto_start(
         _farthest_auto_state["config"] = config.__dict__.copy()
         _farthest_auto_state["last_run_at"] = None
         _farthest_auto_state["last_scheduled_run_at"] = None
+        _farthest_auto_state["last_risk_check_at"] = None
         _farthest_auto_state["next_scheduled_run_at"] = datetime.datetime.now(timezone.utc).isoformat()
+        _farthest_auto_state["next_risk_check_at"] = datetime.datetime.now(timezone.utc).isoformat()
         _farthest_auto_state["last_result"] = None
         seeded_positions = _seed_active_positions_from_portfolio(config)
         _farthest_auto_state["active_positions"] = seeded_positions
@@ -1401,6 +1410,32 @@ def dashboard():
         background: linear-gradient(90deg, #f4c430, #f97316);
         transition: width 0.3s ease;
       }
+      .stoploss-panel {
+        margin-top: 10px;
+        padding: 8px;
+        border-radius: 10px;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        background: rgba(255, 255, 255, 0.04);
+      }
+      .stoploss-title {
+        font-size: 12px;
+        color: var(--muted);
+        margin-bottom: 6px;
+      }
+      .stoploss-next {
+        font-size: 12px;
+        color: var(--text);
+        margin-bottom: 6px;
+      }
+      .stoploss-positions {
+        margin-top: 8px;
+        font-size: 12px;
+        color: var(--muted);
+        min-height: 68px;
+        max-height: 68px;
+        overflow-y: auto;
+        white-space: pre-wrap;
+      }
       .planned-order {
         margin-top: 10px;
         font-size: 12px;
@@ -1610,6 +1645,14 @@ def dashboard():
                     <div id="strategy-progress-fill" class="progress-fill"></div>
                   </div>
                 </div>
+                <div class="stoploss-panel">
+                  <div class="stoploss-title">Stop-loss check (5m cadence)</div>
+                  <div id="stoploss-next-run" class="stoploss-next">Next stop-loss check: --</div>
+                  <div class="progress-track">
+                    <div id="stoploss-progress-fill" class="progress-fill"></div>
+                  </div>
+                  <div id="stoploss-positions" class="stoploss-positions">Protected positions: --</div>
+                </div>
                 <div id="auto-strategy-planned-order" class="planned-order">Auto plan will appear after Auto Status.</div>
                 <div id="auto-strategy-candidates" class="candidate-list"></div>
               </div>
@@ -1704,6 +1747,9 @@ def dashboard():
       const autoLastTradeBadgeEl = document.getElementById("auto-last-trade-badge");
       const strategyNextRunEl = document.getElementById("strategy-next-run");
       const strategyProgressFillEl = document.getElementById("strategy-progress-fill");
+      const stopLossNextRunEl = document.getElementById("stoploss-next-run");
+      const stopLossProgressFillEl = document.getElementById("stoploss-progress-fill");
+      const stopLossPositionsEl = document.getElementById("stoploss-positions");
       const manualStrategyPlannedOrderEl = document.getElementById("manual-strategy-planned-order");
       const manualStrategyCandidatesEl = document.getElementById("manual-strategy-candidates");
       const autoStrategyPlannedOrderEl = document.getElementById("auto-strategy-planned-order");
@@ -1962,6 +2008,48 @@ def dashboard():
         strategyProgressFillEl.style.width = `${progressPct.toFixed(1)}%`;
       }
 
+      function updateStopLossPanel(statusData) {
+        const riskSec = 300;
+        if (!statusData || !statusData.running) {
+          stopLossNextRunEl.textContent = "Next stop-loss check: auto not running";
+          stopLossProgressFillEl.style.width = "0%";
+          stopLossPositionsEl.textContent = "Protected positions: none";
+          return;
+        }
+
+        const nextRiskAt = statusData?.next_risk_check_at ? Date.parse(statusData.next_risk_check_at) : NaN;
+        const lastRiskAt = statusData?.last_risk_check_at ? Date.parse(statusData.last_risk_check_at) : NaN;
+        if (!Number.isFinite(nextRiskAt)) {
+          stopLossNextRunEl.textContent = "Next stop-loss check: waiting";
+          stopLossProgressFillEl.style.width = "0%";
+        } else {
+          const nowMs = Date.now();
+          const remainingSec = Math.max(0, (nextRiskAt - nowMs) / 1000);
+          let elapsedSec = riskSec - remainingSec;
+          if (Number.isFinite(lastRiskAt)) {
+            elapsedSec = Math.max(0, Math.min(riskSec, (nowMs - lastRiskAt) / 1000));
+          }
+          const progressPct = Math.max(0, Math.min(100, (elapsedSec / riskSec) * 100));
+          stopLossNextRunEl.textContent = `Next stop-loss check in ${formatDuration(remainingSec)}`;
+          stopLossProgressFillEl.style.width = `${progressPct.toFixed(1)}%`;
+        }
+
+        const positions = Array.isArray(statusData?.active_positions) ? statusData.active_positions : [];
+        if (!positions.length) {
+          stopLossPositionsEl.textContent = "Protected positions: none (stop-loss starts after first tracked entry/seed).";
+          return;
+        }
+        const lines = positions.slice(0, 6).map((p, i) => {
+          const side = String(p?.side || "--").toUpperCase();
+          const ticker = p?.ticker || "--";
+          const entry = p?.entry_price_cents ?? "--";
+          const count = p?.count ?? "--";
+          return `${i + 1}. ${ticker} (${side}) entry ${entry}c x ${count}`;
+        });
+        const extra = positions.length > 6 ? `\\n... +${positions.length - 6} more` : "";
+        stopLossPositionsEl.textContent = `Protected positions: ${positions.length}\\n${lines.join("\\n")}${extra}`;
+      }
+
       function renderStrategyCandidates(candidates, targetEl) {
         if (!candidates || !candidates.length) {
           targetEl.innerHTML = "";
@@ -2108,10 +2196,12 @@ def dashboard():
           const running = data.running ? "running" : "stopped";
           if (!quiet) strategyStatusEl.textContent = `Auto ${running} (${mode}). Last run: ${data.last_run_at || "n/a"}`;
           updateScheduleProgress(data);
+          updateStopLossPanel(data);
           if (data.last_result) renderStrategySelection(data.last_result, "Last auto plan", "auto");
         } catch (err) {
           if (!quiet) strategyStatusEl.textContent = `Auto status failed: ${err.message || "error"}`;
           updateScheduleProgress(null);
+          updateStopLossPanel(null);
         } finally {
           strategyAutoStatusInflight = false;
         }
