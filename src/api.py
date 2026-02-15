@@ -154,7 +154,7 @@ def _record_strategy_ledger(out: dict, source: str):
     )
 
     entry = cycle.get("entry")
-    multi_leg_actions = {"stop_loss_rotate", "rollover_reenter", "scheduled_rebalance"}
+    multi_leg_actions = {"stop_loss_rotate", "rollover_reenter"}
     if isinstance(entry, dict) and entry.get("active_position") and action_name not in multi_leg_actions:
         ap = entry.get("active_position") or {}
         _log_trade_ledger(
@@ -177,9 +177,6 @@ def _record_strategy_ledger(out: dict, source: str):
         if action_name == "stop_loss_rotate":
             exit_note = f"stop_loss pnl_pct={cycle.get('pnl_pct')}"
             reentry_note = "reentry_after_stop_loss"
-        elif action_name == "scheduled_rebalance":
-            exit_note = "scheduled_rebalance_exit"
-            reentry_note = "scheduled_rebalance_reentry"
         else:
             exit_note = "rollover_exit_stale_ticker"
             reentry_note = "rollover_reentry_latest_event"

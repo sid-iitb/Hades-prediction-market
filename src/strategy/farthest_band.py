@@ -15,8 +15,8 @@ class FarthestBandConfig:
     max_cost_cents: int = 500
     mode: str = "paper"  # "paper" or "live"
     interval_minutes: int = 15
-    stop_loss_pct: float = 0.20
-    rebalance_each_interval: bool = False
+    stop_loss_pct: float = 0.25
+    rebalance_each_interval: bool = True
 
 
 def _safe_json(resp):
@@ -329,27 +329,18 @@ def run_farthest_band_cycle(
 
     if active:
         if force_rebalance:
-            exit_result = _exit_position(client, active, config, reason="scheduled_rebalance_exit")
-            if str(config.mode).lower() == "live" and exit_result.get("action") == "hold":
-                return {
-                    "action": "hold_active",
-                    "reason": "Scheduled rebalance due but exit could not be placed",
-                    "exit": exit_result,
-                    "active_position": active,
-                }
             selection = select_farthest_band_market(spot=spot, markets=markets, config=config)
             entry = _enter_position(
                 client=client,
                 selection=selection,
                 config=config,
                 spot=spot,
-                reason="scheduled_rebalance_reenter",
+                reason="scheduled_add_entry",
             )
             return {
-                "action": "scheduled_rebalance",
-                "reason": "Scheduled interval rebalance",
-                "exited_position": active,
-                "exit": exit_result,
+                "action": "scheduled_add_entry",
+                "reason": "Scheduled interval add entry (no sell)",
+                "previous_active_position": active,
                 "entry": entry,
                 "active_position": entry.get("active_position"),
             }
