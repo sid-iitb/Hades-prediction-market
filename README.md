@@ -6,7 +6,6 @@ The core objective is to evolve from signal collection into automated, risk-awar
 
 ## Dashboard
 ![Dashboard 1](Dashboard.png)
-![Dashboard 2](Dashboard2.png)
 
 The dashboard shows:
 - Live BTC price and timestamp
