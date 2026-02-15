@@ -17,6 +17,7 @@ class FarthestBandConfig:
     interval_minutes: int = 15
     stop_loss_pct: float = 0.25
     rebalance_each_interval: bool = True
+    skip_nearest_levels: int = 2
 
 
 def _safe_json(resp):
@@ -63,8 +64,7 @@ def select_farthest_band_market(
     if config.ask_min_cents > config.ask_max_cents:
         raise ValueError("ask_min_cents cannot be greater than ask_max_cents")
 
-    directional = []
-    eligible = []
+    all_directional = []
     for market in markets or []:
         strike = _parse_number(market.get("strike"))
         ask = _parse_number(market.get(ask_key))
@@ -93,7 +93,22 @@ def select_farthest_band_market(
             "distance_from_spot": distance,
             "expected_return_pct": expected_return_pct,
         }
-        directional.append(row)
+        all_directional.append(row)
+
+    skip_n = max(0, int(getattr(config, "skip_nearest_levels", 0) or 0))
+    skipped_tickers = set()
+    if skip_n > 0 and all_directional:
+        if direction == "lower":
+            nearest_first = sorted(all_directional, key=lambda r: float(r["strike"]), reverse=True)
+        else:
+            nearest_first = sorted(all_directional, key=lambda r: float(r["strike"]))
+        for row in nearest_first[:skip_n]:
+            skipped_tickers.add(str(row["ticker"]))
+
+    directional = [r for r in all_directional if str(r["ticker"]) not in skipped_tickers]
+    eligible = []
+    for row in directional:
+        ask_cents = int(row["ask_cents"])
 
         if ask_cents < int(config.ask_min_cents) or ask_cents > int(config.ask_max_cents):
             continue
@@ -109,7 +124,7 @@ def select_farthest_band_market(
     if not directional:
         return {
             "selected": None,
-            "reason": "No market matched direction filter",
+            "reason": "No market matched direction filter after nearest-level skip",
             "eligible_count": 0,
             "nearest_candidates": [],
         }

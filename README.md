@@ -5,7 +5,8 @@ A research-grade trading workstation for Kalshi's Bitcoin hourly markets. It ing
 The core objective is to evolve from signal collection into automated, risk-aware execution.
 
 ## Dashboard
-![img.png](Dashboard.png)
+![Dashboard 1](Dashboard.png)
+![Dashboard 2](Dashboard2.png)
 
 The dashboard shows:
 - Live BTC price and timestamp
@@ -14,16 +15,13 @@ The dashboard shows:
 - Latest Kalshi markets for the current event
 - One-click YES/NO buttons per market with a configurable max cost (cents)
 - Current portfolio panel with balance and open positions (cost, P/L, max payout) and refresh button
-- Strategy panel for farthest-band execution:
-  - `paper` or `live` mode toggle
-  - Configurable side, ask band (`95-99c` default), max cost, and auto interval
-  - Active position tracking with stop-loss rotation: if mark drops below `-20%`, strategy exits and attempts to rebuy a farther strike
-  - Event rollover handling: when ingest switches to a new hourly event ticker, strategy exits stale ticker and re-enters using latest event markets
-  - Live auto-schedule countdown with progress bar (time remaining until next cycle)
-  - 1-second preview refresh showing the next probable order continuously
-  - Preview of planned order (ticker, strike, ask, count, planned cost, expected return)
-  - Nearest candidate list when no exact ask-band match exists
-  - Run once + auto start/status/stop controls
+- Two farthest-band strategy panels (side by side on desktop):
+  - `Farthest Strategy: Manual` for Preview + Run Once
+  - `Farthest Strategy: Auto` for Auto Start/Status/Stop and schedule progress
+  - Both panels expose the same config controls (`mode`, `side`, ask band, max cost, interval) and stay synchronized
+  - Manual and Auto each have separate plan/candidate output boxes
+  - Auto panel includes next-schedule countdown, progress bar, and last auto trade badge
+  - 1-second preview refresh updates probable next order continuously
 - Trade Ledger panel:
   - Shows recent buy/sell calls from direct and strategy routes
   - Includes a dedicated refresh button to reload latest entries
@@ -104,25 +102,28 @@ python -m src.api
 - `GET /strategy/farthest_band/run?side=yes|no&ask_min_cents=95&ask_max_cents=99&max_cost_cents=500&mode=paper|live`
   - Executes one strategy cycle immediately.
   - `mode=paper` returns planned action only; `mode=live` places a real order.
-  - If an active tracked position is down `20%` or more, it exits and attempts to rebuy a farther strike.
+  - If an active tracked position is down `25%` or more, it exits and attempts to rebuy a farther strike.
 - `GET /strategy/farthest_band/run?side=yes|no&ask_min_cents=95&ask_max_cents=99&max_cost_cents=500&mode=paper|live&force_new_order=1`
   - Forces a fresh entry on run-once (ignores currently tracked active position state).
 - `GET /strategy/farthest_band/auto/start?side=yes|no&ask_min_cents=95&ask_max_cents=99&max_cost_cents=500&mode=paper|live&interval_minutes=15`
   - Starts background auto-execution on interval (default 15 minutes).
-  - Auto cycles apply the same `-20%` stop-loss exit-and-rotate behavior.
+  - Auto cycles apply the same `-25%` stop-loss exit-and-rotate behavior.
   - Stop-loss evaluation runs every 5 minutes while auto mode is active; new scheduled entries still follow `interval_minutes`.
-  - Positions are held across intervals by default; exits happen on stop-loss or ticker rollover.
+  - Scheduled interval runs add a new entry when a candidate exists, without selling the current active position.
+  - Sells happen only on stop-loss or ticker rollover.
 - `GET /strategy/farthest_band/auto/status`
   - Returns running state, active config, last run time, and last result.
 - `GET /strategy/farthest_band/auto/stop`
   - Stops background auto-execution.
+- `GET /strategy/farthest_band/reset`
+  - Clears tracked strategy active position/state cache.
 - `GET /ledger/trades?limit=200`
   - Returns the latest ledger records for buy/sell calls from direct order route and strategy runs/auto cycles.
   - Fields include timestamp, action, side, ticker, price/count/cost, status, source, and payload snapshot.
 
 ## Stop-Loss Behavior
 - Threshold:
-  - Triggered when unrealized PnL is `<= -20%` from entry price.
+  - Triggered when unrealized PnL is `<= -25%` from entry price.
   - PnL formula: `(mark_price_cents - entry_price_cents) / entry_price_cents`.
 - Mark source:
   - YES positions use `yes_bid` (fallback `yes_ask`).
@@ -136,8 +137,12 @@ python -m src.api
 - `Auto`:
   - Scheduled interval runs follow `interval_minutes`.
   - Stop-loss checks run every 5 minutes while auto is active.
-  - On trigger, exits active position and re-enters a farther candidate.
+  - On scheduled runs, can add new entries without closing existing positions.
+  - On stop-loss trigger, exits active position and re-enters a farther candidate.
   - On hourly event rollover, exits stale ticker and re-enters from latest ingest markets.
+- Entry selection risk filters:
+  - Default ask band is `95-99c`.
+  - Strategy skips the nearest 2 strike levels in the chosen direction (`skip_nearest_levels=2`) before selecting.
 - Execution modes:
   - `paper`: decision path only, no exchange order.
   - `live`: real Kalshi orders are submitted for exit/re-entry.
