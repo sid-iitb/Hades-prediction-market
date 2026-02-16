@@ -181,6 +181,9 @@ def _get_stop_loss_trigger_history(limit: int = 20) -> list[dict]:
                     },
                     "sell_error": payload.get("sell_error"),
                     "buy_error": payload.get("buy_error"),
+                    "sell_status": payload.get("sell_status"),
+                    "buy_status": payload.get("buy_status"),
+                    "event_action": payload.get("event_action"),
                 }
             )
         return out
@@ -739,14 +742,30 @@ def _farthest_band_worker():
                 _record_strategy_ledger(out, source="/strategy/farthest_band/auto")
                 latest_out = out
                 cycle = (out or {}).get("result") or {}
-                if str(cycle.get("action") or "").lower() == "stop_loss_rotate":
+                cycle_action = str(cycle.get("action") or "").lower()
+                cycle_reason = str(cycle.get("reason") or "")
+                stop_loss_failed_exit = (
+                    cycle_action == "hold_active" and "stop-loss triggered" in cycle_reason.lower()
+                )
+                if cycle_action == "stop_loss_rotate" or stop_loss_failed_exit:
                     exit_leg = cycle.get("exit") or {}
                     reentry_leg = cycle.get("reentry") or {}
-                    exited = cycle.get("exited_position") or {}
-                    rebought = (
-                        reentry_leg.get("active_position")
-                        or ((reentry_leg.get("selection") or {}).get("selected") or {})
-                    )
+                    exited = cycle.get("exited_position") or cycle.get("active_position") or {}
+                    rebought = {}
+                    if cycle_action == "stop_loss_rotate":
+                        rebought = (
+                            reentry_leg.get("active_position")
+                            or ((reentry_leg.get("selection") or {}).get("selected") or {})
+                        )
+                    sell_error = None
+                    if str(exit_leg.get("action") or "").lower() == "hold":
+                        sell_error = exit_leg.get("reason") or cycle_reason or "Unknown sell failure"
+                    buy_error = None
+                    if cycle_action == "stop_loss_rotate":
+                        if str(reentry_leg.get("action") or "").lower() == "hold":
+                            buy_error = reentry_leg.get("reason") or "Unknown buy failure"
+                    else:
+                        buy_error = "Not attempted because sell leg failed"
                     last_stop_loss_trigger = {
                         "triggered_at": run_at,
                         "sold": {
@@ -767,8 +786,15 @@ def _farthest_band_worker():
                                 else (reentry_leg.get("selection") or {}).get("count")
                             ),
                         },
-                        "sell_error": exit_leg.get("reason"),
-                        "buy_error": reentry_leg.get("reason"),
+                        "sell_error": sell_error,
+                        "buy_error": buy_error,
+                        "sell_status": "failed" if sell_error else "ok",
+                        "buy_status": (
+                            "failed"
+                            if buy_error and cycle_action == "stop_loss_rotate"
+                            else ("skipped" if buy_error else "ok")
+                        ),
+                        "event_action": cycle_action,
                     }
                     stop_loss_trigger_history.append(last_stop_loss_trigger)
                     if len(stop_loss_trigger_history) > 20:
@@ -2310,6 +2336,17 @@ def dashboard():
         max-height: 112px;
         overflow-y: scroll;
       }
+      .planned-order.execution-ok {
+        border-color: rgba(16, 185, 129, 0.45);
+        box-shadow: inset 0 0 0 1px rgba(16, 185, 129, 0.18);
+      }
+      .planned-order.execution-fail {
+        border-color: rgba(239, 68, 68, 0.45);
+        box-shadow: inset 0 0 0 1px rgba(239, 68, 68, 0.18);
+      }
+      .planned-order.execution-none {
+        border-color: rgba(255, 255, 255, 0.14);
+      }
       .candidate-list {
         margin-top: 10px;
         font-size: 12px;
@@ -3152,9 +3189,11 @@ def dashboard():
             const boughtTicker = t?.bought?.ticker || "--";
             const boughtPx = t?.bought?.price_cents ?? "--";
             const boughtCount = t?.bought?.count ?? "--";
-            const sellErr = t?.sell_error ? ` | Sell error: ${t.sell_error}` : "";
-            const buyErr = t?.buy_error ? ` | Buy error: ${t.buy_error}` : "";
-            return `${i + 1}) ${fmtTs(t?.triggered_at)} | Sold ${soldTicker} @ ${soldPx}c x ${soldCount} | Bought ${boughtTicker} @ ${boughtPx}c x ${boughtCount}${sellErr}${buyErr}`;
+            const sellStatus = String(t?.sell_status || (t?.sell_error ? "failed" : "ok")).toUpperCase();
+            const buyStatus = String(t?.buy_status || (t?.buy_error ? "failed" : "ok")).toUpperCase();
+            const sellReason = t?.sell_error ? ` (${t.sell_error})` : "";
+            const buyReason = t?.buy_error ? ` (${t.buy_error})` : "";
+            return `${i + 1}) ${fmtTs(t?.triggered_at)} | Sell: ${soldTicker} @ ${soldPx}c x ${soldCount} [${sellStatus}]${sellReason} | Buy: ${boughtTicker} @ ${boughtPx}c x ${boughtCount} [${buyStatus}]${buyReason}`;
           })
           .join("\\n");
         const triggerBlock = trigger
@@ -3162,10 +3201,10 @@ def dashboard():
               "",
               "Last stop-loss trigger snapshot",
               `Time: ${fmtTs(trigger?.triggered_at)}`,
-              `Sold: ${(trigger?.sold?.ticker || "--")} @ ${(trigger?.sold?.price_cents ?? "--")}c x ${(trigger?.sold?.count ?? "--")}`,
-              `Bought: ${(trigger?.bought?.ticker || "--")} @ ${(trigger?.bought?.price_cents ?? "--")}c x ${(trigger?.bought?.count ?? "--")}`,
-              trigger?.sell_error ? `Sell error: ${trigger.sell_error}` : "",
-              trigger?.buy_error ? `Buy error: ${trigger.buy_error}` : "",
+              `Sell order: ${(trigger?.sold?.ticker || "--")} @ ${(trigger?.sold?.price_cents ?? "--")}c x ${(trigger?.sold?.count ?? "--")} [${String(trigger?.sell_status || (trigger?.sell_error ? "failed" : "ok")).toUpperCase()}]`,
+              trigger?.sell_error ? `Sell failure reason: ${trigger.sell_error}` : "",
+              `Buy order: ${(trigger?.bought?.ticker || "--")} @ ${(trigger?.bought?.price_cents ?? "--")}c x ${(trigger?.bought?.count ?? "--")} [${String(trigger?.buy_status || (trigger?.buy_error ? "failed" : "ok")).toUpperCase()}]`,
+              trigger?.buy_error ? `Buy failure reason: ${trigger.buy_error}` : "",
               recentHistory ? `\\nRecent triggers (${triggerHistory.length})\\n${recentHistory}` : "",
             ].filter(Boolean).join("\\n")
           : "";
@@ -3326,6 +3365,10 @@ def dashboard():
       function renderStrategySelection(payload, label, panel = "manual") {
         const plannedEl = panel === "auto" ? autoStrategyPlannedOrderEl : manualStrategyPlannedOrderEl;
         const candidatesEl = panel === "auto" ? autoStrategyCandidatesEl : manualStrategyCandidatesEl;
+        const setExecutionStyle = (status) => {
+          plannedEl.classList.remove("execution-ok", "execution-fail", "execution-none");
+          plannedEl.classList.add(status === "ok" ? "execution-ok" : (status === "fail" ? "execution-fail" : "execution-none"));
+        };
         const cycle = payload?.result || payload || {};
         const selection =
           payload?.selection ||
@@ -3342,25 +3385,67 @@ def dashboard():
           cycle?.mode ||
           strategyModeEl.value ||
           "paper";
+        const executionLeg = cycle?.reentry || cycle?.entry || null;
+        const liveExecutionLine = () => {
+          if (String(mode).toLowerCase() !== "live") return null;
+          if (!executionLeg || typeof executionLeg !== "object") return "Execution: no order attempted.";
+          const legAction = String(executionLeg?.action || "").toLowerCase();
+          const statusCode = executionLeg?.status_code;
+          const reason = executionLeg?.reason || "";
+          if (legAction === "hold") {
+            return `Execution: Order NOT placed${statusCode ? ` (status ${statusCode})` : ""}. Reason: ${reason || "unknown failure"}`;
+          }
+          if (statusCode === 200 || statusCode === 201) {
+            return `Execution: Order placed (status ${statusCode}).`;
+          }
+          if (statusCode) {
+            return `Execution: Order NOT placed (status ${statusCode}). Reason: ${reason || "exchange rejected/failed"}`;
+          }
+          if (executionLeg?.active_position) {
+            return "Execution: Order placed.";
+          }
+          return `Execution: Order NOT placed. Reason: ${reason || "unknown failure"}`;
+        };
+        const liveExecutionStatus = () => {
+          if (String(mode).toLowerCase() !== "live") return "none";
+          if (!executionLeg || typeof executionLeg !== "object") return "none";
+          const legAction = String(executionLeg?.action || "").toLowerCase();
+          const statusCode = executionLeg?.status_code;
+          if (legAction === "hold") return "fail";
+          if (statusCode === 200 || statusCode === 201) return "ok";
+          if (statusCode) return "fail";
+          if (executionLeg?.active_position) return "ok";
+          return "none";
+        };
         if (!selection) {
+          setExecutionStyle(liveExecutionStatus());
           const active = cycle?.active_position || payload?.active_position || null;
+          const executionSummary = liveExecutionLine();
           if (active) {
-            plannedEl.textContent = [
+            const lines = [
               `${label} (${mode})`,
               `No new order selected.`,
               `Active Position: ${active.ticker || "--"} (${String(active.side || "--").toUpperCase()})`,
               `Entry: ${active.entry_price_cents ?? "--"}c`,
               `Count: ${active.count ?? "--"}`,
               `Reason: ${cycle?.reason || "holding active position"}`,
-            ].join("\\n");
+            ];
+            if (executionSummary) lines.push(executionSummary);
+            plannedEl.textContent = lines.join("\\n");
           } else {
-            plannedEl.textContent = `No strategy selection returned. ${cycle?.reason || ""}`.trim();
+            plannedEl.textContent = [`No strategy selection returned. ${cycle?.reason || ""}`.trim(), executionSummary]
+              .filter(Boolean)
+              .join("\\n");
           }
           candidatesEl.innerHTML = "";
           return;
         }
         if (!selected) {
-          plannedEl.textContent = `${label}: no exact match. ${selection.reason || ""}`;
+          setExecutionStyle(liveExecutionStatus());
+          const executionSummary = liveExecutionLine();
+          plannedEl.textContent = [`${label}: no exact match. ${selection.reason || ""}`.trim(), executionSummary]
+            .filter(Boolean)
+            .join("\\n");
           renderStrategyCandidates(selection.nearest_candidates || [], candidatesEl);
           return;
         }
@@ -3373,6 +3458,9 @@ def dashboard():
           `Planned Cost: ${estCost !== null ? `${estCost}c / ${formatCents(estCost)}` : "--"}`,
           `Expected Return: ${selected.expected_return_pct !== null && selected.expected_return_pct !== undefined ? `${(selected.expected_return_pct * 100).toFixed(2)}%` : "--"}`,
         ];
+        const executionSummary = liveExecutionLine();
+        if (executionSummary) lines.push(executionSummary);
+        setExecutionStyle(liveExecutionStatus());
         plannedEl.textContent = lines.join("\\n");
         renderStrategyCandidates(selection.nearest_candidates || [], candidatesEl);
       }

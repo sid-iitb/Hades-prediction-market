@@ -306,6 +306,33 @@ def _enter_position(client: KalshiClient, selection: dict, config: FarthestBandC
     }
 
 
+def _with_nearest_fallback(selection: dict, config: FarthestBandConfig) -> dict:
+    """
+    If no exact ask-band match exists, pick the first nearest candidate as fallback.
+    Used for stop-loss re-entry only.
+    """
+    sel = dict(selection or {})
+    if isinstance(sel.get("selected"), dict):
+        return sel
+
+    nearest = sel.get("nearest_candidates") or []
+    for candidate in nearest:
+        ask_cents = int(_parse_number((candidate or {}).get("ask_cents")) or 0)
+        if ask_cents < 1:
+            continue
+        count = int(config.max_cost_cents // ask_cents)
+        if count < 1:
+            continue
+        picked = dict(candidate)
+        sel["selected"] = picked
+        sel["count"] = count
+        sel["estimated_cost_cents"] = int(count * ask_cents)
+        sel["fallback_used"] = True
+        sel["fallback_reason"] = "No exact ask-band match; using nearest farther candidate"
+        return sel
+    return sel
+
+
 def _exit_position(
     client: KalshiClient,
     active_position: dict,
@@ -431,6 +458,7 @@ def run_farthest_band_cycle(
                 min_distance_from_spot=previous_distance,
                 exclude_ticker=active.get("ticker"),
             )
+            next_selection = _with_nearest_fallback(next_selection, config)
             reentry_result = _enter_position(
                 client=client,
                 selection=next_selection,
