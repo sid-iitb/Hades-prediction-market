@@ -150,6 +150,88 @@ python -m src.api
   - Use `GET /ledger/trades` or the dashboard Trade Ledger panel to verify actions.
 
 
+## Bot (Phase 1: Verification Mode)
+
+### Repo scan summary
+
+| Module | Purpose |
+|--------|---------|
+| `src/client/kalshi_client.py` | Kalshi API client: `get_top_of_book`, `place_limit_at_best_ask`, `get_orders`, `get_positions`, `get_balance` |
+| `src/client/kraken_client.py` | Kraken prices: `latest_btc_price()`, `latest_eth_price()`, `latest_sol_price()`, `latest_xrp_price()` |
+| `src/utils/fetch_current_predictions_kalshi.py` | Fetch markets by event ticker (public API) |
+| `src/utils/get_current_trading_markets.py` | Resolve current market URL |
+| `src/offline_processing/generate_all_kalshi_urls.py` | Generate Kalshi event slug (kxbtcd-YYmmDDHH) |
+| `src/api.py` | FastAPI dashboard + ingest |
+
+The bot runs in **OBSERVE** mode by default (no trading). Use **TRADE** mode only after verifying signals.
+
+### Run the bot
+
+```bash
+# OBSERVE mode (default) - log signals, no orders
+python -m bot.main --config config.yaml
+
+# Run once and exit (no loop)
+python -m bot.main --config config.yaml --once
+```
+
+### Switch to TRADE mode
+
+1. Set env var: `export MODE=TRADE`
+2. Or edit `config.yaml`: `mode: TRADE`
+3. Run: `python -m bot.main --config config.yaml`
+
+### Sample output (OBSERVE mode)
+
+```
+============================================================
+HADES BOT RUN SUMMARY
+============================================================
+  Timestamp:        2026-02-14 12:35:00 UTC
+  Market ID:        KXBTCD-26FEB1414
+  Market Hour:      KXBTCD-26FEB1414
+  Minutes to close: 25.0
+  Mode:             OBSERVE
+------------------------------------------------------------
+  Tickers checked:  12
+  Signals YES:      2
+  Signals NO:       1
+  Would trade:      3
+------------------------------------------------------------
+  SIGNALS:
+    - KXBTCD-26FEB1414-T68999.99 | YES @ 95c | YES_BUY | late=False
+    - KXBTCD-26FEB1414-T69249.99 | NO @ 96c | NO_BUY | late=False
+------------------------------------------------------------
+  CAP USAGE:
+    Total orders (this hour): 0
+    Per ticker (top 10): (none)
+------------------------------------------------------------
+  EXECUTION:
+    KXBTCD-26FEB1414-T68999.99 YES: WOULD_TRADE
+    KXBTCD-26FEB1414-T69249.99 NO: WOULD_TRADE
+============================================================
+```
+
+### Bot modules
+
+- `bot/main.py` - Entrypoint
+- `bot/scheduler.py` - Run loop, time logic (H+1 min start, 5-min interval)
+- `bot/market.py` - Current hourly market, tickers, orderbook
+- `bot/strategy.py` - Signal generation (YES_BUY, NO_BUY, late window)
+- `bot/execution.py` - Place orders (TRADE mode only), cap enforcement
+- `bot/state.py` - SQLite persistence for order counts
+- `bot/logging.py` - Structured logs + console summary
+
+### Config (`config.yaml`)
+
+- `mode`: OBSERVE | TRADE
+- `assets`: btc, eth, sol, xrp (15-min trading supports all four)
+- `thresholds`: normal (93-98), late (94-99)
+- `schedule`: interval_minutes=5, start_offset_minutes=1, late_window_minutes=10
+- `caps`: max_orders_per_ticker=5, max_total_orders_per_hour=50
+
+---
+
 ## Repository Layout
 ```
 src/
@@ -167,13 +249,27 @@ src/
 
 data/
   kalshi_ingest.db              # SQLite ingest store (generated)
+  bot_state.db                  # Bot order state (generated)
+
+bot/
+  main.py                       # Bot entrypoint
+  scheduler.py                  # Run loop
+  market.py                     # Market discovery + orderbook
+  strategy.py                   # Signal generation
+  execution.py                  # Order placement (TRADE mode)
+  state.py                      # SQLite persistence
+  logging.py                    # Structured logging
+
+config.yaml                     # Bot config
+logs/
+  bot.log                       # Bot run logs (generated)
 ```
 
 ## Strategy Roadmap (High Level)
 - Integrate LLM-assisted market selection (OpenAI/xAI).
 - Add risk controls (exposure caps, kill-switches, dry-run mode).
 - Enhance execution logic (slippage tolerance, order retries).
-- Expand market coverage beyond BTC hourly.
+- Expand market coverage; 15-min bot supports BTC, ETH, SOL, XRP.
 
 ## Safety & Compliance
 This repository is for research and experimentation. Prediction markets involve real financial risk. Ensure you understand Kalshi's rules and applicable regulations before trading.

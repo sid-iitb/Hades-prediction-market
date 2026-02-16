@@ -1,8 +1,11 @@
+from __future__ import annotations
+
 import datetime
 import json
 import os
 import sqlite3
 import threading
+from typing import Optional
 from datetime import timedelta, timezone
 from pathlib import Path
 
@@ -21,10 +24,9 @@ from src.strategy.farthest_band import (
 )
 from dotenv import load_dotenv
 
-env_file = Path("../.env")
-
-# Load environment variables
-load_dotenv()
+# Load .env from project root (parent of src/)
+_project_root = Path(__file__).resolve().parent.parent
+load_dotenv(_project_root / ".env")
 
 app = FastAPI()
 
@@ -37,8 +39,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Project root: from src/api.py, go up one level to project root
 DEFAULT_DB_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+    os.path.dirname(os.path.dirname(__file__)),
     "data",
     "kalshi_ingest.db",
 )
@@ -175,10 +178,16 @@ def _record_strategy_ledger(out: dict, source: str):
         exited = cycle.get("exited_position") or {}
         exit_leg = cycle.get("exit") or {}
         if action_name == "stop_loss_rotate":
-            exit_note = f"stop_loss pnl_pct={cycle.get('pnl_pct')}"
+            exit_mode = exit_leg.get("mode") or mode_hint or "paper"
+            exit_note = f"stop_loss pnl_pct={cycle.get('pnl_pct')} [{exit_mode}]"
             reentry_note = "reentry_after_stop_loss"
+        elif action_name == "scheduled_rebalance":
+            exit_mode = exit_leg.get("mode") or mode_hint or "paper"
+            exit_note = f"scheduled_rebalance_exit [{exit_mode}]"
+            reentry_note = "scheduled_rebalance_reentry"
         else:
-            exit_note = "rollover_exit_stale_ticker"
+            exit_mode = exit_leg.get("mode") or mode_hint or "paper"
+            exit_note = f"rollover_exit_stale_ticker [{exit_mode}]"
             reentry_note = "rollover_reentry_latest_event"
         _log_trade_ledger(
             source=source,
@@ -195,24 +204,26 @@ def _record_strategy_ledger(out: dict, source: str):
         )
         reentry = cycle.get("reentry") or cycle.get("entry") or {}
         ap = reentry.get("active_position") or {}
+        reentry_mode = reentry.get("mode") or mode_hint or "paper"
         if ap:
+            reentry_note_with_mode = f"{reentry_note} [{reentry_mode}]"
             _log_trade_ledger(
                 source=source,
-                run_mode=reentry.get("mode") or mode_hint,
+                run_mode=reentry_mode,
                 action="buy",
                 side=ap.get("side"),
                 ticker=ap.get("ticker"),
                 price_cents=_maybe_int(ap.get("entry_price_cents")),
                 count=_maybe_int(ap.get("count")),
                 status_code=_maybe_int(reentry.get("status_code")),
-                success=(reentry.get("mode") != "live") or (_maybe_int(reentry.get("status_code")) in {200, 201}),
-                note=reentry_note,
+                success=(reentry_mode != "live") or (_maybe_int(reentry.get("status_code")) in {200, 201}),
+                note=reentry_note_with_mode,
                 payload=reentry,
             )
 
 
-_ingest_thread: threading.Thread | None = None
-_farthest_auto_thread: threading.Thread | None = None
+_ingest_thread: Optional[threading.Thread] = None
+_farthest_auto_thread: Optional[threading.Thread] = None
 _farthest_auto_stop = threading.Event()
 _farthest_auto_lock = threading.Lock()
 _farthest_auto_state = {
@@ -305,6 +316,20 @@ def get_latest_ingest():
                 (run["id"],),
             )
             markets = [dict(row) for row in cur.fetchall()]
+
+            def _is_100(val):
+                if val is None:
+                    return False
+                try:
+                    return round(float(val)) == 100
+                except (TypeError, ValueError):
+                    return False
+
+            # Filter out markets where Yes Ask or No Ask is 100
+            markets = [
+                m for m in markets
+                if not _is_100(m.get("yes_ask")) and not _is_100(m.get("no_ask"))
+            ]
             results.append(
                 {
                     "id": run["id"],
@@ -600,9 +625,16 @@ def _farthest_band_worker():
                 if isinstance(scheduled_pos, dict):
                     next_active_positions.append(scheduled_pos)
 
+            # Advance schedule: when no position, check for entries every 60s;
+            # when holding, use full interval for scheduled runs
             if is_scheduled_run:
-                interval_seconds = max(int(config.interval_minutes) * 60, 60)
-                next_scheduled_at = now_utc + timedelta(seconds=interval_seconds)
+                has_position = bool(next_active_positions) or (latest_out and latest_out.get("active_position"))
+                if has_position:
+                    interval_seconds = max(int(config.interval_minutes) * 60, 60)
+                    next_scheduled_at = now_utc + timedelta(seconds=interval_seconds)
+                else:
+                    # No position: retry in 60s to catch entry opportunities (ingest ready, conditions met)
+                    next_scheduled_at = now_utc + timedelta(seconds=60)
 
         if did_run:
             normalized_positions = _normalize_active_positions(next_active_positions)
@@ -697,7 +729,7 @@ def get_portfolio_balance():
 
 
 @app.get("/kalshi/portfolio/orders")
-def get_portfolio_orders(status: str | None = None, ticker: str | None = None, limit: int = 100):
+def get_portfolio_orders(status: Optional[str] = None, ticker: Optional[str] = None, limit: int = 100):
     """
     Fetch current orders (optionally filtered by status/ticker).
     """
@@ -757,7 +789,7 @@ def _price_to_cents_float(value):
 
 
 @app.get("/kalshi/portfolio/current")
-def get_portfolio_current_orders(status: str | None = "open", limit: int = 200):
+def get_portfolio_current_orders(status: Optional[str] = "open", limit: int = 200):
     """
     Current orders/positions with estimated cost, mark-based PnL, and max payout.
     """
@@ -961,6 +993,8 @@ def strategy_farthest_band_run(
     max_cost_cents: int = 500,
     mode: str = "paper",
     force_new_order: bool = False,
+    stop_loss_pct: float = 0.20,
+    profit_target_pct: Optional[float] = None,
 ):
     config = FarthestBandConfig(
         direction="lower",
@@ -969,6 +1003,8 @@ def strategy_farthest_band_run(
         ask_max_cents=ask_max_cents,
         max_cost_cents=max_cost_cents,
         mode=mode,
+        stop_loss_pct=stop_loss_pct,
+        profit_target_pct=profit_target_pct,
     )
     try:
         with _farthest_auto_lock:
@@ -1000,7 +1036,11 @@ def strategy_farthest_band_auto_start(
     max_cost_cents: int = 500,
     mode: str = "paper",
     interval_minutes: int = 15,
+    stop_loss_pct: float = 0.20,
+    profit_target_pct: Optional[float] = None,
+    rebalance_each_interval: bool = False,
 ):
+    """rebalance_each_interval: If True, exits+reenters every interval. If False (default), only exits on stop-loss/take-profit/rollover."""
     global _farthest_auto_thread
     cfg_mode = str(mode or "").lower()
 
@@ -1012,6 +1052,9 @@ def strategy_farthest_band_auto_start(
         max_cost_cents=max_cost_cents,
         mode=mode,
         interval_minutes=interval_minutes,
+        stop_loss_pct=stop_loss_pct,
+        profit_target_pct=profit_target_pct,
+        rebalance_each_interval=rebalance_each_interval,
     )
 
     with _farthest_auto_lock:
@@ -1310,6 +1353,7 @@ def dashboard():
         border-collapse: collapse;
         font-size: 12px;
       }
+      .ledger-table .text-muted { color: var(--muted); }
       .ledger-table th,
       .ledger-table td {
         padding: 6px 4px;
@@ -1423,6 +1467,18 @@ def dashboard():
       }
       .markets tr:last-child td {
         border-bottom: none;
+      }
+      .markets tr.row-highlight-yes td {
+        background: rgba(244, 196, 48, 0.35) !important;
+        border-left: 4px solid #f4c430;
+      }
+      .markets tr.row-highlight-no td {
+        background: rgba(34, 211, 238, 0.35) !important;
+        border-left: 4px solid #22d3ee;
+      }
+      .markets tr.row-highlight-yes.row-highlight-no td {
+        background: linear-gradient(90deg, rgba(244, 196, 48, 0.3) 0%, rgba(34, 211, 238, 0.3) 100%) !important;
+        border-left: 4px solid #a3e635;
       }
       .strategy-grid {
         display: grid;
@@ -1712,6 +1768,14 @@ def dashboard():
                   </div>
                   <div id="stoploss-positions" class="stoploss-positions">Protected positions: --</div>
                 </div>
+                <div class="field">
+                  <label for="strategy-stop-loss">Stop Loss (%)</label>
+                  <input id="strategy-stop-loss" type="number" min="0" max="100" step="1" value="20" title="Exit when PnL <= -this %" />
+                </div>
+                <div class="field">
+                  <label for="strategy-profit-target">Profit Target (%)</label>
+                  <input id="strategy-profit-target" type="number" min="0" max="100" step="0.5" value="" placeholder="disabled" title="Exit when PnL >= this %. Empty = disabled." />
+                </div>
                 <div id="auto-strategy-planned-order" class="planned-order">Auto plan will appear after Auto Status.</div>
                 <div id="auto-strategy-candidates" class="candidate-list"></div>
               </div>
@@ -1754,6 +1818,7 @@ def dashboard():
                   <tr>
                     <th>Time</th>
                     <th>Source</th>
+                    <th>Mode</th>
                     <th>Action</th>
                     <th>Side</th>
                     <th>Ticker</th>
@@ -1765,7 +1830,7 @@ def dashboard():
                   </tr>
                 </thead>
                 <tbody id="ledger-body">
-                  <tr><td colspan="10">Click Refresh to load ledger.</td></tr>
+                  <tr><td colspan="11">Click Refresh to load ledger.</td></tr>
                 </tbody>
               </table>
             </div>
@@ -1968,16 +2033,42 @@ def dashboard():
           marketsBody.innerHTML = "<tr><td colspan=\\"4\\">No markets found.</td></tr>";
           return;
         }
-        const rows = markets.slice(0, 20).map(m => {
+        const parseNum = (v) => {
+          if (v == null || v === "") return NaN;
+          const s = String(v).replace(/c$/i, "").replace(/\s/g, "").trim();
+          return Number(s);
+        };
+        const filteredMarkets = markets.filter(m => {
+          const y = Math.round(parseNum(m.yes_ask ?? m.yesAsk));
+          const n = Math.round(parseNum(m.no_ask ?? m.noAsk));
+          return !(y === 100 || n === 100);
+        });
+        const rows = filteredMarkets.slice(0, 20).map(m => {
           const strike = Number(m.strike || 0);
           const ticker = m.ticker || "";
-          const yesAsk = m.yes_ask ?? "--";
-          const noAsk = m.no_ask ?? "--";
-          const yesNum = Number(yesAsk);
+          const yesAskRaw = m.yes_ask ?? m.yesAsk;
+          const noAskRaw = m.no_ask ?? m.noAsk;
+          const yesAsk = yesAskRaw ?? "--";
+          const noAsk = noAskRaw ?? "--";
+          const yesNum = parseNum(yesAskRaw);
           const rowHot = Number.isFinite(yesNum) && yesNum >= 90 && yesNum <= 99;
           const subtitle = m.subtitle || "";
+          const inRange = v => { const n = Math.round(v); return !isNaN(v) && n >= 85 && n <= 99; };
+          const yesInRange = inRange(yesAskVal);
+          const noInRange = inRange(noAskVal);
+          const classes = [];
+          if (yesInRange) classes.push('row-highlight-yes');
+          if (noInRange) classes.push('row-highlight-no');
+          const rowClass = classes.length ? ` class="${classes.join(' ')}"` : '';
+          const inRange = v => { const n = Math.round(v); return !isNaN(v) && n >= 85 && n <= 99; };
+          const yesInRange = inRange(parseNum(yesAskRaw));
+          const noInRange = inRange(parseNum(noAskRaw));
+          const classes = [];
+          if (yesInRange) classes.push('row-highlight-yes');
+          if (noInRange) classes.push('row-highlight-no');
+          const rowClass = classes.length ? ` class="${classes.join(' ') + (rowHot ? ' row-hot' : '')}"` : (rowHot ? ' class="row-hot"' : '');
           return `
-            <tr class="${rowHot ? "row-hot" : ""}">
+            <tr${rowClass}>
               <td>${strike ? strike.toLocaleString("en-US", { style: "currency", currency: "USD" }) : "--"}</td>
               <td>
                 ${yesAsk}c
@@ -2098,6 +2189,8 @@ def dashboard():
         return null;
       }
 
+      const strategyStopLossEl = document.getElementById("strategy-stop-loss");
+      const strategyProfitTargetEl = document.getElementById("strategy-profit-target");
       function strategyParams(includeMode = false, includeInterval = false) {
         const params = new URLSearchParams();
         params.set("side", strategySideEl.value || "yes");
@@ -2106,6 +2199,9 @@ def dashboard():
         params.set("max_cost_cents", String(Number(strategyMaxCostEl.value || 500)));
         if (includeMode) params.set("mode", strategyModeEl.value || "paper");
         if (includeInterval) params.set("interval_minutes", String(Number(strategyIntervalEl.value || 15)));
+        params.set("stop_loss_pct", String(Number(strategyStopLossEl?.value || 20) / 100));
+        const pt = strategyProfitTargetEl?.value?.trim();
+        if (pt && !isNaN(Number(pt))) params.set("profit_target_pct", String(Number(pt) / 100));
         return params.toString();
       }
 
@@ -2287,15 +2383,29 @@ def dashboard():
           "paper";
         if (!selection) {
           const active = cycle?.active_position || payload?.active_position || null;
+          const exitEval = cycle?.exit_criteria_evaluated || payload?.exit_criteria_evaluated || null;
           if (active) {
-            plannedEl.textContent = [
+            const lines = [
               `${label} (${mode})`,
               `No new order selected.`,
               `Active Position: ${active.ticker || "--"} (${String(active.side || "--").toUpperCase()})`,
               `Entry: ${active.entry_price_cents ?? "--"}c`,
               `Count: ${active.count ?? "--"}`,
               `Reason: ${cycle?.reason || "holding active position"}`,
-            ].join("\\n");
+            ];
+            if (exitEval?.evaluated) {
+              lines.push("--- Exit criteria (every run) ---");
+              lines.push(`Side: ${exitEval.side ?? "--"}`);
+              lines.push(`PnL: ${exitEval.pnl_pct != null ? (exitEval.pnl_pct * 100).toFixed(2) + "%" : "--"}`);
+              lines.push(`Stop-loss threshold: ${exitEval.stop_loss_threshold_pct != null ? (exitEval.stop_loss_threshold_pct * 100).toFixed(0) + "%" : "--"}`);
+              lines.push(`Stop-loss triggered: ${exitEval.stop_loss_triggered ? "YES" : "no"}`);
+              if (exitEval.profit_target_threshold_pct != null) {
+                lines.push(`Take-profit threshold: ${(exitEval.profit_target_threshold_pct * 100).toFixed(2)}%`);
+                lines.push(`Take-profit triggered: ${exitEval.take_profit_triggered ? "YES" : "no"}`);
+              }
+              lines.push(`What happened: ${exitEval.what_happened ?? "--"}`);
+            }
+            plannedEl.textContent = lines.join("\\n");
           } else {
             plannedEl.textContent = `No strategy selection returned. ${cycle?.reason || ""}`.trim();
           }
@@ -2316,6 +2426,11 @@ def dashboard():
           `Planned Cost: ${estCost !== null ? `${estCost}c / ${formatCents(estCost)}` : "--"}`,
           `Expected Return: ${selected.expected_return_pct !== null && selected.expected_return_pct !== undefined ? `${(selected.expected_return_pct * 100).toFixed(2)}%` : "--"}`,
         ];
+        const exitEval2 = cycle?.exit_criteria_evaluated || payload?.exit_criteria_evaluated || null;
+        if (exitEval2?.evaluated !== undefined) {
+          lines.push("--- Exit criteria ---");
+          lines.push(exitEval2.what_happened ?? (exitEval2.evaluated ? "Evaluated (no active position)" : "Not evaluated"));
+        }
         plannedEl.textContent = lines.join("\\n");
         renderStrategyCandidates(selection.nearest_candidates || [], candidatesEl);
       }
@@ -2356,7 +2471,11 @@ def dashboard():
       }
 
       async function strategyAutoStart() {
-        strategyStatusEl.textContent = `Starting auto (${strategyModeEl.value})...`;
+        const mode = strategyModeEl.value || "paper";
+        if (mode === "paper") {
+          if (!confirm("Auto will run in PAPER mode — no real orders will be placed. Select LIVE in the Mode dropdown to trade for real. Continue?")) return;
+        }
+        strategyStatusEl.textContent = `Starting auto (${mode})...`;
         try {
           const res = await fetch(`/strategy/farthest_band/auto/start?${strategyParams(true, true)}`);
           const data = await res.json();
@@ -2375,9 +2494,10 @@ def dashboard():
           const res = await fetch("/strategy/farthest_band/auto/status");
           const data = await res.json();
           if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
-          const mode = data?.config?.mode || strategyModeEl.value;
+          const mode = (data?.config?.mode || strategyModeEl.value || "paper").toLowerCase();
           const running = data.running ? "running" : "stopped";
-          if (!quiet) strategyStatusEl.textContent = `Auto ${running} (${mode}). Last run: ${data.last_run_at || "n/a"}`;
+          const modeLabel = mode === "live" ? "LIVE (real orders)" : "PAPER (no real orders)";
+          if (!quiet) strategyStatusEl.textContent = `Auto ${running} — ${modeLabel}. Last run: ${data.last_run_at || "n/a"}`;
           updateScheduleProgress(data);
           updateStopLossPanel(data);
           if (data.last_result) renderStrategySelection(data.last_result, "Last auto plan", "auto");
@@ -2493,7 +2613,7 @@ def dashboard():
       }
 
       async function refreshLedger() {
-        ledgerBody.innerHTML = "<tr><td colspan=\\"10\\">Loading ledger...</td></tr>";
+        ledgerBody.innerHTML = "<tr><td colspan=\\"11\\">Loading ledger...</td></tr>";
         try {
           const res = await fetch("/ledger/trades?limit=50");
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -2512,12 +2632,13 @@ def dashboard():
             autoLastTradeBadgeEl.textContent = "Last Auto Trade: none yet.";
           }
           if (!records.length) {
-            ledgerBody.innerHTML = "<tr><td colspan=\\"10\\">No ledger records.</td></tr>";
+            ledgerBody.innerHTML = "<tr><td colspan=\\"11\\">No ledger records.</td></tr>";
             return;
           }
           const rows = records.map(r => {
             const ts = r.ts || "--";
             const source = r.source || "--";
+            const mode = r.run_mode || "--";
             const action = r.action || "--";
             const side = r.side || "--";
             const ticker = r.ticker || "--";
@@ -2526,10 +2647,12 @@ def dashboard():
             const cost = r.cost_cents !== null && r.cost_cents !== undefined ? formatCents(r.cost_cents) : "--";
             const status = r.status_code ?? "--";
             const note = r.note || "--";
+            const modeClass = mode === "paper" ? "text-muted" : "";
             return `
               <tr>
                 <td>${ts}</td>
                 <td>${source}</td>
+                <td class="${modeClass}" title="${mode === "paper" ? "No real orders placed" : "Real exchange orders"}">${mode}</td>
                 <td>${action}</td>
                 <td>${String(side).toUpperCase()}</td>
                 <td>${ticker}</td>
@@ -2543,7 +2666,7 @@ def dashboard():
           }).join("");
           ledgerBody.innerHTML = rows;
         } catch (err) {
-          ledgerBody.innerHTML = "<tr><td colspan=\\"10\\">Error loading ledger.</td></tr>";
+          ledgerBody.innerHTML = "<tr><td colspan=\\"11\\">Error loading ledger.</td></tr>";
         }
       }
 

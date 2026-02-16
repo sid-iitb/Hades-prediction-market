@@ -15,9 +15,10 @@ class FarthestBandConfig:
     max_cost_cents: int = 500
     mode: str = "paper"  # "paper" or "live"
     interval_minutes: int = 15
-    stop_loss_pct: float = 0.25
-    rebalance_each_interval: bool = True
+    stop_loss_pct: float = 0.20
+    rebalance_each_interval: bool = False  # If True, exits+reenters every interval regardless of PnL
     skip_nearest_levels: int = 2
+    profit_target_pct: Optional[float] = None  # e.g. 0.05 = 5%; None = disabled
 
 
 def _safe_json(resp):
@@ -355,6 +356,33 @@ def _exit_position(client: KalshiClient, active_position: dict, config: Farthest
     }
 
 
+def _build_exit_criteria_evaluated(
+    active: dict,
+    pnl_pct: Optional[float],
+    mark_state: dict,
+    stop_loss_pct: float,
+    profit_target_pct: Optional[float],
+    stop_loss_triggered: bool,
+    take_profit_triggered: bool,
+    what_happened: str,
+) -> dict:
+    """Build exit criteria evaluation summary for both YES and NO positions."""
+    side = str(active.get("side") or "").upper()
+    return {
+        "evaluated": True,
+        "side": side,
+        "ticker": active.get("ticker"),
+        "entry_price_cents": active.get("entry_price_cents"),
+        "mark_cents": mark_state.get("mark_cents"),
+        "pnl_pct": round(pnl_pct, 6) if pnl_pct is not None else None,
+        "stop_loss_threshold_pct": -stop_loss_pct,
+        "stop_loss_triggered": stop_loss_triggered,
+        "profit_target_threshold_pct": profit_target_pct,
+        "take_profit_triggered": take_profit_triggered,
+        "what_happened": what_happened,
+    }
+
+
 def run_farthest_band_cycle(
     client: KalshiClient,
     spot: float,
@@ -365,6 +393,10 @@ def run_farthest_band_cycle(
 ) -> dict:
     active = dict(active_position) if active_position else None
     stop_loss_pct = abs(float(config.stop_loss_pct))
+    profit_target_pct = config.profit_target_pct
+    if profit_target_pct is not None:
+        profit_target_pct = abs(float(profit_target_pct))
+
     current_tickers = {str(m.get("ticker")) for m in (markets or []) if m.get("ticker")}
 
     if active:
@@ -372,11 +404,23 @@ def run_farthest_band_cycle(
         if str(active.get("ticker")) not in current_tickers:
             exit_result = _exit_position(client, active, config, reason="rollover_exit_stale_ticker")
             if str(config.mode).lower() == "live" and exit_result.get("action") == "hold":
+                # Stale ticker (event rolled) but exit failed - likely market closed, no bids.
+                # Clear active_position so we can place new entries; old position will settle on Kalshi.
+                selection = select_farthest_band_market(spot=spot, markets=markets, config=config)
+                entry = _enter_position(
+                    client=client,
+                    selection=selection,
+                    config=config,
+                    spot=spot,
+                    reason="rollover_reenter_after_exit_failed",
+                )
                 return {
-                    "action": "hold_active",
-                    "reason": "Active ticker stale but live exit could not be placed",
+                    "action": "rollover_reenter",
+                    "reason": "Active ticker stale, exit failed (no bid - likely closed). Cleared and re-entered.",
+                    "exited_position": active,
                     "exit": exit_result,
-                    "active_position": active,
+                    "entry": entry,
+                    "active_position": entry.get("active_position"),
                 }
             selection = select_farthest_band_market(spot=spot, markets=markets, config=config)
             entry = _enter_position(
@@ -395,14 +439,42 @@ def run_farthest_band_cycle(
                 "active_position": entry.get("active_position"),
             }
 
+        # Exit criteria evaluated on every run for both YES and NO positions
         mark_state = _mark_price_and_pnl(client, active)
         pnl_pct = mark_state.get("pnl_pct")
+
+        # Take-profit check (optional; runs before stop-loss)
+        if profit_target_pct is not None and pnl_pct is not None and pnl_pct >= profit_target_pct:
+            exit_result = _exit_position(client, active, config, reason="take_profit_exit")
+            exit_eval = _build_exit_criteria_evaluated(
+                active, pnl_pct, mark_state, stop_loss_pct, profit_target_pct,
+                stop_loss_triggered=False,
+                take_profit_triggered=True,
+                what_happened=f"Take-profit triggered at {pnl_pct*100:.2f}% (target {profit_target_pct*100:.2f}%). Position closed.",
+            )
+            return {
+                "action": "take_profit_exit",
+                "exit_criteria_evaluated": exit_eval,
+                "pnl_pct": pnl_pct,
+                "exited_position": active,
+                "exit": exit_result,
+                "active_position": None,
+            }
+
+        # Stop-loss check
         if pnl_pct is not None and pnl_pct <= -stop_loss_pct:
             exit_result = _exit_position(client, active, config, reason="stop_loss_exit")
             if exit_result.get("action") == "hold":
+                exit_eval = _build_exit_criteria_evaluated(
+                    active, pnl_pct, mark_state, stop_loss_pct, profit_target_pct,
+                    stop_loss_triggered=True,
+                    take_profit_triggered=False,
+                    what_happened="Stop-loss triggered but exit could not be placed (no bid available).",
+                )
                 return {
                     "action": "hold_active",
                     "reason": "Stop-loss triggered but exit could not be placed",
+                    "exit_criteria_evaluated": exit_eval,
                     "pnl_pct": pnl_pct,
                     "exit": exit_result,
                     "active_position": active,
@@ -422,8 +494,15 @@ def run_farthest_band_cycle(
                 spot=spot,
                 reason="stop_loss_rebuy_further",
             )
+            exit_eval = _build_exit_criteria_evaluated(
+                active, pnl_pct, mark_state, stop_loss_pct, profit_target_pct,
+                stop_loss_triggered=True,
+                take_profit_triggered=False,
+                what_happened=f"Stop-loss triggered at {pnl_pct*100:.2f}%. Exited and re-entered farther band.",
+            )
             return {
                 "action": "stop_loss_rotate",
+                "exit_criteria_evaluated": exit_eval,
                 "stop_loss_trigger_pct": -stop_loss_pct,
                 "pnl_pct": pnl_pct,
                 "exited_position": active,
@@ -451,13 +530,22 @@ def run_farthest_band_cycle(
                 "active_position": next_active,
             }
 
+        # No exit triggered
+        exit_eval = _build_exit_criteria_evaluated(
+            active, pnl_pct, mark_state, stop_loss_pct, profit_target_pct,
+            stop_loss_triggered=False,
+            take_profit_triggered=False,
+            what_happened=f"Holding. PnL {pnl_pct*100:.2f}% (stop-loss threshold -{stop_loss_pct*100:.0f}%)" if pnl_pct is not None else "Holding. No mark available.",
+        )
         return {
             "action": "hold_active",
             "reason": "Stop-loss not triggered",
+            "exit_criteria_evaluated": exit_eval,
             "active_position": active,
             "mark": mark_state,
         }
 
+    # No active position - enter new
     selection = select_farthest_band_market(spot=spot, markets=markets, config=config)
     entry = _enter_position(
         client=client,
@@ -468,6 +556,7 @@ def run_farthest_band_cycle(
     )
     return {
         "action": entry.get("action", "hold"),
+        "exit_criteria_evaluated": {"evaluated": False, "what_happened": "No active position; entry logic ran."},
         "entry": entry,
         "active_position": entry.get("active_position"),
     }

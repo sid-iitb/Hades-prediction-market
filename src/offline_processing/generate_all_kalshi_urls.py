@@ -4,35 +4,82 @@ import pytz
 # Base URL for Kalshi events
 BASE_URL = "https://kalshi.com/markets/kxbtcd/bitcoin-price-abovebelow/"
 
-def generate_kalshi_slug(target_time):
+# Kalshi event ticker prefixes for hourly price markets
+ASSET_PREFIXES = {
+    "btc": "kxbtcd",
+    "eth": "kxethd",
+    "sol": "kxsold",
+    "xrp": "kxxrpd",
+}
+
+# 15-minute crypto market prefixes (format: YYmmmDDHHMM)
+ASSET_PREFIXES_15M = {
+    "btc": "kxbtc15m",
+    "eth": "kxeth15m",
+    "sol": "kxsol15m",
+    "xrp": "kxxrp15m",
+}
+
+
+def generate_kalshi_slug(target_time, asset: str = "btc"):
     """
-    Generates the Kalshi event slug for a given datetime.
-    Format: kxbtcd-[YY][MMM][DD][HH]
-    Example: kxbtcd-25nov2614 (Nov 26, 2025, 14:00 ET)
+    Generates the Kalshi event slug for a given datetime and asset.
+    Format: {prefix}-[YY][MMM][DD][HH]
+    Example: kxbtcd-25nov2614 (Nov 26, 2025, 14:00 ET), kxethd-25nov2614 for ETH
     """
+    prefix = ASSET_PREFIXES.get(str(asset).lower(), "kxbtcd")
     # Ensure time is in Eastern Time
     et_tz = pytz.timezone('US/Eastern')
     if target_time.tzinfo is None:
-        # Assume UTC if no timezone is provided, then convert to ET
         target_time = pytz.utc.localize(target_time).astimezone(et_tz)
     else:
         target_time = target_time.astimezone(et_tz)
 
-    # Format components
-    year = target_time.strftime("%y") # 2-digit year
-    month = target_time.strftime("%b").lower() # 3-letter month, lowercase
-    day = target_time.strftime("%d") # 2-digit day
-    hour = target_time.strftime("%H") # 24-hour format
-    
-    slug = f"kxbtcd-{year}{month}{day}{hour}"
+    year = target_time.strftime("%y")
+    month = target_time.strftime("%b").lower()
+    day = target_time.strftime("%d")
+    hour = target_time.strftime("%H")
+    slug = f"{prefix}-{year}{month}{day}{hour}"
     return slug
 
-def generate_kalshi_url(target_time):
+
+def generate_15min_slug(target_time, asset: str = "btc"):
+    """
+    Generates the Kalshi event slug for 15-min crypto markets.
+    Format: {prefix}-YYmmmDDHHMM (minute = 00, 15, 30, 45)
+    Example: kxbtc15m-26feb141430 (Feb 14, 2026, 14:30 ET)
+    """
+    prefix = ASSET_PREFIXES_15M.get(str(asset).lower(), "kxbtc15m")
+    et_tz = pytz.timezone("US/Eastern")
+    if target_time.tzinfo is None:
+        target_time = pytz.utc.localize(target_time).astimezone(et_tz)
+    else:
+        target_time = target_time.astimezone(et_tz)
+
+    year = target_time.strftime("%y")
+    month = target_time.strftime("%b").lower()
+    day = target_time.strftime("%d")
+    hour = target_time.strftime("%H")
+    minute = target_time.strftime("%M")
+    slug = f"{prefix}-{year}{month}{day}{hour}{minute}"
+    return slug
+
+
+_ASSET_BASE_URLS = {
+    "btc": "https://kalshi.com/markets/kxbtcd/bitcoin-price-abovebelow/",
+    "eth": "https://kalshi.com/markets/kxethd/ethereum-price-abovebelow/",
+    "sol": "https://kalshi.com/markets/kxsold/solana-price-abovebelow/",
+    "xrp": "https://kalshi.com/markets/kxxrpd/xrp-price-abovebelow/",
+}
+
+
+def generate_kalshi_url(target_time, asset: str = "btc"):
     """
     Generates the full Kalshi URL for a given datetime.
     """
-    slug = generate_kalshi_slug(target_time)
-    return f"{BASE_URL}{slug}"
+    slug = generate_kalshi_slug(target_time, asset)
+    base = _ASSET_BASE_URLS.get(str(asset).lower(), _ASSET_BASE_URLS["btc"])
+    return f"{base}{slug}"
 
 def generate_urls_until_year_end():
     """

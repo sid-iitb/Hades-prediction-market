@@ -22,12 +22,24 @@ class KrakenClient:
         self._base_url = base_url.rstrip("/")
 
     def latest_btc_price(self) -> PriceQuote:
-        payload = self._get_json(f"{self._base_url}/0/public/Ticker?pair=XBTUSD")
+        return self._latest_price("XBTUSD", "BTC")
+
+    def latest_eth_price(self) -> PriceQuote:
+        return self._latest_price("ETHUSD", "ETH")
+
+    def latest_sol_price(self) -> PriceQuote:
+        return self._latest_price("SOLUSD", "SOL")
+
+    def latest_xrp_price(self) -> PriceQuote:
+        return self._latest_price("XRPUSD", "XRP")
+
+    def _latest_price(self, pair: str, symbol: str) -> PriceQuote:
+        payload = self._get_json(f"{self._base_url}/0/public/Ticker?pair={pair}")
         if payload.get("error"):
             raise RuntimeError(f"Kraken API error: {payload['error']}")
 
         result = payload.get("result", {})
-        pair_data = result.get("XBTUSD") or next(iter(result.values()), None)
+        pair_data = result.get(pair) or next(iter(result.values()), None)
         if not pair_data:
             raise RuntimeError("Kraken API response missing result")
 
@@ -36,7 +48,7 @@ class KrakenClient:
             raise RuntimeError("Kraken API response missing last trade price")
 
         price = float(last_trade[0])
-        return PriceQuote(symbol="BTC", price=price, currency="USD", source="kraken")
+        return PriceQuote(symbol=symbol, price=price, currency="USD", source="kraken")
 
     @staticmethod
     def _get_json(url: str) -> Dict[str, Any]:
