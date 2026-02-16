@@ -1424,9 +1424,70 @@ def dashboard():
       }
       .hero {
         display: grid;
-        grid-template-columns: minmax(0, 1.8fr) minmax(0, 1fr);
+        grid-template-columns: minmax(0, 1.8fr) minmax(0, 1fr) minmax(0, 1fr);
         gap: 20px;
-        align-items: end;
+        align-items: stretch;
+      }
+      .hero-balance {
+        display: grid;
+        align-content: center;
+        justify-items: center;
+        gap: 8px;
+        background:
+          radial-gradient(circle at 20% 15%, rgba(34, 211, 238, 0.18), transparent 50%),
+          radial-gradient(circle at 80% 90%, rgba(250, 204, 21, 0.16), transparent 48%),
+          rgba(255, 255, 255, 0.05);
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        border-radius: 14px;
+        padding: 16px 18px;
+        min-height: 120px;
+        box-shadow:
+          inset 0 0 0 1px rgba(255, 255, 255, 0.04),
+          0 0 20px rgba(34, 211, 238, 0.12),
+          0 0 24px rgba(250, 204, 21, 0.1);
+      }
+      .hero-balance-label {
+        color: #dbeafe;
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        font-weight: 700;
+      }
+      .hero-balance-values {
+        display: flex;
+        gap: 12px;
+        align-items: baseline;
+        flex-wrap: wrap;
+        justify-content: center;
+      }
+      .hero-balance-item {
+        display: grid;
+        gap: 2px;
+        padding: 8px 10px;
+        border-radius: 10px;
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        background: rgba(8, 16, 32, 0.45);
+        min-width: 130px;
+      }
+      .hero-balance-key {
+        color: #a5b4fc;
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+      }
+      .hero-balance-val {
+        color: #e2e8f0;
+        font-size: 24px;
+        font-weight: 700;
+        line-height: 1.1;
+      }
+      #hero-cash {
+        color: #86efac;
+        text-shadow: 0 0 14px rgba(34, 197, 94, 0.32);
+      }
+      #hero-portfolio {
+        color: #fcd34d;
+        text-shadow: 0 0 16px rgba(250, 204, 21, 0.35);
       }
       .expiry-card {
         display: grid;
@@ -1675,10 +1736,17 @@ def dashboard():
         margin-left: 6px;
       }
       .markets tr.row-hot td {
-        background: rgba(34, 211, 238, 0.08);
+        background: rgba(34, 211, 238, 0.2);
+        color: #d8fbff;
+        font-weight: 700;
+        text-shadow: 0 0 8px rgba(34, 211, 238, 0.35);
       }
       .markets tr.row-hot td:first-child {
-        box-shadow: inset 2px 0 0 rgba(34, 211, 238, 0.55);
+        box-shadow: inset 4px 0 0 #22d3ee, inset 0 0 0 1px rgba(34, 211, 238, 0.25);
+      }
+      .markets tr.row-hot td .btn.trade {
+        border-color: rgba(34, 211, 238, 0.7);
+        box-shadow: 0 0 12px rgba(34, 211, 238, 0.25);
       }
       .markets tr.row-pending td {
         background: rgba(244, 196, 48, 0.12);
@@ -1845,6 +1913,7 @@ def dashboard():
       @media (max-width: 520px) {
         .card { padding: 22px; }
         .hero { grid-template-columns: 1fr; }
+        .hero-balance { justify-items: start; }
         .expiry-card { justify-items: start; }
         .top-panels {
           grid-template-columns: 1fr;
@@ -1869,6 +1938,19 @@ def dashboard():
               </div>
               <div id="price" class="price">$--</div>
               <div id="ts" class="sub">Last update: --</div>
+            </div>
+            <div class="hero-balance">
+              <div class="hero-balance-label">Portfolio Snapshot</div>
+              <div class="hero-balance-values">
+                <div class="hero-balance-item">
+                  <div class="hero-balance-key">Cash</div>
+                  <div id="hero-cash" class="hero-balance-val">$--</div>
+                </div>
+                <div class="hero-balance-item">
+                  <div class="hero-balance-key">Portfolio</div>
+                  <div id="hero-portfolio" class="hero-balance-val">$--</div>
+                </div>
+              </div>
             </div>
             <div class="expiry-card">
               <div class="expiry-label">Ticker Expiry</div>
@@ -2101,6 +2183,8 @@ def dashboard():
       const tsEl = document.getElementById("ts");
       const eventExpiryEl = document.getElementById("event-expiry");
       const eventTickerNameEl = document.getElementById("event-ticker-name");
+      const heroCashEl = document.getElementById("hero-cash");
+      const heroPortfolioEl = document.getElementById("hero-portfolio");
       const canvas = document.getElementById("chart");
       const ctx = canvas.getContext("2d");
       const chartTooltipEl = document.getElementById("chart-tooltip");
@@ -2338,18 +2422,32 @@ def dashboard():
 
       function extractTradeErrorText(data, fallbackStatus) {
         const statusTxt = fallbackStatus ? `HTTP ${fallbackStatus}` : "HTTP error";
+        const objectToMsg = (obj) => {
+          if (!obj || typeof obj !== "object") return "";
+          const msg = obj.error || obj.message || obj.detail || obj.reason || obj.title;
+          const code = obj.error_code || obj.code || obj.status || obj.status_code;
+          if (msg && code) return `${code}: ${msg}`;
+          if (msg) return String(msg);
+          try { return JSON.stringify(obj); } catch (_) { return ""; }
+        };
         if (!data) return statusTxt;
-        if (data.error) return `${statusTxt}${data.stage ? ` [${data.stage}]` : ""}: ${String(data.error)}`;
+        if (data.error) {
+          const errMsg = (typeof data.error === "object") ? objectToMsg(data.error) : String(data.error);
+          return `${statusTxt}${data.stage ? ` [${data.stage}]` : ""}: ${(errMsg || "Unknown error").slice(0, 220)}`;
+        }
         if (data.raw_response && String(data.raw_response).trim()) {
           return `${statusTxt}: ${String(data.raw_response).trim().slice(0, 220)}`;
         }
         const body = data.response;
         if (typeof body === "string" && body.trim()) return `${statusTxt}: ${body.trim().slice(0, 220)}`;
         if (body && typeof body === "object") {
-          const msg = body.error || body.message || body.detail || body.reason;
-          const code = body.error_code || body.code;
-          if (msg && code) return `${statusTxt} ${code}: ${msg}`;
-          if (msg) return `${statusTxt}: ${String(msg)}`;
+          const nestedError = (typeof body.error === "object") ? body.error : null;
+          if (nestedError) {
+            const nestedMsg = objectToMsg(nestedError);
+            if (nestedMsg) return `${statusTxt}: ${nestedMsg.slice(0, 220)}`;
+          }
+          const msg = objectToMsg(body);
+          if (msg) return `${statusTxt}: ${msg.slice(0, 220)}`;
           try { return `${statusTxt}: ${JSON.stringify(body).slice(0, 220)}`; } catch (_) {}
         }
         if (data.status_code) return `HTTP ${data.status_code}`;
@@ -2846,6 +2944,8 @@ def dashboard():
           const cash = formatCents(cashCents);
           const portfolio = formatCents(portfolioDisplayCents);
           const positionValue = formatCents(positionValueCents);
+          if (heroCashEl) heroCashEl.textContent = cash;
+          if (heroPortfolioEl) heroPortfolioEl.textContent = portfolio;
           portfolioSummaryEl.textContent = `Cash: ${cash} | Portfolio: ${portfolio} | Position Value: ${positionValue}${btcOnly ? " | Filter: BTC only" : ""}`;
 
           if (!orders.length) {
@@ -2870,6 +2970,8 @@ def dashboard():
           }).join("");
           portfolioBody.innerHTML = rows;
         } catch (err) {
+          if (heroCashEl) heroCashEl.textContent = "$--";
+          if (heroPortfolioEl) heroPortfolioEl.textContent = "$--";
           portfolioSummaryEl.textContent = "Failed to load portfolio.";
           portfolioBody.innerHTML = "<tr><td colspan=\\"5\\">Error loading orders.</td></tr>";
         }

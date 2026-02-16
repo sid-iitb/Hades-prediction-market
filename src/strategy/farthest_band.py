@@ -305,7 +305,13 @@ def _enter_position(client: KalshiClient, selection: dict, config: FarthestBandC
     }
 
 
-def _exit_position(client: KalshiClient, active_position: dict, config: FarthestBandConfig, reason: str) -> dict:
+def _exit_position(
+    client: KalshiClient,
+    active_position: dict,
+    config: FarthestBandConfig,
+    reason: str,
+    market_like: bool = False,
+) -> dict:
     side = str(active_position.get("side") or "").lower()
     count = int(active_position.get("count") or 0)
     if side not in {"yes", "no"} or count < 1:
@@ -313,7 +319,9 @@ def _exit_position(client: KalshiClient, active_position: dict, config: Farthest
 
     top = client.get_top_of_book(active_position["ticker"])
     bid_cents = top.get(f"{side}_bid")
-    if bid_cents is None:
+    # For stop-loss we want market-like behavior: sell at executable bid only.
+    # For other exits we keep legacy ask fallback.
+    if bid_cents is None and not market_like:
         bid_cents = top.get(f"{side}_ask")
     if bid_cents is None or int(bid_cents) < 1:
         return {"action": "hold", "reason": "No bid/mark available to exit", "top_of_book": top}
@@ -397,8 +405,15 @@ def run_farthest_band_cycle(
 
         mark_state = _mark_price_and_pnl(client, active)
         pnl_pct = mark_state.get("pnl_pct")
-        if pnl_pct is not None and pnl_pct <= -stop_loss_pct:
-            exit_result = _exit_position(client, active, config, reason="stop_loss_exit")
+        # Trigger only when loss is strictly greater than stop_loss_pct.
+        if pnl_pct is not None and pnl_pct < -stop_loss_pct:
+            exit_result = _exit_position(
+                client,
+                active,
+                config,
+                reason="stop_loss_exit",
+                market_like=True,
+            )
             if exit_result.get("action") == "hold":
                 return {
                     "action": "hold_active",
