@@ -82,6 +82,112 @@ def _ensure_trade_ledger(conn):
     conn.commit()
 
 
+def _ensure_stop_loss_triggers(conn):
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS stop_loss_triggers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            sold_ticker TEXT,
+            sold_price_cents INTEGER,
+            sold_count INTEGER,
+            bought_ticker TEXT,
+            bought_price_cents INTEGER,
+            bought_count INTEGER,
+            payload_json TEXT
+        )
+        """
+    )
+    conn.commit()
+
+
+def _log_stop_loss_trigger(snapshot: dict):
+    if not isinstance(snapshot, dict):
+        return
+    sold = snapshot.get("sold") or {}
+    bought = snapshot.get("bought") or {}
+    ts = snapshot.get("triggered_at") or datetime.datetime.now(timezone.utc).isoformat()
+    payload_json = None
+    try:
+        payload_json = json.dumps(snapshot)
+    except Exception:
+        payload_json = str(snapshot)
+
+    conn = _open_ledger_db()
+    try:
+        _ensure_stop_loss_triggers(conn)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO stop_loss_triggers (
+                ts, sold_ticker, sold_price_cents, sold_count,
+                bought_ticker, bought_price_cents, bought_count, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                ts,
+                sold.get("ticker"),
+                _maybe_int(sold.get("price_cents")),
+                _maybe_int(sold.get("count")),
+                bought.get("ticker"),
+                _maybe_int(bought.get("price_cents")),
+                _maybe_int(bought.get("count")),
+                payload_json,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _get_stop_loss_trigger_history(limit: int = 20) -> list[dict]:
+    limit = max(1, min(int(limit), 500))
+    conn = _open_ledger_db()
+    try:
+        _ensure_stop_loss_triggers(conn)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT ts, sold_ticker, sold_price_cents, sold_count,
+                   bought_ticker, bought_price_cents, bought_count, payload_json
+            FROM stop_loss_triggers
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        rows = cur.fetchall()
+        # Return oldest->newest so UI can slice/reverse consistently.
+        out = []
+        for r in reversed(rows):
+            payload = {}
+            try:
+                payload = json.loads(r["payload_json"]) if r["payload_json"] else {}
+            except Exception:
+                payload = {}
+            out.append(
+                {
+                    "triggered_at": r["ts"],
+                    "sold": {
+                        "ticker": r["sold_ticker"],
+                        "price_cents": r["sold_price_cents"],
+                        "count": r["sold_count"],
+                    },
+                    "bought": {
+                        "ticker": r["bought_ticker"],
+                        "price_cents": r["bought_price_cents"],
+                        "count": r["bought_count"],
+                    },
+                    "sell_error": payload.get("sell_error"),
+                    "buy_error": payload.get("buy_error"),
+                }
+            )
+        return out
+    finally:
+        conn.close()
+
+
 def _log_trade_ledger(
     source: str,
     run_mode: str | None,
@@ -229,6 +335,8 @@ _farthest_auto_state = {
     "active_positions": [],
     "active_position_mode": None,
     "risk_snapshot": [],
+    "last_stop_loss_trigger": None,
+    "stop_loss_trigger_history": [],
 }
 
 
@@ -489,7 +597,7 @@ def _market_event_prefix(ticker: str | None) -> str | None:
     return None
 
 
-def _seed_active_positions_from_portfolio(config: FarthestBandConfig) -> list[dict]:
+def _seed_active_positions_from_portfolio(config: FarthestBandConfig) -> list[dict] | None:
     """
     Recover strategy-tracked positions from live portfolio so stop-loss can
     continue protecting positions after API restarts.
@@ -501,7 +609,8 @@ def _seed_active_positions_from_portfolio(config: FarthestBandConfig) -> list[di
     try:
         positions = client.get_positions()
     except Exception:
-        return []
+        # Return None on fetch failure so callers can keep prior tracked state.
+        return None
 
     ingest = _latest_ingest_record() or {}
     latest_event = str(ingest.get("event_ticker") or "").strip()
@@ -597,10 +706,17 @@ def _farthest_band_worker():
             else:
                 active_positions = []
             _farthest_auto_state["next_scheduled_run_at"] = next_scheduled_at.isoformat()
+            last_stop_loss_trigger = dict(_farthest_auto_state.get("last_stop_loss_trigger") or {}) or None
+            stop_loss_trigger_history = list(_farthest_auto_state.get("stop_loss_trigger_history") or [])
         if not cfg_dict:
             break
 
         config = FarthestBandConfig(**cfg_dict)
+        # Always prefer live portfolio quantities for stop-loss decisions in live mode.
+        if str(config.mode).lower() == "live":
+            live_positions = _seed_active_positions_from_portfolio(config)
+            if live_positions is not None:
+                active_positions = live_positions
         is_scheduled_run = now_utc >= next_scheduled_at
         did_run = False
         run_at = None
@@ -622,6 +738,42 @@ def _farthest_band_worker():
                     out = {"action": "error", "reason": str(exc), "active_position": pos}
                 _record_strategy_ledger(out, source="/strategy/farthest_band/auto")
                 latest_out = out
+                cycle = (out or {}).get("result") or {}
+                if str(cycle.get("action") or "").lower() == "stop_loss_rotate":
+                    exit_leg = cycle.get("exit") or {}
+                    reentry_leg = cycle.get("reentry") or {}
+                    exited = cycle.get("exited_position") or {}
+                    rebought = (
+                        reentry_leg.get("active_position")
+                        or ((reentry_leg.get("selection") or {}).get("selected") or {})
+                    )
+                    last_stop_loss_trigger = {
+                        "triggered_at": run_at,
+                        "sold": {
+                            "ticker": exited.get("ticker"),
+                            "price_cents": _maybe_int(exit_leg.get("exit_price_cents")),
+                            "count": _maybe_int(exited.get("count")),
+                        },
+                        "bought": {
+                            "ticker": rebought.get("ticker"),
+                            "price_cents": _maybe_int(
+                                rebought.get("entry_price_cents")
+                                if rebought.get("entry_price_cents") is not None
+                                else rebought.get("ask_cents")
+                            ),
+                            "count": _maybe_int(
+                                rebought.get("count")
+                                if rebought.get("count") is not None
+                                else (reentry_leg.get("selection") or {}).get("count")
+                            ),
+                        },
+                        "sell_error": exit_leg.get("reason"),
+                        "buy_error": reentry_leg.get("reason"),
+                    }
+                    stop_loss_trigger_history.append(last_stop_loss_trigger)
+                    if len(stop_loss_trigger_history) > 20:
+                        stop_loss_trigger_history = stop_loss_trigger_history[-20:]
+                    _log_stop_loss_trigger(last_stop_loss_trigger)
                 mark = out.get("mark") if isinstance(out, dict) else None
                 pnl_pct = out.get("pnl_pct") if isinstance(out, dict) else None
                 if pnl_pct is None and isinstance(mark, dict):
@@ -675,13 +827,16 @@ def _farthest_band_worker():
                 _farthest_auto_state["active_positions"] = normalized_positions
                 _farthest_auto_state["active_position"] = normalized_positions[-1] if normalized_positions else None
                 _farthest_auto_state["active_position_mode"] = cfg_mode if normalized_positions else None
+                _farthest_auto_state["last_stop_loss_trigger"] = last_stop_loss_trigger
+                _farthest_auto_state["stop_loss_trigger_history"] = stop_loss_trigger_history
 
         # Wake at the earlier of:
         # - next scheduled interval execution
-        # - 5-minute risk-check cadence
+        # - configured stop-loss risk-check cadence
         now_after = datetime.datetime.now(timezone.utc)
         seconds_until_schedule = max(1, int((next_scheduled_at - now_after).total_seconds()))
-        wait_seconds = min(300, seconds_until_schedule)
+        configured_risk_sec = max(1, int(getattr(config, "stop_loss_check_seconds", 300) or 300))
+        wait_seconds = min(configured_risk_sec, seconds_until_schedule)
         next_risk_check_at = now_after + timedelta(seconds=wait_seconds)
         with _farthest_auto_lock:
             _farthest_auto_state["next_risk_check_at"] = next_risk_check_at.isoformat()
@@ -1358,6 +1513,7 @@ def strategy_farthest_band_preview(
     ask_min_cents: int = 95,
     ask_max_cents: int = 99,
     max_cost_cents: int = 500,
+    stop_loss_pct: float = 0.25,
 ):
     config = FarthestBandConfig(
         direction="lower",
@@ -1365,6 +1521,7 @@ def strategy_farthest_band_preview(
         ask_min_cents=ask_min_cents,
         ask_max_cents=ask_max_cents,
         max_cost_cents=max_cost_cents,
+        stop_loss_pct=stop_loss_pct,
         mode="paper",
     )
     ingest = _latest_ingest_record()
@@ -1393,6 +1550,7 @@ def strategy_farthest_band_run(
     ask_max_cents: int = 99,
     max_cost_cents: int = 500,
     mode: str = "paper",
+    stop_loss_pct: float = 0.25,
     force_new_order: bool = False,
 ):
     config = FarthestBandConfig(
@@ -1401,6 +1559,7 @@ def strategy_farthest_band_run(
         ask_min_cents=ask_min_cents,
         ask_max_cents=ask_max_cents,
         max_cost_cents=max_cost_cents,
+        stop_loss_pct=stop_loss_pct,
         mode=mode,
     )
     try:
@@ -1433,6 +1592,8 @@ def strategy_farthest_band_auto_start(
     max_cost_cents: int = 500,
     mode: str = "paper",
     interval_minutes: int = 15,
+    stop_loss_pct: float = 0.25,
+    stop_loss_check_seconds: int = 300,
 ):
     global _farthest_auto_thread
     cfg_mode = str(mode or "").lower()
@@ -1445,6 +1606,8 @@ def strategy_farthest_band_auto_start(
         max_cost_cents=max_cost_cents,
         mode=mode,
         interval_minutes=interval_minutes,
+        stop_loss_pct=stop_loss_pct,
+        stop_loss_check_seconds=stop_loss_check_seconds,
     )
 
     with _farthest_auto_lock:
@@ -1465,7 +1628,10 @@ def strategy_farthest_band_auto_start(
         _farthest_auto_state["next_risk_check_at"] = datetime.datetime.now(timezone.utc).isoformat()
         _farthest_auto_state["last_result"] = None
         _farthest_auto_state["risk_snapshot"] = []
-        seeded_positions = _seed_active_positions_from_portfolio(config)
+        history = _get_stop_loss_trigger_history(limit=20)
+        _farthest_auto_state["stop_loss_trigger_history"] = history
+        _farthest_auto_state["last_stop_loss_trigger"] = history[-1] if history else None
+        seeded_positions = _seed_active_positions_from_portfolio(config) or []
         _farthest_auto_state["active_positions"] = seeded_positions
         _farthest_auto_state["active_position"] = seeded_positions[-1] if seeded_positions else None
         _farthest_auto_state["active_position_mode"] = cfg_mode if seeded_positions else None
@@ -1508,6 +1674,9 @@ def strategy_farthest_band_reset():
         _farthest_auto_state["active_position_mode"] = None
         _farthest_auto_state["last_result"] = None
         _farthest_auto_state["risk_snapshot"] = []
+        history = _get_stop_loss_trigger_history(limit=20)
+        _farthest_auto_state["stop_loss_trigger_history"] = history
+        _farthest_auto_state["last_stop_loss_trigger"] = history[-1] if history else None
     return {"ok": True, "message": "Strategy active position reset"}
 
 
@@ -1517,6 +1686,9 @@ def strategy_farthest_band_auto_status():
         thread_alive = bool(_farthest_auto_thread and _farthest_auto_thread.is_alive())
         state = dict(_farthest_auto_state)
         state["running"] = thread_alive
+    history = _get_stop_loss_trigger_history(limit=20)
+    state["stop_loss_trigger_history"] = history
+    state["last_stop_loss_trigger"] = history[-1] if history else None
     # Refresh risk snapshot on demand so stop-loss panel can always show latest P/L%.
     if thread_alive:
         active_positions = state.get("active_positions") or []
@@ -2268,6 +2440,14 @@ def dashboard():
                     <label for="strategy-interval">Auto Interval (min)</label>
                     <input id="strategy-interval" type="number" min="1" value="15" />
                   </div>
+                  <div class="field">
+                    <label for="strategy-stop-loss-pct">Stop-Loss %</label>
+                    <input id="strategy-stop-loss-pct" type="number" min="0.1" step="0.1" value="25.0" />
+                  </div>
+                  <div class="field">
+                    <label for="strategy-stop-loss-seconds">Risk Check (sec)</label>
+                    <input id="strategy-stop-loss-seconds" type="number" min="1" value="300" />
+                  </div>
                 </div>
                 <div class="strategy-actions">
                   <button id="strategy-auto-start" class="btn" type="button">Auto Start</button>
@@ -2283,7 +2463,8 @@ def dashboard():
                   </div>
                 </div>
                 <div class="stoploss-panel">
-                  <div class="stoploss-title">Stop-loss check (5m cadence)</div>
+                  <div class="stoploss-title">Stop-loss check cadence</div>
+                  <div id="stoploss-config" class="stoploss-next">Frequency: -- | Trigger: --</div>
                   <div id="stoploss-next-run" class="stoploss-next">Next stop-loss check: --</div>
                   <div class="progress-track">
                     <div id="stoploss-progress-fill" class="progress-fill"></div>
@@ -2358,6 +2539,14 @@ def dashboard():
                   <div class="field">
                     <label for="manual-strategy-interval">Auto Interval (min)</label>
                     <input id="manual-strategy-interval" type="number" min="1" value="15" />
+                  </div>
+                  <div class="field">
+                    <label for="manual-strategy-stop-loss-pct">Stop-Loss %</label>
+                    <input id="manual-strategy-stop-loss-pct" type="number" min="0.1" step="0.1" value="25.0" />
+                  </div>
+                  <div class="field">
+                    <label for="manual-strategy-stop-loss-seconds">Risk Check (sec)</label>
+                    <input id="manual-strategy-stop-loss-seconds" type="number" min="1" value="300" />
                   </div>
                 </div>
                 <div class="strategy-actions">
@@ -2456,12 +2645,16 @@ def dashboard():
       const strategyAskMaxEl = document.getElementById("strategy-ask-max");
       const strategyMaxCostEl = document.getElementById("strategy-max-cost");
       const strategyIntervalEl = document.getElementById("strategy-interval");
+      const strategyStopLossPctEl = document.getElementById("strategy-stop-loss-pct");
+      const strategyStopLossSecondsEl = document.getElementById("strategy-stop-loss-seconds");
       const manualStrategyModeEl = document.getElementById("manual-strategy-mode");
       const manualStrategySideEl = document.getElementById("manual-strategy-side");
       const manualStrategyAskMinEl = document.getElementById("manual-strategy-ask-min");
       const manualStrategyAskMaxEl = document.getElementById("manual-strategy-ask-max");
       const manualStrategyMaxCostEl = document.getElementById("manual-strategy-max-cost");
       const manualStrategyIntervalEl = document.getElementById("manual-strategy-interval");
+      const manualStrategyStopLossPctEl = document.getElementById("manual-strategy-stop-loss-pct");
+      const manualStrategyStopLossSecondsEl = document.getElementById("manual-strategy-stop-loss-seconds");
       const strategyPreviewBtn = document.getElementById("strategy-preview");
       const strategyRunBtn = document.getElementById("strategy-run");
       const strategyAutoStartBtn = document.getElementById("strategy-auto-start");
@@ -2471,6 +2664,7 @@ def dashboard():
       const autoLastTradeBadgeEl = document.getElementById("auto-last-trade-badge");
       const strategyNextRunEl = document.getElementById("strategy-next-run");
       const strategyProgressFillEl = document.getElementById("strategy-progress-fill");
+      const stopLossConfigEl = document.getElementById("stoploss-config");
       const stopLossNextRunEl = document.getElementById("stoploss-next-run");
       const stopLossProgressFillEl = document.getElementById("stoploss-progress-fill");
       const stopLossPositionsEl = document.getElementById("stoploss-positions");
@@ -2494,6 +2688,8 @@ def dashboard():
           strategyAskMaxEl.value = manualStrategyAskMaxEl.value;
           strategyMaxCostEl.value = manualStrategyMaxCostEl.value;
           strategyIntervalEl.value = manualStrategyIntervalEl.value;
+          strategyStopLossPctEl.value = manualStrategyStopLossPctEl.value;
+          strategyStopLossSecondsEl.value = manualStrategyStopLossSecondsEl.value;
           return;
         }
         manualStrategyModeEl.value = strategyModeEl.value;
@@ -2502,6 +2698,8 @@ def dashboard():
         manualStrategyAskMaxEl.value = strategyAskMaxEl.value;
         manualStrategyMaxCostEl.value = strategyMaxCostEl.value;
         manualStrategyIntervalEl.value = strategyIntervalEl.value;
+        manualStrategyStopLossPctEl.value = strategyStopLossPctEl.value;
+        manualStrategyStopLossSecondsEl.value = strategyStopLossSecondsEl.value;
       }
 
       function resizeCanvas() {
@@ -2841,8 +3039,10 @@ def dashboard():
         params.set("ask_min_cents", String(Number(strategyAskMinEl.value || 95)));
         params.set("ask_max_cents", String(Number(strategyAskMaxEl.value || 99)));
         params.set("max_cost_cents", String(Number(strategyMaxCostEl.value || 500)));
+        params.set("stop_loss_pct", String((Number(strategyStopLossPctEl.value || 25) / 100)));
         if (includeMode) params.set("mode", strategyModeEl.value || "paper");
         if (includeInterval) params.set("interval_minutes", String(Number(strategyIntervalEl.value || 15)));
+        if (includeInterval) params.set("stop_loss_check_seconds", String(Number(strategyStopLossSecondsEl.value || 300)));
         return params.toString();
       }
 
@@ -2929,12 +3129,62 @@ def dashboard():
       }
 
       function updateStopLossPanel(statusData) {
-        const riskSec = 300;
+        const configuredRiskSec = Math.max(1, Number(statusData?.config?.stop_loss_check_seconds || strategyStopLossSecondsEl.value || 300));
+        const fmtTs = (iso) => {
+          if (!iso) return "n/a";
+          const d = new Date(iso);
+          if (!Number.isFinite(d.getTime())) return String(iso);
+          return d.toLocaleString();
+        };
+        const triggerHistory = (statusData && typeof statusData === "object" && Array.isArray(statusData.stop_loss_trigger_history))
+          ? statusData.stop_loss_trigger_history
+          : [];
+        const trigger = (statusData && typeof statusData === "object")
+          ? (statusData.last_stop_loss_trigger || triggerHistory[triggerHistory.length - 1] || null)
+          : null;
+        const recentHistory = triggerHistory
+          .slice(-5)
+          .reverse()
+          .map((t, i) => {
+            const soldTicker = t?.sold?.ticker || "--";
+            const soldPx = t?.sold?.price_cents ?? "--";
+            const soldCount = t?.sold?.count ?? "--";
+            const boughtTicker = t?.bought?.ticker || "--";
+            const boughtPx = t?.bought?.price_cents ?? "--";
+            const boughtCount = t?.bought?.count ?? "--";
+            const sellErr = t?.sell_error ? ` | Sell error: ${t.sell_error}` : "";
+            const buyErr = t?.buy_error ? ` | Buy error: ${t.buy_error}` : "";
+            return `${i + 1}) ${fmtTs(t?.triggered_at)} | Sold ${soldTicker} @ ${soldPx}c x ${soldCount} | Bought ${boughtTicker} @ ${boughtPx}c x ${boughtCount}${sellErr}${buyErr}`;
+          })
+          .join("\\n");
+        const triggerBlock = trigger
+          ? [
+              "",
+              "Last stop-loss trigger snapshot",
+              `Time: ${fmtTs(trigger?.triggered_at)}`,
+              `Sold: ${(trigger?.sold?.ticker || "--")} @ ${(trigger?.sold?.price_cents ?? "--")}c x ${(trigger?.sold?.count ?? "--")}`,
+              `Bought: ${(trigger?.bought?.ticker || "--")} @ ${(trigger?.bought?.price_cents ?? "--")}c x ${(trigger?.bought?.count ?? "--")}`,
+              trigger?.sell_error ? `Sell error: ${trigger.sell_error}` : "",
+              trigger?.buy_error ? `Buy error: ${trigger.buy_error}` : "",
+              recentHistory ? `\\nRecent triggers (${triggerHistory.length})\\n${recentHistory}` : "",
+            ].filter(Boolean).join("\\n")
+          : "";
+        const configuredIntervalMin = Math.max(1, Number(statusData?.config?.interval_minutes || strategyIntervalEl.value || 15));
+        const cadenceSec = Math.max(1, Math.min(configuredRiskSec, Math.floor(configuredIntervalMin * 60)));
+        const cadenceText = cadenceSec % 60 === 0
+          ? `${Math.floor(cadenceSec / 60)}m`
+          : `${cadenceSec}s`;
+        const stopLossPct = Math.abs(Number(statusData?.config?.stop_loss_pct ?? 0.25)) * 100;
+        if (stopLossConfigEl) {
+          stopLossConfigEl.textContent = `Frequency: every up to ${cadenceText} (min(configured risk check, next schedule)) | Trigger: loss > ${stopLossPct.toFixed(2)}%`;
+        }
         if (!statusData || !statusData.running) {
           stopLossNextRunEl.textContent = "Next stop-loss check: auto not running";
           stopLossProgressFillEl.style.width = "0%";
           stopLossPositionsEl.textContent = "Protected positions: none";
-          if (stopLossLastRunEl) stopLossLastRunEl.textContent = "Last stop-loss run: auto not running";
+          if (stopLossLastRunEl) {
+            stopLossLastRunEl.textContent = `Last stop-loss run: auto not running${triggerBlock}`;
+          }
           return;
         }
 
@@ -2946,27 +3196,21 @@ def dashboard():
         } else {
           const nowMs = Date.now();
           const remainingSec = Math.max(0, (nextRiskAt - nowMs) / 1000);
-          let elapsedSec = riskSec - remainingSec;
+          let elapsedSec = cadenceSec - remainingSec;
           if (Number.isFinite(lastRiskAt)) {
-            elapsedSec = Math.max(0, Math.min(riskSec, (nowMs - lastRiskAt) / 1000));
+            elapsedSec = Math.max(0, Math.min(cadenceSec, (nowMs - lastRiskAt) / 1000));
           }
-          const progressPct = Math.max(0, Math.min(100, (elapsedSec / riskSec) * 100));
+          const progressPct = Math.max(0, Math.min(100, (elapsedSec / cadenceSec) * 100));
           stopLossNextRunEl.textContent = `Next stop-loss check in ${formatDuration(remainingSec)}`;
           stopLossProgressFillEl.style.width = `${progressPct.toFixed(1)}%`;
         }
 
         const positions = Array.isArray(statusData?.active_positions) ? statusData.active_positions : [];
         const snapshots = Array.isArray(statusData?.risk_snapshot) ? statusData.risk_snapshot : [];
-        const fmtTs = (iso) => {
-          if (!iso) return "n/a";
-          const d = new Date(iso);
-          if (!Number.isFinite(d.getTime())) return String(iso);
-          return d.toLocaleString();
-        };
         if (!positions.length) {
           stopLossPositionsEl.textContent = "Protected positions: none (stop-loss starts after first tracked entry/seed).";
           if (stopLossLastRunEl) {
-            stopLossLastRunEl.textContent = `Last stop-loss run\\nTime: ${fmtTs(statusData?.last_risk_check_at)}\\nResult: No protected positions.`;
+            stopLossLastRunEl.textContent = `Last stop-loss run\\nTime: ${fmtTs(statusData?.last_risk_check_at)}\\nResult: No protected positions.${triggerBlock}`;
           }
           return;
         }
@@ -3021,8 +3265,16 @@ def dashboard():
             const boughtPx = reentry?.active_position?.entry_price_cents ?? reentry?.selection?.selected?.ask_cents ?? "--";
             decision = "Triggered: stop-loss hit.";
             detail = `Sold: ${soldTicker} @ ${soldPx}c x ${soldCount}\\nBought: ${boughtTicker} @ ${boughtPx}c x ${boughtCount}`;
+            if (exit?.action === "hold" && exit?.reason) {
+              detail += `\\nSell error: ${exit.reason}`;
+            }
+            if (reentry?.action === "hold" && reentry?.reason) {
+              detail += `\\nBuy error: ${reentry.reason}`;
+            }
           } else if (action === "hold_active" && String(reason || "").toLowerCase().includes("stop-loss triggered")) {
             decision = `Triggered, but exit failed: ${reason || "unknown reason"}`;
+            const exitReason = cycle?.exit?.reason || "";
+            if (exitReason) detail = `Sell error: ${exitReason}`;
           } else if (action === "rollover_reenter") {
             decision = "Rollover action executed (not stop-loss).";
           } else if (action === "error") {
@@ -3034,7 +3286,7 @@ def dashboard():
               .join(" | ");
             detail = checked ? `Checked: ${checked}` : "";
           }
-          stopLossLastRunEl.textContent = `Last stop-loss run\\nTime: ${fmtTs(lastRiskAt)}\\nResult: ${decision}${detail ? `\\n${detail}` : ""}`;
+          stopLossLastRunEl.textContent = `Last stop-loss run\\nTime: ${fmtTs(lastRiskAt)}\\nResult: ${decision}${detail ? `\\n${detail}` : ""}${triggerBlock}`;
         }
       }
 
@@ -3456,9 +3708,9 @@ def dashboard():
       portfolioBtcOnlyEl.addEventListener("change", refreshPortfolio);
       refreshLedgerBtn.addEventListener("click", refreshLedger);
       refreshPnlBtn.addEventListener("click", refreshPnlSummary);
-      [manualStrategyModeEl, manualStrategySideEl, manualStrategyAskMinEl, manualStrategyAskMaxEl, manualStrategyMaxCostEl, manualStrategyIntervalEl]
+      [manualStrategyModeEl, manualStrategySideEl, manualStrategyAskMinEl, manualStrategyAskMaxEl, manualStrategyMaxCostEl, manualStrategyIntervalEl, manualStrategyStopLossPctEl, manualStrategyStopLossSecondsEl]
         .forEach(el => el.addEventListener("change", () => syncStrategyControls(true)));
-      [strategyModeEl, strategySideEl, strategyAskMinEl, strategyAskMaxEl, strategyMaxCostEl, strategyIntervalEl]
+      [strategyModeEl, strategySideEl, strategyAskMinEl, strategyAskMaxEl, strategyMaxCostEl, strategyIntervalEl, strategyStopLossPctEl, strategyStopLossSecondsEl]
         .forEach(el => el.addEventListener("change", () => syncStrategyControls(false)));
       strategyPreviewBtn.addEventListener("click", strategyPreview);
       strategyRunBtn.addEventListener("click", strategyRun);

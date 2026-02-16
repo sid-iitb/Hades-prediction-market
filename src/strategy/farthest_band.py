@@ -16,6 +16,7 @@ class FarthestBandConfig:
     mode: str = "paper"  # "paper" or "live"
     interval_minutes: int = 15
     stop_loss_pct: float = 0.25
+    stop_loss_check_seconds: int = 300
     rebalance_each_interval: bool = True
     skip_nearest_levels: int = 2
 
