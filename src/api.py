@@ -5,13 +5,14 @@ import json
 import os
 import sqlite3
 import threading
+import traceback
 from typing import Optional
 from datetime import timedelta, timezone
 from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 from src.client.kalshi_client import KalshiClient
@@ -679,47 +680,93 @@ def _parse_dollar_str_to_cents(value):
 
 @app.get("/kalshi/place_best_ask_order")
 def place_best_ask_order(side: str, ticker: str, max_cost_cents: int = 500):
-    client = KalshiClient()
-    resp = None
-    if side.lower() == "yes":
-        resp = client.place_yes_limit_at_best_ask(
-            ticker=ticker,
-            max_cost_cents=max_cost_cents,
-        )
-    elif side.lower() == "no":
-        resp = client.place_no_limit_at_best_ask(
-            ticker=ticker,
-            max_cost_cents=max_cost_cents,
-        )
-    else:
-        return {"error": "side must be 'yes' or 'no'"}
-
     try:
-        body = resp.json()
-    except Exception:
-        body = resp.text
-    body_obj = body if isinstance(body, dict) else {}
-    price_cents = _maybe_int(
-        body_obj.get("yes_price")
-        or body_obj.get("no_price")
-        or body_obj.get("price")
-        or body_obj.get("limit_price")
-    )
-    count = _maybe_int(body_obj.get("count") or body_obj.get("quantity") or body_obj.get("filled_count"))
-    _log_trade_ledger(
-        source="/kalshi/place_best_ask_order",
-        run_mode="live",
-        action="buy",
-        side=str(side).lower(),
-        ticker=ticker,
-        price_cents=price_cents,
-        count=count,
-        status_code=resp.status_code if resp is not None else None,
-        success=bool(resp is not None and resp.status_code in {200, 201}),
-        note=f"max_cost_cents={max_cost_cents}",
-        payload=body,
-    )
-    return {"status_code": resp.status_code, "response": body}
+        side_norm = str(side or "").lower()
+        if side_norm not in {"yes", "no"}:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "side must be 'yes' or 'no'", "stage": "validation"},
+            )
+
+        client = KalshiClient()
+        if side_norm == "yes":
+            resp = client.place_yes_limit_at_best_ask(
+                ticker=ticker,
+                max_cost_cents=max_cost_cents,
+            )
+        else:
+            resp = client.place_no_limit_at_best_ask(
+                ticker=ticker,
+                max_cost_cents=max_cost_cents,
+            )
+
+        try:
+            body = resp.json()
+        except Exception:
+            body = resp.text
+
+        body_obj = body if isinstance(body, dict) else {}
+
+        def _deep_find_first_number(obj, keys):
+            if isinstance(obj, dict):
+                for k in keys:
+                    v = obj.get(k)
+                    if isinstance(v, (int, float)):
+                        return int(v)
+                for v in obj.values():
+                    found = _deep_find_first_number(v, keys)
+                    if found is not None:
+                        return found
+            elif isinstance(obj, list):
+                for item in obj:
+                    found = _deep_find_first_number(item, keys)
+                    if found is not None:
+                        return found
+            return None
+
+        price_keys = [f"{side_norm}_price", "yes_price", "no_price", "price", "limit_price", "avg_price"]
+        count_keys = ["filled_count", "matched_count", "executed_count", "count", "quantity"]
+        price_cents = _deep_find_first_number(body_obj, price_keys)
+        count = _deep_find_first_number(body_obj, count_keys)
+
+        # Fallback to submitted best-ask intent when exchange response omits fill/order fields.
+        if price_cents is None or count is None:
+            try:
+                top = client.get_top_of_book(ticker)
+                ask = top.get(f"{side_norm}_ask")
+                if price_cents is None and ask is not None:
+                    price_cents = int(ask)
+                if count is None and ask is not None and int(ask) > 0:
+                    count = int(int(max_cost_cents) // int(ask))
+            except Exception:
+                pass
+        _log_trade_ledger(
+            source="/kalshi/place_best_ask_order",
+            run_mode="live",
+            action="buy",
+            side=side_norm,
+            ticker=ticker,
+            price_cents=price_cents,
+            count=count,
+            status_code=resp.status_code if resp is not None else None,
+            success=bool(resp is not None and resp.status_code in {200, 201}),
+            note=f"max_cost_cents={max_cost_cents}",
+            payload=body,
+        )
+        return {"status_code": resp.status_code, "response": body}
+    except Exception as exc:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+                "stage": "place_best_ask_order",
+                "side": str(side or "").lower(),
+                "ticker": ticker,
+                "max_cost_cents": max_cost_cents,
+                "traceback": traceback.format_exc().splitlines()[-8:],
+            },
+        )
 
 
 @app.get("/kalshi/portfolio/balance")
@@ -751,6 +798,41 @@ def _extract_order_price_cents(order):
         if isinstance(val, (int, float)):
             return int(val)
     return None
+
+
+def _extract_order_price_cents_float(order):
+    for key in ("avg_price", "yes_price", "no_price", "price", "limit_price"):
+        val = order.get(key)
+        if isinstance(val, (int, float)):
+            v = float(val)
+            if 0 < v <= 1.0:
+                return v * 100.0
+            return v
+    return None
+
+
+def _extract_order_fees_cents(order):
+    return (
+        _parse_dollar_str_to_cents(order.get("fees_paid_dollars"))
+        or _parse_dollar_str_to_cents(order.get("fees_paid"))
+        or _parse_dollar_str_to_cents(order.get("total_fees_dollars"))
+        or _parse_dollar_str_to_cents(order.get("total_fees"))
+        or _parse_dollar_str_to_cents(order.get("fee_dollars"))
+        or _parse_dollar_str_to_cents(order.get("fee"))
+        or 0
+    )
+
+
+def _order_sort_key(order):
+    for k in ("created_time", "created_at", "updated_time", "updated_at", "ts", "time"):
+        v = order.get(k)
+        if not v:
+            continue
+        try:
+            return datetime.datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp()
+        except Exception:
+            continue
+    return 0.0
 
 
 def _midpoint(a, b):
@@ -938,6 +1020,157 @@ def get_portfolio_current_orders(status: Optional[str] = "open", limit: int = 20
             )
 
     return {"balance": balance, "orders": rows}
+
+
+@app.get("/kalshi/pnl/summary")
+def get_pnl_summary(limit: int = 300):
+    """
+    Compute FIFO realized/unrealized/net PnL from filled buy/sell orders.
+    """
+    client = KalshiClient()
+    order_sources = {}
+    merged = {}
+    statuses_to_try = [None, "filled", "executed", "closed"]
+    for st in statuses_to_try:
+        try:
+            batch = client.get_all_orders(status=st, limit=max(50, int(limit)), max_pages=50)
+        except Exception:
+            batch = []
+        order_sources[str(st)] = len(batch or [])
+        for o in batch or []:
+            oid = str(o.get("order_id") or o.get("id") or "")
+            if oid:
+                merged[oid] = o
+            else:
+                # fallback key when id is absent
+                k = f"{o.get('ticker')}|{o.get('side')}|{o.get('action')}|{o.get('created_time') or o.get('created_at') or ''}|{o.get('client_order_id') or ''}"
+                merged[k] = o
+    orders_sorted = sorted(list(merged.values()), key=_order_sort_key)
+
+    # FIFO lots keyed by (ticker, side)
+    lots: dict[tuple[str, str], list[dict]] = {}
+    realized_by_key: dict[tuple[str, str], int] = {}
+    buys_cost_cents = 0
+    sells_proceeds_cents = 0
+    fees_cents_total = 0
+    fill_count = 0
+
+    for o in orders_sorted:
+        action = str(o.get("action") or "").lower()
+        side = str(o.get("side") or "").lower()
+        ticker = str(o.get("ticker") or "")
+        if action not in {"buy", "sell"} or side not in {"yes", "no"} or not ticker:
+            continue
+
+        filled_count = (
+            _maybe_int(o.get("filled_count"))
+            or _maybe_int(o.get("matched_count"))
+            or _maybe_int(o.get("executed_count"))
+            or 0
+        )
+        order_count = int(_extract_order_count(o) or 0)
+        status_txt = str(o.get("status") or "").lower()
+        count = int(filled_count if filled_count > 0 else (order_count if status_txt in {"filled", "executed", "closed"} else 0))
+        if count < 1:
+            continue
+
+        px = _extract_order_price_cents_float(o)
+        if px is None:
+            continue
+
+        fees = int(_extract_order_fees_cents(o) or 0)
+        fees_cents_total += fees
+        fill_count += 1
+        key = (ticker, side)
+
+        # Per-contract fee allocation for consistent FIFO matching.
+        fee_per_contract = float(fees) / float(count) if count > 0 else 0.0
+
+        if action == "buy":
+            total_cost = int(round(px * count + fees))
+            buys_cost_cents += total_cost
+            lots.setdefault(key, []).append(
+                {
+                    "remaining": int(count),
+                    "cost_per_contract": float(px) + fee_per_contract,
+                }
+            )
+            continue
+
+        # sell leg
+        total_proceeds = int(round(px * count - fees))
+        sells_proceeds_cents += total_proceeds
+        sell_proceeds_per_contract = float(px) - fee_per_contract
+        remaining = int(count)
+        realized_this = 0.0
+        fifo = lots.setdefault(key, [])
+        while remaining > 0 and fifo:
+            lot = fifo[0]
+            take = min(remaining, int(lot["remaining"]))
+            realized_this += (sell_proceeds_per_contract - float(lot["cost_per_contract"])) * float(take)
+            lot["remaining"] = int(lot["remaining"]) - take
+            remaining -= take
+            if lot["remaining"] <= 0:
+                fifo.pop(0)
+        # If unmatched sells exist, treat basis as 0 so PnL remains conservative/traceable.
+        if remaining > 0:
+            realized_this += sell_proceeds_per_contract * float(remaining)
+        realized_by_key[key] = int(realized_by_key.get(key, 0) + int(round(realized_this)))
+
+    # Mark open lots for unrealized PnL using executable bid side.
+    open_cost_basis_cents = 0
+    open_market_value_cents = 0
+    by_market = []
+    for (ticker, side), fifo in lots.items():
+        open_qty = sum(int(l.get("remaining") or 0) for l in fifo)
+        if open_qty < 1:
+            continue
+        basis = int(round(sum(float(l["cost_per_contract"]) * int(l["remaining"]) for l in fifo)))
+        try:
+            top = client.get_top_of_book(ticker)
+        except Exception:
+            top = {}
+        mark = top.get(f"{side}_bid")
+        if mark is None:
+            mark = 0
+        mv = int(round(float(mark) * float(open_qty)))
+        unrealized = mv - basis
+        realized = int(realized_by_key.get((ticker, side), 0))
+        open_cost_basis_cents += basis
+        open_market_value_cents += mv
+        by_market.append(
+            {
+                "ticker": ticker,
+                "side": side,
+                "open_count": open_qty,
+                "realized_pnl_cents": realized,
+                "open_cost_basis_cents": basis,
+                "open_market_value_cents": mv,
+                "unrealized_pnl_cents": unrealized,
+                "net_pnl_cents": realized + unrealized,
+            }
+        )
+
+    realized_total = int(sum(realized_by_key.values()))
+    unrealized_total = int(open_market_value_cents - open_cost_basis_cents)
+    net_total = int(realized_total + unrealized_total)
+
+    return {
+        "fills_count": fill_count,
+        "orders_considered": len(orders_sorted),
+        "order_sources": order_sources,
+        "totals": {
+            "buys_cost_cents": int(buys_cost_cents),
+            "sells_proceeds_cents": int(sells_proceeds_cents),
+            "fees_cents": int(fees_cents_total),
+            "realized_pnl_cents": realized_total,
+            "open_cost_basis_cents": int(open_cost_basis_cents),
+            "open_market_value_cents": int(open_market_value_cents),
+            "unrealized_pnl_cents": unrealized_total,
+            "net_pnl_cents": net_total,
+        },
+        "by_market": sorted(by_market, key=lambda r: (r["ticker"], r["side"])),
+    }
 
 
 @app.get("/kalshi/portfolio/positions_debug")
@@ -1234,9 +1467,70 @@ def dashboard():
       }
       .hero {
         display: grid;
-        grid-template-columns: minmax(0, 1.8fr) minmax(0, 1fr);
+        grid-template-columns: minmax(0, 1.8fr) minmax(0, 1fr) minmax(0, 1fr);
         gap: 20px;
-        align-items: end;
+        align-items: stretch;
+      }
+      .hero-balance {
+        display: grid;
+        align-content: center;
+        justify-items: center;
+        gap: 8px;
+        background:
+          radial-gradient(circle at 20% 15%, rgba(34, 211, 238, 0.18), transparent 50%),
+          radial-gradient(circle at 80% 90%, rgba(250, 204, 21, 0.16), transparent 48%),
+          rgba(255, 255, 255, 0.05);
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        border-radius: 14px;
+        padding: 16px 18px;
+        min-height: 120px;
+        box-shadow:
+          inset 0 0 0 1px rgba(255, 255, 255, 0.04),
+          0 0 20px rgba(34, 211, 238, 0.12),
+          0 0 24px rgba(250, 204, 21, 0.1);
+      }
+      .hero-balance-label {
+        color: #dbeafe;
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        font-weight: 700;
+      }
+      .hero-balance-values {
+        display: flex;
+        gap: 12px;
+        align-items: baseline;
+        flex-wrap: wrap;
+        justify-content: center;
+      }
+      .hero-balance-item {
+        display: grid;
+        gap: 2px;
+        padding: 8px 10px;
+        border-radius: 10px;
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        background: rgba(8, 16, 32, 0.45);
+        min-width: 130px;
+      }
+      .hero-balance-key {
+        color: #a5b4fc;
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+      }
+      .hero-balance-val {
+        color: #e2e8f0;
+        font-size: 24px;
+        font-weight: 700;
+        line-height: 1.1;
+      }
+      #hero-cash {
+        color: #86efac;
+        text-shadow: 0 0 14px rgba(34, 197, 94, 0.32);
+      }
+      #hero-portfolio {
+        color: #fcd34d;
+        text-shadow: 0 0 16px rgba(250, 204, 21, 0.35);
       }
       .expiry-card {
         display: grid;
@@ -1344,6 +1638,55 @@ def dashboard():
         border-radius: 14px;
         padding: 12px;
       }
+      .pnl-panel {
+        background: rgba(10, 16, 32, 0.6);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 12px;
+      }
+      .pnl-totals {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 8px;
+        margin-bottom: 10px;
+      }
+      .pnl-total {
+        background: rgba(255, 255, 255, 0.04);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 10px;
+        padding: 8px;
+      }
+      .pnl-total .k {
+        font-size: 11px;
+        color: var(--muted);
+        text-transform: uppercase;
+      }
+      .pnl-total .v {
+        font-size: 14px;
+        color: var(--text);
+        margin-top: 4px;
+      }
+      .pnl-table-wrap {
+        max-height: 220px;
+        overflow-y: auto;
+      }
+      .pnl-table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 12px;
+      }
+      .pnl-table th,
+      .pnl-table td {
+        padding: 6px 4px;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+        text-align: left;
+        white-space: nowrap;
+      }
+      .pnl-table th {
+        color: var(--muted);
+        font-size: 11px;
+        text-transform: uppercase;
+      }
       .ledger-table-wrap {
         max-height: 260px;
         overflow-y: auto;
@@ -1437,16 +1780,35 @@ def dashboard():
         margin-left: 6px;
       }
       .markets tr.row-hot td {
-        background: rgba(34, 211, 238, 0.08);
+        background: rgba(34, 211, 238, 0.2);
+        color: #d8fbff;
+        font-weight: 700;
+        text-shadow: 0 0 8px rgba(34, 211, 238, 0.35);
       }
       .markets tr.row-hot td:first-child {
-        box-shadow: inset 2px 0 0 rgba(34, 211, 238, 0.55);
+        box-shadow: inset 4px 0 0 #22d3ee, inset 0 0 0 1px rgba(34, 211, 238, 0.25);
+      }
+      .markets tr.row-hot td .btn.trade {
+        border-color: rgba(34, 211, 238, 0.7);
+        box-shadow: 0 0 12px rgba(34, 211, 238, 0.25);
+      }
+      .markets tr.row-pending td {
+        background: rgba(244, 196, 48, 0.12);
+      }
+      .markets tr.row-error td {
+        background: rgba(239, 68, 68, 0.14);
+      }
+      .markets tr.row-success td {
+        background: rgba(16, 185, 129, 0.12);
       }
       .trade-status {
         margin-top: 8px;
         font-size: 12px;
         color: var(--muted);
       }
+      .trade-status.pending { color: #fde68a; }
+      .trade-status.error { color: #fca5a5; }
+      .trade-status.success { color: #86efac; }
       .markets table {
         width: 100%;
         border-collapse: collapse;
@@ -1607,6 +1969,7 @@ def dashboard():
       @media (max-width: 520px) {
         .card { padding: 22px; }
         .hero { grid-template-columns: 1fr; }
+        .hero-balance { justify-items: start; }
         .expiry-card { justify-items: start; }
         .top-panels {
           grid-template-columns: 1fr;
@@ -1631,6 +1994,19 @@ def dashboard():
               </div>
               <div id="price" class="price">$--</div>
               <div id="ts" class="sub">Last update: --</div>
+            </div>
+            <div class="hero-balance">
+              <div class="hero-balance-label">Portfolio Snapshot</div>
+              <div class="hero-balance-values">
+                <div class="hero-balance-item">
+                  <div class="hero-balance-key">Cash</div>
+                  <div id="hero-cash" class="hero-balance-val">$--</div>
+                </div>
+                <div class="hero-balance-item">
+                  <div class="hero-balance-key">Portfolio</div>
+                  <div id="hero-portfolio" class="hero-balance-val">$--</div>
+                </div>
+              </div>
             </div>
             <div class="expiry-card">
               <div class="expiry-label">Ticker Expiry</div>
@@ -1835,6 +2211,35 @@ def dashboard():
               </table>
             </div>
           </div>
+          <div class="pnl-panel">
+            <div class="markets-header">
+              <h3>P/L Summary (All Orders)</h3>
+              <button id="refresh-pnl" class="btn" type="button">Refresh</button>
+            </div>
+            <div id="pnl-totals" class="pnl-totals">
+              <div class="pnl-total"><div class="k">Realized</div><div class="v">--</div></div>
+              <div class="pnl-total"><div class="k">Unrealized</div><div class="v">--</div></div>
+              <div class="pnl-total"><div class="k">Net</div><div class="v">--</div></div>
+              <div class="pnl-total"><div class="k">Fees</div><div class="v">--</div></div>
+            </div>
+            <div class="pnl-table-wrap">
+              <table class="pnl-table">
+                <thead>
+                  <tr>
+                    <th>Ticker</th>
+                    <th>Side</th>
+                    <th>Open</th>
+                    <th>Realized</th>
+                    <th>Unrealized</th>
+                    <th>Net</th>
+                  </tr>
+                </thead>
+                <tbody id="pnl-body">
+                  <tr><td colspan="6">Click Refresh to load P/L summary.</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -1843,6 +2248,8 @@ def dashboard():
       const tsEl = document.getElementById("ts");
       const eventExpiryEl = document.getElementById("event-expiry");
       const eventTickerNameEl = document.getElementById("event-ticker-name");
+      const heroCashEl = document.getElementById("hero-cash");
+      const heroPortfolioEl = document.getElementById("hero-portfolio");
       const canvas = document.getElementById("chart");
       const ctx = canvas.getContext("2d");
       const chartTooltipEl = document.getElementById("chart-tooltip");
@@ -1855,6 +2262,9 @@ def dashboard():
       const portfolioBody = document.getElementById("portfolio-body");
       const refreshLedgerBtn = document.getElementById("refresh-ledger");
       const ledgerBody = document.getElementById("ledger-body");
+      const refreshPnlBtn = document.getElementById("refresh-pnl");
+      const pnlTotalsEl = document.getElementById("pnl-totals");
+      const pnlBody = document.getElementById("pnl-body");
       const strategyModeEl = document.getElementById("strategy-mode");
       const strategySideEl = document.getElementById("strategy-side");
       const strategyAskMinEl = document.getElementById("strategy-ask-min");
@@ -2068,7 +2478,7 @@ def dashboard():
           if (noInRange) classes.push('row-highlight-no');
           const rowClass = classes.length ? ` class="${classes.join(' ') + (rowHot ? ' row-hot' : '')}"` : (rowHot ? ' class="row-hot"' : '');
           return `
-            <tr${rowClass}>
+            <tr${rowClass} data-market-ticker="${ticker}">
               <td>${strike ? strike.toLocaleString("en-US", { style: "currency", currency: "USD" }) : "--"}</td>
               <td>
                 ${yesAsk}c
@@ -2087,9 +2497,52 @@ def dashboard():
           btn.addEventListener("click", () => {
             const side = btn.getAttribute("data-side");
             const ticker = btn.getAttribute("data-ticker");
-            placeBestAskOrder(side, ticker);
+            placeBestAskOrder(side, ticker, btn);
           });
         });
+      }
+
+      function setTradeRowState(ticker, stateClass) {
+        const rows = Array.from(marketsBody.querySelectorAll("tr[data-market-ticker]"));
+        rows.forEach((row) => {
+          if (String(row.getAttribute("data-market-ticker")) !== String(ticker)) return;
+          row.classList.remove("row-pending", "row-error", "row-success");
+          if (stateClass) row.classList.add(stateClass);
+        });
+      }
+
+      function extractTradeErrorText(data, fallbackStatus) {
+        const statusTxt = fallbackStatus ? `HTTP ${fallbackStatus}` : "HTTP error";
+        const objectToMsg = (obj) => {
+          if (!obj || typeof obj !== "object") return "";
+          const msg = obj.error || obj.message || obj.detail || obj.reason || obj.title;
+          const code = obj.error_code || obj.code || obj.status || obj.status_code;
+          if (msg && code) return `${code}: ${msg}`;
+          if (msg) return String(msg);
+          try { return JSON.stringify(obj); } catch (_) { return ""; }
+        };
+        if (!data) return statusTxt;
+        if (data.error) {
+          const errMsg = (typeof data.error === "object") ? objectToMsg(data.error) : String(data.error);
+          return `${statusTxt}${data.stage ? ` [${data.stage}]` : ""}: ${(errMsg || "Unknown error").slice(0, 220)}`;
+        }
+        if (data.raw_response && String(data.raw_response).trim()) {
+          return `${statusTxt}: ${String(data.raw_response).trim().slice(0, 220)}`;
+        }
+        const body = data.response;
+        if (typeof body === "string" && body.trim()) return `${statusTxt}: ${body.trim().slice(0, 220)}`;
+        if (body && typeof body === "object") {
+          const nestedError = (typeof body.error === "object") ? body.error : null;
+          if (nestedError) {
+            const nestedMsg = objectToMsg(nestedError);
+            if (nestedMsg) return `${statusTxt}: ${nestedMsg.slice(0, 220)}`;
+          }
+          const msg = objectToMsg(body);
+          if (msg) return `${statusTxt}: ${msg.slice(0, 220)}`;
+          try { return `${statusTxt}: ${JSON.stringify(body).slice(0, 220)}`; } catch (_) {}
+        }
+        if (data.status_code) return `HTTP ${data.status_code}`;
+        return statusTxt;
       }
 
       async function refreshMarkets() {
@@ -2118,7 +2571,7 @@ def dashboard():
         } catch (_) {}
       }
 
-      async function placeBestAskOrder(side, ticker) {
+      async function placeBestAskOrder(side, ticker, btnEl = null) {
         const statusEl = document.getElementById("trade-status");
         const maxCost = Number(maxCostEl.value || 0);
         if (!ticker) {
@@ -2129,18 +2582,46 @@ def dashboard():
           if (statusEl) statusEl.textContent = "Invalid max cost.";
           return;
         }
-        if (statusEl) statusEl.textContent = `Placing ${side.toUpperCase()} order...`;
+        if (statusEl) {
+          statusEl.className = "trade-status pending";
+          statusEl.textContent = `Placing ${side.toUpperCase()} order...`;
+        }
+        if (btnEl) btnEl.disabled = true;
+        setTradeRowState(ticker, "row-pending");
         try {
           const url = `/kalshi/place_best_ask_order?side=${encodeURIComponent(side)}&ticker=${encodeURIComponent(ticker)}&max_cost_cents=${encodeURIComponent(maxCost)}`;
           const res = await fetch(url);
-          const data = await res.json();
-          if (!res.ok || data.error) {
-            if (statusEl) statusEl.textContent = `Error: ${data.error || res.status}`;
+          let data = null;
+          const rawText = await res.text();
+          try {
+            data = rawText ? JSON.parse(rawText) : {};
+          } catch (_) {
+            data = { raw_response: rawText };
+          }
+          const exchangeStatus = Number(data?.status_code || 0);
+          const failed = !res.ok || !!data.error || (exchangeStatus && ![200, 201].includes(exchangeStatus));
+          if (failed) {
+            const reason = extractTradeErrorText(data, res.status);
+            if (statusEl) {
+              statusEl.className = "trade-status error";
+              statusEl.textContent = `Order failed (${side.toUpperCase()} ${ticker}): ${reason}`;
+            }
+            setTradeRowState(ticker, "row-error");
             return;
           }
-          if (statusEl) statusEl.textContent = `Order submitted (${side.toUpperCase()}) for ${ticker}.`;
+          if (statusEl) {
+            statusEl.className = "trade-status success";
+            statusEl.textContent = `Order submitted (${side.toUpperCase()}) for ${ticker}.`;
+          }
+          setTradeRowState(ticker, "row-success");
         } catch (err) {
-          if (statusEl) statusEl.textContent = "Request failed.";
+          if (statusEl) {
+            statusEl.className = "trade-status error";
+            statusEl.textContent = `Request failed (${side.toUpperCase()} ${ticker}): ${err?.message || "network error"}`;
+          }
+          setTradeRowState(ticker, "row-error");
+        } finally {
+          if (btnEl) btnEl.disabled = false;
         }
       }
 
@@ -2583,6 +3064,8 @@ def dashboard():
           const cash = formatCents(cashCents);
           const portfolio = formatCents(portfolioDisplayCents);
           const positionValue = formatCents(positionValueCents);
+          if (heroCashEl) heroCashEl.textContent = cash;
+          if (heroPortfolioEl) heroPortfolioEl.textContent = portfolio;
           portfolioSummaryEl.textContent = `Cash: ${cash} | Portfolio: ${portfolio} | Position Value: ${positionValue}${btcOnly ? " | Filter: BTC only" : ""}`;
 
           if (!orders.length) {
@@ -2607,6 +3090,8 @@ def dashboard():
           }).join("");
           portfolioBody.innerHTML = rows;
         } catch (err) {
+          if (heroCashEl) heroCashEl.textContent = "$--";
+          if (heroPortfolioEl) heroPortfolioEl.textContent = "$--";
           portfolioSummaryEl.textContent = "Failed to load portfolio.";
           portfolioBody.innerHTML = "<tr><td colspan=\\"5\\">Error loading orders.</td></tr>";
         }
@@ -2670,6 +3155,39 @@ def dashboard():
         }
       }
 
+      async function refreshPnlSummary() {
+        pnlBody.innerHTML = "<tr><td colspan=\\"6\\">Loading P/L summary...</td></tr>";
+        try {
+          const res = await fetch("/kalshi/pnl/summary");
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const data = await res.json();
+          const t = data.totals || {};
+          pnlTotalsEl.innerHTML = `
+            <div class="pnl-total"><div class="k">Realized</div><div class="v">${formatCents(t.realized_pnl_cents)}</div></div>
+            <div class="pnl-total"><div class="k">Unrealized</div><div class="v">${formatCents(t.unrealized_pnl_cents)}</div></div>
+            <div class="pnl-total"><div class="k">Net</div><div class="v">${formatCents(t.net_pnl_cents)}</div></div>
+            <div class="pnl-total"><div class="k">Fees</div><div class="v">${formatCents(t.fees_cents)}</div></div>
+          `;
+          const rows = data.by_market || [];
+          if (!rows.length) {
+            pnlBody.innerHTML = "<tr><td colspan=\\"6\\">No P/L rows.</td></tr>";
+            return;
+          }
+          pnlBody.innerHTML = rows.map(r => `
+            <tr>
+              <td>${r.ticker || "--"}</td>
+              <td>${String(r.side || "--").toUpperCase()}</td>
+              <td>${r.open_count ?? "--"}</td>
+              <td>${formatCents(r.realized_pnl_cents)}</td>
+              <td>${formatCents(r.unrealized_pnl_cents)}</td>
+              <td>${formatCents(r.net_pnl_cents)}</td>
+            </tr>
+          `).join("");
+        } catch (err) {
+          pnlBody.innerHTML = "<tr><td colspan=\\"6\\">Error loading P/L summary.</td></tr>";
+        }
+      }
+
       function hideChartTooltip() {
         chartTooltipEl.style.display = "none";
       }
@@ -2709,6 +3227,7 @@ def dashboard():
       refreshPortfolioBtn.addEventListener("click", refreshPortfolio);
       portfolioBtcOnlyEl.addEventListener("change", refreshPortfolio);
       refreshLedgerBtn.addEventListener("click", refreshLedger);
+      refreshPnlBtn.addEventListener("click", refreshPnlSummary);
       [manualStrategyModeEl, manualStrategySideEl, manualStrategyAskMinEl, manualStrategyAskMaxEl, manualStrategyMaxCostEl, manualStrategyIntervalEl]
         .forEach(el => el.addEventListener("change", () => syncStrategyControls(true)));
       [strategyModeEl, strategySideEl, strategyAskMinEl, strategyAskMaxEl, strategyMaxCostEl, strategyIntervalEl]
@@ -2729,12 +3248,16 @@ def dashboard():
         strategyPreview(true);
         strategyAutoStatus(true);
       }, 1000);
+      setInterval(() => {
+        refreshPortfolio();
+      }, 3000);
       setInterval(refreshExpiryMeta, 30000);
       syncStrategyControls(false);
       refreshMarkets();
       refreshExpiryMeta();
       strategyPreview();
       refreshLedger();
+      refreshPnlSummary();
       window.addEventListener("resize", refreshChart);
     </script>
   </body>
