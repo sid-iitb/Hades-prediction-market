@@ -110,7 +110,13 @@ python3 -m src.api
 - `GET /kalshi/portfolio/orders`
   - Returns current orders (filter with `status`, `ticker`, `limit`).
 - `GET /kalshi/portfolio/current`
-  - Returns portfolio balance and current positions/orders with estimated cost, mark-based P/L, and max payout.
+  - Returns portfolio balance, cashflow summary (deposits/withdrawals/net transfer when available), and current positions/orders with estimated cost, mark-based P/L, and max payout.
+- `GET /kalshi/portfolio/cashflow`
+  - Returns best-effort money in/out summary from Kalshi balance payload:
+    - `deposits_cents`
+    - `withdrawals_cents`
+    - `net_transfer_cents`
+  - Also returns `source_keys` and raw balance payload for field verification.
 - `GET /kalshi/pnl/summary`
   - Aggregates order history into buys/sells/fees plus realized, unrealized, and net P/L.
   - Includes per-market breakdown and diagnostics (`orders_considered`, `fills_count`, etc.).

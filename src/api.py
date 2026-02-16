@@ -228,6 +228,7 @@ _farthest_auto_state = {
     "active_position": None,
     "active_positions": [],
     "active_position_mode": None,
+    "risk_snapshot": [],
 }
 
 
@@ -440,6 +441,44 @@ def _normalize_active_positions(raw_positions):
     return normalized
 
 
+def _build_risk_snapshot(active_positions):
+    snapshot = []
+    positions = _normalize_active_positions(active_positions or [])
+    if not positions:
+        return snapshot
+
+    client = KalshiClient()
+    for p in positions:
+        ticker = str(p.get("ticker") or "")
+        side = str(p.get("side") or "").lower()
+        entry = _maybe_int(p.get("entry_price_cents")) or 0
+        count = _maybe_int(p.get("count")) or 0
+        mark_cents = None
+        pnl_pct = None
+        error = None
+        if ticker and side in {"yes", "no"} and entry > 0:
+            try:
+                top = client.get_top_of_book(ticker)
+                mark_cents = _maybe_int(top.get(f"{side}_bid"))
+                if mark_cents is None:
+                    mark_cents = 0
+                pnl_pct = (float(mark_cents) - float(entry)) / float(entry)
+            except Exception as exc:
+                error = str(exc)
+        snapshot.append(
+            {
+                "ticker": ticker,
+                "side": side,
+                "entry_price_cents": entry,
+                "count": count,
+                "mark_cents": mark_cents,
+                "pnl_pct": pnl_pct,
+                "error": error,
+            }
+        )
+    return snapshot
+
+
 def _market_event_prefix(ticker: str | None) -> str | None:
     t = str(ticker or "").strip()
     if not t:
@@ -567,6 +606,7 @@ def _farthest_band_worker():
         run_at = None
         latest_out = None
         next_active_positions = []
+        risk_snapshot = []
 
         if active_positions or is_scheduled_run:
             did_run = True
@@ -582,6 +622,22 @@ def _farthest_band_worker():
                     out = {"action": "error", "reason": str(exc), "active_position": pos}
                 _record_strategy_ledger(out, source="/strategy/farthest_band/auto")
                 latest_out = out
+                mark = out.get("mark") if isinstance(out, dict) else None
+                pnl_pct = out.get("pnl_pct") if isinstance(out, dict) else None
+                if pnl_pct is None and isinstance(mark, dict):
+                    pnl_pct = mark.get("pnl_pct")
+                mark_cents = mark.get("mark_cents") if isinstance(mark, dict) else None
+                risk_snapshot.append(
+                    {
+                        "ticker": pos.get("ticker"),
+                        "side": pos.get("side"),
+                        "entry_price_cents": pos.get("entry_price_cents"),
+                        "count": pos.get("count"),
+                        "pnl_pct": pnl_pct,
+                        "mark_cents": mark_cents,
+                        "action": out.get("action") if isinstance(out, dict) else "error",
+                    }
+                )
                 next_pos = out.get("active_position")
                 if isinstance(next_pos, dict):
                     next_active_positions.append(next_pos)
@@ -613,6 +669,7 @@ def _farthest_band_worker():
                     _farthest_auto_state["last_scheduled_run_at"] = run_at
                 if active_positions:
                     _farthest_auto_state["last_risk_check_at"] = run_at
+                    _farthest_auto_state["risk_snapshot"] = risk_snapshot
                 _farthest_auto_state["next_scheduled_run_at"] = next_scheduled_at.isoformat()
                 _farthest_auto_state["last_result"] = latest_out
                 _farthest_auto_state["active_positions"] = normalized_positions
@@ -645,6 +702,90 @@ def _parse_dollar_str_to_cents(value):
         return int(round(float(cleaned) * 100))
     except Exception:
         return None
+
+
+def _pick_balance_amount_cents(balance: dict, cents_keys: list[str], dollar_keys: list[str]):
+    for k in cents_keys:
+        v = balance.get(k)
+        if isinstance(v, (int, float)):
+            return int(round(float(v))), k
+    for k in dollar_keys:
+        v = _parse_dollar_str_to_cents(balance.get(k))
+        if v is not None:
+            return int(v), k
+    return None, None
+
+
+def _extract_cashflow_summary(balance: dict):
+    balance = balance or {}
+    deposits_cents, deposits_key = _pick_balance_amount_cents(
+        balance,
+        [
+            "deposits_cents",
+            "deposit_cents",
+            "total_deposits_cents",
+            "lifetime_deposits_cents",
+            "cash_in_cents",
+        ],
+        [
+            "deposits",
+            "deposit",
+            "total_deposits",
+            "lifetime_deposits",
+            "cash_in",
+            "deposits_dollars",
+            "total_deposits_dollars",
+            "lifetime_deposits_dollars",
+            "cash_in_dollars",
+        ],
+    )
+    withdrawals_cents, withdrawals_key = _pick_balance_amount_cents(
+        balance,
+        [
+            "withdrawals_cents",
+            "withdrawal_cents",
+            "total_withdrawals_cents",
+            "lifetime_withdrawals_cents",
+            "cash_out_cents",
+        ],
+        [
+            "withdrawals",
+            "withdrawal",
+            "total_withdrawals",
+            "lifetime_withdrawals",
+            "cash_out",
+            "withdrawals_dollars",
+            "total_withdrawals_dollars",
+            "lifetime_withdrawals_dollars",
+            "cash_out_dollars",
+        ],
+    )
+
+    net_transfer_cents = None
+    if deposits_cents is not None and withdrawals_cents is not None:
+        net_transfer_cents = int(deposits_cents) - int(withdrawals_cents)
+
+    available = deposits_cents is not None or withdrawals_cents is not None
+    reason = None
+    if not available:
+        reason = (
+            "Kalshi /portfolio/balance payload did not include deposit/withdrawal fields. "
+            "Only cash/portfolio values are currently available for this account response."
+        )
+
+    return {
+        "available": available,
+        "reason": reason,
+        "deposits_cents": deposits_cents,
+        "withdrawals_cents": withdrawals_cents,
+        "net_transfer_cents": net_transfer_cents,
+        "source_keys": {
+            "deposits": deposits_key,
+            "withdrawals": withdrawals_key,
+        },
+        "balance_keys_seen": sorted(list(balance.keys())),
+    }
+
 
 @app.get("/kalshi/place_best_ask_order")
 def place_best_ask_order(side: str, ticker: str, max_cost_cents: int = 500):
@@ -743,6 +884,20 @@ def get_portfolio_balance():
     return client.get_balance()
 
 
+@app.get("/kalshi/portfolio/cashflow")
+def get_portfolio_cashflow():
+    """
+    Best-effort deposits/withdrawals summary from Kalshi balance payload.
+    """
+    client = KalshiClient()
+    balance = client.get_balance() or {}
+    cashflow = _extract_cashflow_summary(balance)
+    return {
+        "cashflow": cashflow,
+        "raw_balance": balance,
+    }
+
+
 @app.get("/kalshi/portfolio/orders")
 def get_portfolio_orders(status: str | None = None, ticker: str | None = None, limit: int = 100):
     """
@@ -838,6 +993,18 @@ def _price_to_cents_float(value):
     return v
 
 
+def _extract_money_cents(position: dict, cents_keys: list[str], dollar_keys: list[str]):
+    for k in cents_keys:
+        v = position.get(k)
+        if isinstance(v, (int, float)):
+            return int(round(float(v)))
+    for k in dollar_keys:
+        v = _parse_dollar_str_to_cents(position.get(k))
+        if v is not None:
+            return int(v)
+    return None
+
+
 @app.get("/kalshi/portfolio/current")
 def get_portfolio_current_orders(status: str | None = "open", limit: int = 200):
     """
@@ -846,6 +1013,7 @@ def get_portfolio_current_orders(status: str | None = "open", limit: int = 200):
     client = KalshiClient()
     orders = client.get_all_orders(status=status, limit=limit, max_pages=20) if status else client.get_all_orders(limit=limit, max_pages=20)
     balance = client.get_balance()
+    cashflow = _extract_cashflow_summary(balance)
     positions = client.get_positions()
     positions_list = positions.get("market_positions") or positions.get("positions") or []
 
@@ -898,18 +1066,55 @@ def get_portfolio_current_orders(status: str | None = "open", limit: int = 200):
         if cost_cents is None and price_cents is not None and count:
             cost_cents = price_cents * int(count)
         max_payout_cents = 100 * int(count) if count else None
-        market_value_cents = (
-            _parse_dollar_str_to_cents(p.get("market_value"))
-            or _parse_dollar_str_to_cents(p.get("market_exposure_dollars"))
-            or _parse_dollar_str_to_cents(p.get("market_exposure"))
-        )
-        pnl_cents = (
-            _parse_dollar_str_to_cents(p.get("unrealized_pnl_dollars"))
-            or _parse_dollar_str_to_cents(p.get("unrealized_pnl"))
-            or _parse_dollar_str_to_cents(p.get("realized_pnl_dollars"))
-            or _parse_dollar_str_to_cents(p.get("realized_pnl"))
-            or _parse_dollar_str_to_cents(p.get("pnl"))
-        )
+        mark_cents = None
+        market_value_cents = None
+        pnl_cents = None
+        if ticker and side in {"yes", "no"} and count:
+            try:
+                top = client.get_top_of_book(ticker)
+                mark_cents = _maybe_int(top.get(f"{side}_bid"))
+            except Exception:
+                mark_cents = None
+        # Preferred valuation for portfolio panel: executable bid mark.
+        if mark_cents is not None and int(count) > 0:
+            market_value_cents = int(mark_cents) * int(count)
+            if cost_cents is not None:
+                pnl_cents = int(market_value_cents) - int(cost_cents)
+        # Fallback to Kalshi payload market value/pnl when bid mark is unavailable.
+        if market_value_cents is None:
+            market_value_cents = _extract_money_cents(
+                p,
+                cents_keys=[
+                    "market_value_cents",
+                    "market_exposure_cents",
+                    "position_value_cents",
+                    "positions_value_cents",
+                ],
+                dollar_keys=[
+                    "market_value",
+                    "market_value_dollars",
+                    "market_exposure_dollars",
+                    "market_exposure",
+                    "position_value",
+                    "position_value_dollars",
+                ],
+            )
+        if pnl_cents is None:
+            pnl_cents = _extract_money_cents(
+                p,
+                cents_keys=[
+                    "unrealized_pnl_cents",
+                    "realized_pnl_cents",
+                    "pnl_cents",
+                ],
+                dollar_keys=[
+                    "unrealized_pnl_dollars",
+                    "unrealized_pnl",
+                    "realized_pnl_dollars",
+                    "realized_pnl",
+                    "pnl",
+                ],
+            )
         if pnl_cents is None and market_value_cents is not None and cost_cents is not None:
             pnl_cents = market_value_cents - cost_cents
         if cost_cents is None and market_value_cents is not None and pnl_cents is not None:
@@ -917,18 +1122,8 @@ def get_portfolio_current_orders(status: str | None = "open", limit: int = 200):
         if pnl_cents is None and ticker and count:
             if price_cents is None and total_traded_cents is not None and count:
                 price_cents = int(round(total_traded_cents / int(count)))
-            try:
-                top = client.get_top_of_book(ticker)
-                yes_mid = _midpoint(top.get("yes_bid"), top.get("yes_ask"))
-                no_mid = _midpoint(top.get("no_bid"), top.get("no_ask"))
-                if no_mid is None and yes_mid is not None:
-                    no_mid = 100 - yes_mid
-                if side == "yes" and yes_mid is not None and price_cents is not None:
-                    pnl_cents = int((yes_mid - price_cents) * int(count))
-                elif side == "no" and no_mid is not None and price_cents is not None:
-                    pnl_cents = int((no_mid - price_cents) * int(count))
-            except Exception:
-                pass
+            if mark_cents is not None and price_cents is not None:
+                pnl_cents = int((mark_cents - price_cents) * int(count))
 
         rows.append(
             {
@@ -939,7 +1134,8 @@ def get_portfolio_current_orders(status: str | None = "open", limit: int = 200):
                 "count": int(count) if count else 0,
                 "price_cents": price_cents,
                 "cost_cents": cost_cents,
-                "mark_cents": None,
+                "market_value_cents": market_value_cents,
+                "mark_cents": mark_cents,
                 "pnl_cents": pnl_cents,
                 "max_payout_cents": max_payout_cents,
             }
@@ -957,19 +1153,22 @@ def get_portfolio_current_orders(status: str | None = "open", limit: int = 200):
 
             mark_cents = None
             pnl_cents = None
+            market_value_cents = None
             if ticker and side in {"yes", "no"} and price is not None and count:
                 top = client.get_top_of_book(ticker)
-                yes_mid = _midpoint(top.get("yes_bid"), top.get("yes_ask"))
-                no_mid = _midpoint(top.get("no_bid"), top.get("no_ask"))
-                if no_mid is None and yes_mid is not None:
-                    no_mid = 100 - yes_mid
                 if side == "yes":
-                    mark_cents = yes_mid
+                    mark_cents = _maybe_int(top.get("yes_bid"))
+                    if mark_cents is None:
+                        mark_cents = _midpoint(top.get("yes_bid"), top.get("yes_ask"))
                     if mark_cents is not None:
+                        market_value_cents = int(mark_cents) * int(count)
                         pnl_cents = int((mark_cents - price) * count)
                 else:
-                    mark_cents = no_mid
+                    mark_cents = _maybe_int(top.get("no_bid"))
+                    if mark_cents is None:
+                        mark_cents = _midpoint(top.get("no_bid"), top.get("no_ask"))
                     if mark_cents is not None:
+                        market_value_cents = int(mark_cents) * int(count)
                         pnl_cents = int((mark_cents - price) * count)
 
             rows.append(
@@ -981,13 +1180,14 @@ def get_portfolio_current_orders(status: str | None = "open", limit: int = 200):
                     "count": count,
                     "price_cents": price,
                     "cost_cents": cost_cents,
+                    "market_value_cents": market_value_cents,
                     "mark_cents": mark_cents,
                     "pnl_cents": pnl_cents,
                     "max_payout_cents": max_payout_cents,
                 }
             )
 
-    return {"balance": balance, "orders": rows}
+    return {"balance": balance, "cashflow": cashflow, "orders": rows}
 
 
 @app.get("/kalshi/pnl/summary")
@@ -1264,6 +1464,7 @@ def strategy_farthest_band_auto_start(
         _farthest_auto_state["next_scheduled_run_at"] = datetime.datetime.now(timezone.utc).isoformat()
         _farthest_auto_state["next_risk_check_at"] = datetime.datetime.now(timezone.utc).isoformat()
         _farthest_auto_state["last_result"] = None
+        _farthest_auto_state["risk_snapshot"] = []
         seeded_positions = _seed_active_positions_from_portfolio(config)
         _farthest_auto_state["active_positions"] = seeded_positions
         _farthest_auto_state["active_position"] = seeded_positions[-1] if seeded_positions else None
@@ -1288,6 +1489,7 @@ def strategy_farthest_band_auto_stop():
     _farthest_auto_stop.set()
     with _farthest_auto_lock:
         _farthest_auto_state["running"] = False
+        _farthest_auto_state["risk_snapshot"] = []
         active_position = _farthest_auto_state.get("active_position")
         active_positions = list(_farthest_auto_state.get("active_positions") or [])
     return {
@@ -1305,6 +1507,7 @@ def strategy_farthest_band_reset():
         _farthest_auto_state["active_positions"] = []
         _farthest_auto_state["active_position_mode"] = None
         _farthest_auto_state["last_result"] = None
+        _farthest_auto_state["risk_snapshot"] = []
     return {"ok": True, "message": "Strategy active position reset"}
 
 
@@ -1314,6 +1517,10 @@ def strategy_farthest_band_auto_status():
         thread_alive = bool(_farthest_auto_thread and _farthest_auto_thread.is_alive())
         state = dict(_farthest_auto_state)
         state["running"] = thread_alive
+    # Refresh risk snapshot on demand so stop-loss panel can always show latest P/L%.
+    if thread_alive:
+        active_positions = state.get("active_positions") or []
+        state["risk_snapshot"] = _build_risk_snapshot(active_positions)
     return state
 
 
@@ -1552,27 +1759,27 @@ def dashboard():
       }
       .top-panels {
         display: grid;
-        grid-template-columns: minmax(0, 1.35fr) minmax(0, 1.55fr) minmax(0, 1.55fr) minmax(0, 1.35fr);
+        grid-template-columns: minmax(0, 1.2fr) minmax(0, 1.9fr) minmax(0, 1.2fr);
         grid-template-areas:
-          "markets manual auto portfolio";
+          "markets auto right";
         gap: 16px;
         align-items: start;
       }
       .markets { grid-area: markets; }
+      .right-stack {
+        grid-area: right;
+        display: grid;
+        gap: 16px;
+        align-content: start;
+      }
       .portfolio-panel {
         background: rgba(10, 16, 32, 0.6);
         border: 1px solid var(--border);
         border-radius: 14px;
         padding: 12px;
         min-height: 260px;
-        grid-area: portfolio;
       }
-      .manual-panel {
-        grid-area: manual;
-      }
-      .auto-panel {
-        grid-area: auto;
-      }
+      .auto-panel { grid-area: auto; }
       .strategy-panel {
         background: rgba(10, 16, 32, 0.6);
         border: 1px solid var(--border);
@@ -1588,6 +1795,7 @@ def dashboard():
         width: 100%;
         border-collapse: collapse;
         font-size: 12px;
+        table-layout: fixed;
       }
       .ledger-panel {
         background: rgba(10, 16, 32, 0.6);
@@ -1669,9 +1877,33 @@ def dashboard():
       }
       .portfolio-table th,
       .portfolio-table td {
-        padding: 6px 4px;
+        padding: 6px 3px;
         border-bottom: 1px solid rgba(255, 255, 255, 0.08);
         text-align: left;
+      }
+      .portfolio-table th:nth-child(1),
+      .portfolio-table td:nth-child(1) {
+        width: 33%;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .portfolio-table th:nth-child(2),
+      .portfolio-table td:nth-child(2) {
+        width: 7%;
+      }
+      .portfolio-table th:nth-child(3),
+      .portfolio-table td:nth-child(3),
+      .portfolio-table th:nth-child(4),
+      .portfolio-table td:nth-child(4),
+      .portfolio-table th:nth-child(5),
+      .portfolio-table td:nth-child(5),
+      .portfolio-table th:nth-child(6),
+      .portfolio-table td:nth-child(6),
+      .portfolio-table th:nth-child(7),
+      .portfolio-table td:nth-child(7) {
+        width: 9%;
+        white-space: nowrap;
       }
       .portfolio-table th {
         color: var(--muted);
@@ -1680,6 +1912,9 @@ def dashboard():
         text-transform: uppercase;
         letter-spacing: 0.04em;
       }
+      .pnl-pos { color: #34d399; }
+      .pnl-neg { color: #f87171; }
+      .pnl-flat { color: var(--text); }
       .markets h3 {
         margin: 0;
         font-size: 13px;
@@ -1874,10 +2109,21 @@ def dashboard():
         margin-top: 8px;
         font-size: 12px;
         color: var(--muted);
-        min-height: 68px;
-        max-height: 68px;
+        min-height: 110px;
+        max-height: 110px;
         overflow-y: auto;
         white-space: pre-wrap;
+      }
+      .stoploss-last-run {
+        margin-top: 8px;
+        font-size: 12px;
+        color: var(--text);
+        background: rgba(255, 255, 255, 0.05);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 10px;
+        padding: 8px;
+        white-space: pre-wrap;
+        min-height: 84px;
       }
       .planned-order {
         margin-top: 10px;
@@ -1919,9 +2165,8 @@ def dashboard():
           grid-template-columns: 1fr;
           grid-template-areas:
             "markets"
-            "manual"
             "auto"
-            "portfolio";
+            "right";
         }
       }
     </style>
@@ -1988,50 +2233,7 @@ def dashboard():
                 </tbody>
               </table>
             </div>
-              <div class="strategy-panel manual-panel">
-                <div class="markets-header">
-                  <h3>Farthest Strategy: Manual</h3>
-                </div>
-                <div class="strategy-grid">
-                  <div class="field">
-                    <label for="manual-strategy-mode">Mode</label>
-                    <select id="manual-strategy-mode">
-                      <option value="paper" selected>paper</option>
-                      <option value="live">live</option>
-                    </select>
-                  </div>
-                  <div class="field">
-                    <label for="manual-strategy-side">Side</label>
-                    <select id="manual-strategy-side">
-                      <option value="yes" selected>yes</option>
-                      <option value="no">no</option>
-                    </select>
-                  </div>
-                  <div class="field">
-                    <label for="manual-strategy-ask-min">Ask Min (c)</label>
-                    <input id="manual-strategy-ask-min" type="number" min="1" max="99" value="95" />
-                  </div>
-                  <div class="field">
-                    <label for="manual-strategy-ask-max">Ask Max (c)</label>
-                    <input id="manual-strategy-ask-max" type="number" min="1" max="99" value="99" />
-                  </div>
-                  <div class="field">
-                    <label for="manual-strategy-max-cost">Max Cost (c)</label>
-                    <input id="manual-strategy-max-cost" type="number" min="1" value="500" />
-                  </div>
-                  <div class="field">
-                    <label for="manual-strategy-interval">Auto Interval (min)</label>
-                    <input id="manual-strategy-interval" type="number" min="1" value="15" />
-                  </div>
-                </div>
-                <div class="strategy-actions">
-                  <button id="strategy-preview" class="btn secondary" type="button">Preview</button>
-                  <button id="strategy-run" class="btn" type="button">Run Once</button>
-                </div>
-                <div id="manual-strategy-planned-order" class="planned-order">Manual planned order will appear after Preview.</div>
-                <div id="manual-strategy-candidates" class="candidate-list"></div>
-              </div>
-              <div class="strategy-panel auto-panel">
+            <div class="strategy-panel auto-panel">
                 <div class="markets-header">
                   <h3>Farthest Strategy: Auto</h3>
                 </div>
@@ -2087,10 +2289,12 @@ def dashboard():
                     <div id="stoploss-progress-fill" class="progress-fill"></div>
                   </div>
                   <div id="stoploss-positions" class="stoploss-positions">Protected positions: --</div>
+                  <div id="stoploss-last-run" class="stoploss-last-run">Last stop-loss run: --</div>
                 </div>
                 <div id="auto-strategy-planned-order" class="planned-order">Auto plan will appear after Auto Status.</div>
                 <div id="auto-strategy-candidates" class="candidate-list"></div>
-              </div>
+            </div>
+            <div class="right-stack">
               <div class="portfolio-panel">
                 <div class="markets-header">
                   <h3>Current Portfolio</h3>
@@ -2109,15 +2313,61 @@ def dashboard():
                       <th>Ticker</th>
                       <th>Side</th>
                       <th>Cost</th>
+                      <th>Value</th>
                       <th>P/L</th>
+                      <th>P/L %</th>
                       <th>Max</th>
                     </tr>
                   </thead>
                   <tbody id="portfolio-body">
-                    <tr><td colspan="5">Click Refresh to load orders.</td></tr>
+                    <tr><td colspan="7">Click Refresh to load orders.</td></tr>
                   </tbody>
                 </table>
               </div>
+              <div class="strategy-panel manual-panel">
+                <div class="markets-header">
+                  <h3>Farthest Strategy: Manual</h3>
+                </div>
+                <div class="strategy-grid">
+                  <div class="field">
+                    <label for="manual-strategy-mode">Mode</label>
+                    <select id="manual-strategy-mode">
+                      <option value="paper" selected>paper</option>
+                      <option value="live">live</option>
+                    </select>
+                  </div>
+                  <div class="field">
+                    <label for="manual-strategy-side">Side</label>
+                    <select id="manual-strategy-side">
+                      <option value="yes" selected>yes</option>
+                      <option value="no">no</option>
+                    </select>
+                  </div>
+                  <div class="field">
+                    <label for="manual-strategy-ask-min">Ask Min (c)</label>
+                    <input id="manual-strategy-ask-min" type="number" min="1" max="99" value="95" />
+                  </div>
+                  <div class="field">
+                    <label for="manual-strategy-ask-max">Ask Max (c)</label>
+                    <input id="manual-strategy-ask-max" type="number" min="1" max="99" value="99" />
+                  </div>
+                  <div class="field">
+                    <label for="manual-strategy-max-cost">Max Cost (c)</label>
+                    <input id="manual-strategy-max-cost" type="number" min="1" value="500" />
+                  </div>
+                  <div class="field">
+                    <label for="manual-strategy-interval">Auto Interval (min)</label>
+                    <input id="manual-strategy-interval" type="number" min="1" value="15" />
+                  </div>
+                </div>
+                <div class="strategy-actions">
+                  <button id="strategy-preview" class="btn secondary" type="button">Preview</button>
+                  <button id="strategy-run" class="btn" type="button">Run Once</button>
+                </div>
+                <div id="manual-strategy-planned-order" class="planned-order">Manual planned order will appear after Preview.</div>
+                <div id="manual-strategy-candidates" class="candidate-list"></div>
+              </div>
+            </div>
           </div>
           <div class="ledger-panel">
             <div class="markets-header">
@@ -2224,6 +2474,7 @@ def dashboard():
       const stopLossNextRunEl = document.getElementById("stoploss-next-run");
       const stopLossProgressFillEl = document.getElementById("stoploss-progress-fill");
       const stopLossPositionsEl = document.getElementById("stoploss-positions");
+      const stopLossLastRunEl = document.getElementById("stoploss-last-run");
       const manualStrategyPlannedOrderEl = document.getElementById("manual-strategy-planned-order");
       const manualStrategyCandidatesEl = document.getElementById("manual-strategy-candidates");
       const autoStrategyPlannedOrderEl = document.getElementById("auto-strategy-planned-order");
@@ -2541,6 +2792,11 @@ def dashboard():
         return `${sign}$${Math.abs(dollars).toFixed(2)}`;
       }
 
+      function shortTicker(ticker) {
+        const t = String(ticker || "--");
+        return t.replace(/^KXBTCD-/i, "");
+      }
+
       function asIntOrNull(v) {
         if (v === null || v === undefined) return null;
         const n = Number(v);
@@ -2678,6 +2934,7 @@ def dashboard():
           stopLossNextRunEl.textContent = "Next stop-loss check: auto not running";
           stopLossProgressFillEl.style.width = "0%";
           stopLossPositionsEl.textContent = "Protected positions: none";
+          if (stopLossLastRunEl) stopLossLastRunEl.textContent = "Last stop-loss run: auto not running";
           return;
         }
 
@@ -2699,19 +2956,86 @@ def dashboard():
         }
 
         const positions = Array.isArray(statusData?.active_positions) ? statusData.active_positions : [];
+        const snapshots = Array.isArray(statusData?.risk_snapshot) ? statusData.risk_snapshot : [];
+        const fmtTs = (iso) => {
+          if (!iso) return "n/a";
+          const d = new Date(iso);
+          if (!Number.isFinite(d.getTime())) return String(iso);
+          return d.toLocaleString();
+        };
         if (!positions.length) {
           stopLossPositionsEl.textContent = "Protected positions: none (stop-loss starts after first tracked entry/seed).";
+          if (stopLossLastRunEl) {
+            stopLossLastRunEl.textContent = `Last stop-loss run\\nTime: ${fmtTs(statusData?.last_risk_check_at)}\\nResult: No protected positions.`;
+          }
           return;
         }
+        const fmtPct = (v) => {
+          if (v === null || v === undefined || !Number.isFinite(Number(v))) return "--";
+          const n = Number(v) * 100;
+          const sign = n > 0 ? "+" : "";
+          return `${sign}${n.toFixed(2)}%`;
+        };
         const lines = positions.slice(0, 6).map((p, i) => {
           const side = String(p?.side || "--").toUpperCase();
           const ticker = p?.ticker || "--";
           const entry = p?.entry_price_cents ?? "--";
           const count = p?.count ?? "--";
-          return `${i + 1}. ${ticker} (${side}) entry ${entry}c x ${count}`;
+          const snap = snapshots.find(s =>
+            String(s?.ticker || "") === String(ticker || "") &&
+            String((s?.side || "").toUpperCase()) === side
+          ) || snapshots[i] || null;
+          let pnlPctText = fmtPct(snap?.pnl_pct);
+          let suffix = "";
+          if (!snap) {
+            pnlPctText = "n/a";
+            suffix = " (no snapshot yet)";
+          } else if (snap?.error) {
+            suffix = " (mark err)";
+          } else if ((snap?.pnl_pct === null || snap?.pnl_pct === undefined) && (snap?.mark_cents === null || snap?.mark_cents === undefined)) {
+            suffix = " (mark unavailable)";
+          }
+          return `${i + 1}. ${ticker} (${side}) entry ${entry}c x ${count} | last P/L ${pnlPctText}${suffix}`;
         });
         const extra = positions.length > 6 ? `\\n... +${positions.length - 6} more` : "";
         stopLossPositionsEl.textContent = `Protected positions: ${positions.length}\\n${lines.join("\\n")}${extra}`;
+
+        if (stopLossLastRunEl) {
+          const lastRiskAt = statusData?.last_risk_check_at;
+          const lastOut = statusData?.last_result || {};
+          const cycle = (lastOut && typeof lastOut === "object" && lastOut.result && typeof lastOut.result === "object")
+            ? lastOut.result
+            : lastOut;
+          const action = String(cycle?.action || "").toLowerCase();
+          const reason = cycle?.reason || "";
+          let decision = "Checked protected positions; no stop-loss trigger.";
+          let detail = "";
+          if (action === "stop_loss_rotate") {
+            const exit = cycle?.exit || {};
+            const reentry = cycle?.reentry || {};
+            const soldTicker = cycle?.exited_position?.ticker || "--";
+            const soldCount = cycle?.exited_position?.count ?? "--";
+            const soldPx = exit?.exit_price_cents ?? "--";
+            const boughtTicker = reentry?.active_position?.ticker || reentry?.selection?.selected?.ticker || "--";
+            const boughtCount = reentry?.active_position?.count ?? reentry?.selection?.count ?? "--";
+            const boughtPx = reentry?.active_position?.entry_price_cents ?? reentry?.selection?.selected?.ask_cents ?? "--";
+            decision = "Triggered: stop-loss hit.";
+            detail = `Sold: ${soldTicker} @ ${soldPx}c x ${soldCount}\\nBought: ${boughtTicker} @ ${boughtPx}c x ${boughtCount}`;
+          } else if (action === "hold_active" && String(reason || "").toLowerCase().includes("stop-loss triggered")) {
+            decision = `Triggered, but exit failed: ${reason || "unknown reason"}`;
+          } else if (action === "rollover_reenter") {
+            decision = "Rollover action executed (not stop-loss).";
+          } else if (action === "error") {
+            decision = `Risk check error: ${reason || "unknown error"}`;
+          } else {
+            const checked = snapshots
+              .slice(0, 4)
+              .map((s) => `${s?.ticker || "--"} ${fmtPct(s?.pnl_pct)}`)
+              .join(" | ");
+            detail = checked ? `Checked: ${checked}` : "";
+          }
+          stopLossLastRunEl.textContent = `Last stop-loss run\\nTime: ${fmtTs(lastRiskAt)}\\nResult: ${decision}${detail ? `\\n${detail}` : ""}`;
+        }
       }
 
       function renderStrategyCandidates(candidates, targetEl) {
@@ -2890,6 +3214,7 @@ def dashboard():
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
           const data = await res.json();
           const balance = data.balance || {};
+          const cashflow = data.cashflow || {};
           const cashCents = pickBalanceCents(
             balance,
             ["cash_balance_cents", "available_cash_cents", "free_balance_cents", "spendable_balance_cents", "balance_cents"],
@@ -2918,6 +3243,12 @@ def dashboard():
             for (const o of orders) {
               const cnt = asIntOrNull(o?.count) || 0;
               if (cnt <= 0) continue;
+              const mv = asIntOrNull(o?.market_value_cents);
+              if (mv !== null) {
+                acc += mv;
+                seen += 1;
+                continue;
+              }
               const c = asIntOrNull(o?.cost_cents);
               const p = asIntOrNull(o?.pnl_cents);
               if (c !== null && p !== null) {
@@ -2944,26 +3275,41 @@ def dashboard():
           const cash = formatCents(cashCents);
           const portfolio = formatCents(portfolioDisplayCents);
           const positionValue = formatCents(positionValueCents);
+          const deposits = formatCents(cashflow?.deposits_cents);
+          const withdrawals = formatCents(cashflow?.withdrawals_cents);
+          const netTransfer = formatCents(cashflow?.net_transfer_cents);
+          const hasCashflow = cashflow && (cashflow.deposits_cents !== null || cashflow.withdrawals_cents !== null);
           if (heroCashEl) heroCashEl.textContent = cash;
           if (heroPortfolioEl) heroPortfolioEl.textContent = portfolio;
-          portfolioSummaryEl.textContent = `Cash: ${cash} | Portfolio: ${portfolio} | Position Value: ${positionValue}${btcOnly ? " | Filter: BTC only" : ""}`;
+          portfolioSummaryEl.textContent = `Position Value: ${positionValue}${hasCashflow ? ` | In: ${deposits} | Out: ${withdrawals} | Net: ${netTransfer}` : ""}${btcOnly ? " | Filter: BTC only" : ""}`;
 
           if (!orders.length) {
-            portfolioBody.innerHTML = "<tr><td colspan=\\"5\\">No orders found.</td></tr>";
+            portfolioBody.innerHTML = "<tr><td colspan=\\"7\\">No orders found.</td></tr>";
             return;
           }
           const rows = orders.map(o => {
-            const ticker = o.ticker || "--";
+            const ticker = shortTicker(o.ticker);
             const side = (o.side || "--").toUpperCase();
             const cost = formatCents(o.cost_cents);
+            const marketValue = formatCents(o.market_value_cents);
             const pnl = formatCents(o.pnl_cents);
+            const c = asIntOrNull(o?.cost_cents);
+            const p = asIntOrNull(o?.pnl_cents);
+            const pnlPctVal = (c && c !== 0 && p !== null)
+              ? (p * 100 / c)
+              : null;
+            const pnlPct = (pnlPctVal !== null) ? `${pnlPctVal.toFixed(2)}%` : "--";
+            const pnlClass = (p === null || p === undefined) ? "pnl-flat" : (p > 0 ? "pnl-pos" : (p < 0 ? "pnl-neg" : "pnl-flat"));
+            const pnlPctClass = (pnlPctVal === null) ? "pnl-flat" : (pnlPctVal > 0 ? "pnl-pos" : (pnlPctVal < 0 ? "pnl-neg" : "pnl-flat"));
             const max = formatCents(o.max_payout_cents);
             return `
               <tr>
                 <td>${ticker}</td>
                 <td>${side}</td>
                 <td>${cost}</td>
-                <td>${pnl}</td>
+                <td>${marketValue}</td>
+                <td class="${pnlClass}">${pnl}</td>
+                <td class="${pnlPctClass}">${pnlPct}</td>
                 <td>${max}</td>
               </tr>
             `;
@@ -2973,7 +3319,7 @@ def dashboard():
           if (heroCashEl) heroCashEl.textContent = "$--";
           if (heroPortfolioEl) heroPortfolioEl.textContent = "$--";
           portfolioSummaryEl.textContent = "Failed to load portfolio.";
-          portfolioBody.innerHTML = "<tr><td colspan=\\"5\\">Error loading orders.</td></tr>";
+          portfolioBody.innerHTML = "<tr><td colspan=\\"7\\">Error loading orders.</td></tr>";
         }
       }
 
@@ -2991,7 +3337,12 @@ def dashboard():
             const ticker = lastAuto.ticker || "--";
             const px = lastAuto.price_cents !== null && lastAuto.price_cents !== undefined ? `${lastAuto.price_cents}c` : "--";
             const cnt = lastAuto.count ?? "--";
-            const at = lastAuto.ts || "--";
+            const tsRaw = lastAuto.ts || null;
+            let at = "--";
+            if (tsRaw) {
+              const dt = new Date(tsRaw);
+              at = Number.isFinite(dt.getTime()) ? dt.toLocaleString() : String(tsRaw);
+            }
             autoLastTradeBadgeEl.textContent = `Last Auto Trade: ${action} ${side} ${ticker} @ ${px} x ${cnt} (${at})`;
           } else {
             autoLastTradeBadgeEl.textContent = "Last Auto Trade: none yet.";
