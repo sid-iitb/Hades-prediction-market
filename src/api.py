@@ -2,9 +2,11 @@ import datetime
 import json
 import os
 import sqlite3
+import smtplib
 import threading
 import traceback
 from datetime import timedelta, timezone
+from email.message import EmailMessage
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -141,8 +143,8 @@ def _log_stop_loss_trigger(snapshot: dict):
         conn.close()
 
 
-def _get_stop_loss_trigger_history(limit: int = 20) -> list[dict]:
-    limit = max(1, min(int(limit), 500))
+def _get_stop_loss_trigger_history(limit: int = 5000) -> list[dict]:
+    limit = max(1, min(int(limit), 5000))
     conn = _open_ledger_db()
     try:
         _ensure_stop_loss_triggers(conn)
@@ -179,6 +181,14 @@ def _get_stop_loss_trigger_history(limit: int = 20) -> list[dict]:
                         "price_cents": r["bought_price_cents"],
                         "count": r["bought_count"],
                     },
+                    "entry": payload.get("entry"),
+                    "sold_value_cents": payload.get("sold_value_cents"),
+                    "realized_pnl_cents": payload.get("realized_pnl_cents"),
+                    "realized_pnl_pct": payload.get("realized_pnl_pct"),
+                    "pre_exit_pnl_pct": payload.get("pre_exit_pnl_pct"),
+                    "buy_selection_reason": payload.get("buy_selection_reason"),
+                    "buy_fallback_used": payload.get("buy_fallback_used"),
+                    "buy_fallback_reason": payload.get("buy_fallback_reason"),
                     "sell_error": payload.get("sell_error"),
                     "buy_error": payload.get("buy_error"),
                     "sell_status": payload.get("sell_status"),
@@ -252,6 +262,34 @@ def _maybe_int(v):
         return None
 
 
+def _coerce_contract_price_cents(value):
+    """
+    Normalize various price encodings into per-contract cents in [1, 100].
+    Handles probability (0..1), cents (1..100), and over-scaled values.
+    """
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except Exception:
+        return None
+    if v <= 0:
+        return None
+    if v <= 1.0:
+        cents = v * 100.0
+        return int(round(cents)) if 0 < cents <= 100 else None
+    if v <= 100:
+        return int(round(v))
+
+    # Some upstream fields can be over-scaled (e.g., 705 instead of 70.5).
+    scaled = float(v)
+    for _ in range(4):
+        if 0 < scaled <= 100:
+            return int(round(scaled))
+        scaled /= 10.0
+    return None
+
+
 def _record_strategy_ledger(out: dict, source: str):
     cycle = (out or {}).get("result") or {}
     spot = (out or {}).get("spot")
@@ -279,6 +317,41 @@ def _record_strategy_ledger(out: dict, source: str):
             success=(entry.get("mode") != "live") or (_maybe_int(entry.get("status_code")) in {200, 201}),
             note=f"strategy_action={action_name} spot={spot}",
             payload=entry,
+        )
+    elif isinstance(entry, dict) and action_name not in multi_leg_actions:
+        # Capture failed/held entry attempts too (especially live buy failures).
+        sel = (entry.get("selection") or {}).get("selected") or {}
+        active_side = ((cycle.get("active_position") or {}) if isinstance(cycle, dict) else {}).get("side") or "yes"
+        _log_trade_ledger(
+            source=source,
+            run_mode=entry.get("mode") or mode_hint,
+            action="buy",
+            side=(sel.get("ask_key") or f"{active_side}_ask").replace("_ask", ""),
+            ticker=sel.get("ticker"),
+            price_cents=_maybe_int(sel.get("ask_cents")),
+            count=_maybe_int((entry.get("selection") or {}).get("count")),
+            status_code=_maybe_int(entry.get("status_code")),
+            success=False if str(entry.get("mode") or mode_hint).lower() == "live" else None,
+            note=f"strategy_action={action_name} failed_entry reason={entry.get('reason')}",
+            payload=entry,
+        )
+
+    # Capture stop-loss-triggered exit failures that return hold_active.
+    if action_name == "hold_active" and "stop-loss triggered" in str(cycle.get("reason") or "").lower():
+        ap = cycle.get("active_position") or {}
+        exit_leg = cycle.get("exit") or {}
+        _log_trade_ledger(
+            source=source,
+            run_mode=exit_leg.get("mode") or mode_hint,
+            action="sell",
+            side=ap.get("side"),
+            ticker=ap.get("ticker"),
+            price_cents=_maybe_int(exit_leg.get("exit_price_cents")),
+            count=_maybe_int(ap.get("count")),
+            status_code=_maybe_int(exit_leg.get("status_code")),
+            success=False,
+            note=f"stop_loss_exit_failed reason={exit_leg.get('reason') or cycle.get('reason')}",
+            payload=exit_leg or cycle,
         )
 
     if action_name in multi_leg_actions:
@@ -319,9 +392,27 @@ def _record_strategy_ledger(out: dict, source: str):
                 note=reentry_note,
                 payload=reentry,
             )
+        else:
+            # Capture failed/held re-entry attempts with planned selection details.
+            sel = (reentry.get("selection") or {}).get("selected") or {}
+            _log_trade_ledger(
+                source=source,
+                run_mode=reentry.get("mode") or mode_hint,
+                action="buy",
+                side=(sel.get("ask_key") or f"{(exited.get('side') or 'yes')}_ask").replace("_ask", ""),
+                ticker=sel.get("ticker"),
+                price_cents=_maybe_int(sel.get("ask_cents")),
+                count=_maybe_int((reentry.get("selection") or {}).get("count")),
+                status_code=_maybe_int(reentry.get("status_code")),
+                success=False if str(reentry.get("mode") or mode_hint).lower() == "live" else None,
+                note=f"{reentry_note}_failed reason={reentry.get('reason')}",
+                payload=reentry,
+            )
 
 
 _ingest_thread: threading.Thread | None = None
+_ledger_email_thread: threading.Thread | None = None
+_ledger_email_stop = threading.Event()
 _farthest_auto_thread: threading.Thread | None = None
 _farthest_auto_stop = threading.Event()
 _farthest_auto_lock = threading.Lock()
@@ -357,11 +448,130 @@ def _start_ingest_loop():
     _ingest_thread.start()
 
 
+def _parse_bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _format_local_ts(iso_ts: str | None) -> str:
+    if not iso_ts:
+        return "--"
+    try:
+        dt = datetime.datetime.fromisoformat(str(iso_ts).replace("Z", "+00:00"))
+        return dt.astimezone().strftime("%Y-%m-%d %I:%M:%S %p %Z")
+    except Exception:
+        return str(iso_ts)
+
+
+def _read_ledger_since(since_iso: str) -> list[dict]:
+    conn = _open_ledger_db()
+    try:
+        _ensure_trade_ledger(conn)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT ts, source, action, side, ticker, price_cents, count, status_code, success, note
+            FROM trade_ledger
+            WHERE ts > ?
+            ORDER BY id ASC
+            """,
+            (since_iso,),
+        )
+        return [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def _send_ledger_email(records: list[dict]):
+    smtp_host = os.getenv("LEDGER_EMAIL_SMTP_HOST")
+    smtp_port = int(os.getenv("LEDGER_EMAIL_SMTP_PORT", "587"))
+    smtp_user = os.getenv("LEDGER_EMAIL_SMTP_USER")
+    smtp_pass = os.getenv("LEDGER_EMAIL_SMTP_PASS")
+    smtp_tls = _parse_bool_env("LEDGER_EMAIL_SMTP_TLS", True)
+    to_addr = os.getenv("LEDGER_EMAIL_TO")
+    from_addr = os.getenv("LEDGER_EMAIL_FROM") or smtp_user
+    subject_prefix = os.getenv("LEDGER_EMAIL_SUBJECT_PREFIX", "Hades Ledger")
+
+    if not smtp_host or not to_addr or not from_addr:
+        raise ValueError("Missing email config (LEDGER_EMAIL_SMTP_HOST, LEDGER_EMAIL_TO, LEDGER_EMAIL_FROM)")
+
+    successes = sum(1 for r in records if r.get("success") == 1)
+    failures = sum(1 for r in records if r.get("success") == 0 or (r.get("status_code") and int(r["status_code"]) >= 400))
+    local_now = datetime.datetime.now().astimezone().strftime("%Y-%m-%d %I:%M %p %Z")
+    first_ts = _format_local_ts(records[0].get("ts")) if records else "--"
+    last_ts = _format_local_ts(records[-1].get("ts")) if records else "--"
+
+    lines = [
+        f"Ledger window summary ({local_now})",
+        f"Records: {len(records)} | Success: {successes} | Failure: {failures}",
+        f"Range: {first_ts} -> {last_ts}",
+        "",
+        "Recent entries:",
+    ]
+    for r in records[-30:]:
+        ts = _format_local_ts(r.get("ts"))
+        action = str(r.get("action") or "--").upper()
+        side = str(r.get("side") or "--").upper()
+        ticker = r.get("ticker") or "--"
+        px = f"{r.get('price_cents')}c" if r.get("price_cents") is not None else "--"
+        cnt = r.get("count") if r.get("count") is not None else "--"
+        status = r.get("status_code") if r.get("status_code") is not None else "--"
+        note = r.get("note") or ""
+        lines.append(f"- {ts} | {action} {side} {ticker} @ {px} x {cnt} | status={status} {note}".strip())
+
+    msg = EmailMessage()
+    msg["Subject"] = f"{subject_prefix} | {len(records)} updates"
+    msg["From"] = from_addr
+    msg["To"] = to_addr
+    msg.set_content("\n".join(lines))
+
+    with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as server:
+        if smtp_tls:
+            server.starttls()
+        if smtp_user and smtp_pass:
+            server.login(smtp_user, smtp_pass)
+        server.send_message(msg)
+
+
+def _ledger_email_worker():
+    interval_min = max(1, int(os.getenv("LEDGER_EMAIL_INTERVAL_MINUTES", "30")))
+    last_sent_cutoff = datetime.datetime.now(timezone.utc).isoformat()
+    while not _ledger_email_stop.is_set():
+        if _ledger_email_stop.wait(timeout=interval_min * 60):
+            break
+        try:
+            rows = _read_ledger_since(last_sent_cutoff)
+            last_sent_cutoff = datetime.datetime.now(timezone.utc).isoformat()
+            if not rows:
+                continue
+            _send_ledger_email(rows)
+        except Exception as exc:
+            print(f"Ledger email worker error: {exc}")
+
+
+def _start_ledger_email_loop():
+    global _ledger_email_thread
+    if _ledger_email_thread and _ledger_email_thread.is_alive():
+        return
+    if not _parse_bool_env("LEDGER_EMAIL_ENABLED", False):
+        return
+    _ledger_email_stop.clear()
+    _ledger_email_thread = threading.Thread(
+        target=_ledger_email_worker,
+        name="ledger-email-loop",
+        daemon=True,
+    )
+    _ledger_email_thread.start()
+
+
 @app.on_event("startup")
 def startup_ingest():
     auto_ingest = os.getenv("KALSHI_AUTO_INGEST", "true").lower()
     if auto_ingest in {"1", "true", "yes", "on"}:
         _start_ingest_loop()
+    _start_ledger_email_loop()
 
 
 @app.get("/get_price_ticker")
@@ -540,7 +750,7 @@ def _normalize_active_positions(raw_positions):
         ticker = str(p.get("ticker") or "").strip()
         side = str(p.get("side") or "").strip().lower()
         count = _maybe_int(p.get("count")) or 0
-        entry_price = _maybe_int(p.get("entry_price_cents")) or 0
+        entry_price = _coerce_contract_price_cents(p.get("entry_price_cents")) or 0
         if not ticker or side not in {"yes", "no"} or count < 1 or entry_price < 1:
             continue
         row = dict(p)
@@ -661,14 +871,14 @@ def _seed_active_positions_from_portfolio(config: FarthestBandConfig) -> list[di
             continue
 
         avg_price = p.get("avg_price") or p.get("average_price")
-        entry_price = _price_to_cents(avg_price)
+        entry_price = _coerce_contract_price_cents(avg_price)
         if entry_price is None:
             traded = (
                 _parse_dollar_str_to_cents(p.get("total_traded_dollars"))
                 or _parse_dollar_str_to_cents(p.get("total_traded"))
             )
             if traded is not None and count > 0:
-                entry_price = int(round(float(traded) / float(count)))
+                entry_price = _coerce_contract_price_cents(float(traded) / float(count))
         if entry_price is None or entry_price < 1:
             continue
 
@@ -739,7 +949,11 @@ def _farthest_band_worker():
                     )
                 except Exception as exc:
                     out = {"action": "error", "reason": str(exc), "active_position": pos}
-                _record_strategy_ledger(out, source="/strategy/farthest_band/auto")
+                try:
+                    _record_strategy_ledger(out, source="/strategy/farthest_band/auto")
+                except Exception:
+                    # Ledger write must never kill the strategy worker.
+                    pass
                 latest_out = out
                 cycle = (out or {}).get("result") or {}
                 cycle_action = str(cycle.get("action") or "").lower()
@@ -766,12 +980,40 @@ def _farthest_band_worker():
                             buy_error = reentry_leg.get("reason") or "Unknown buy failure"
                     else:
                         buy_error = "Not attempted because sell leg failed"
+                    entry_price_cents = _maybe_int(exited.get("entry_price_cents"))
+                    sold_price_cents = _maybe_int(exit_leg.get("exit_price_cents"))
+                    sold_count = _maybe_int(exited.get("count"))
+                    purchase_value_cents = (
+                        int(entry_price_cents * sold_count)
+                        if isinstance(entry_price_cents, int) and isinstance(sold_count, int)
+                        else None
+                    )
+                    sold_value_cents = (
+                        int(sold_price_cents * sold_count)
+                        if isinstance(sold_price_cents, int) and isinstance(sold_count, int)
+                        else None
+                    )
+                    realized_pnl_cents = (
+                        int(sold_value_cents - purchase_value_cents)
+                        if isinstance(sold_value_cents, int) and isinstance(purchase_value_cents, int)
+                        else None
+                    )
+                    realized_pnl_pct = (
+                        (float(sold_price_cents) - float(entry_price_cents)) / float(entry_price_cents)
+                        if isinstance(sold_price_cents, int) and isinstance(entry_price_cents, int) and entry_price_cents > 0
+                        else None
+                    )
                     last_stop_loss_trigger = {
                         "triggered_at": run_at,
                         "sold": {
                             "ticker": exited.get("ticker"),
                             "price_cents": _maybe_int(exit_leg.get("exit_price_cents")),
                             "count": _maybe_int(exited.get("count")),
+                        },
+                        "entry": {
+                            "price_cents": entry_price_cents,
+                            "count": sold_count,
+                            "purchase_value_cents": purchase_value_cents,
                         },
                         "bought": {
                             "ticker": rebought.get("ticker"),
@@ -786,6 +1028,13 @@ def _farthest_band_worker():
                                 else (reentry_leg.get("selection") or {}).get("count")
                             ),
                         },
+                        "sold_value_cents": sold_value_cents,
+                        "realized_pnl_cents": realized_pnl_cents,
+                        "realized_pnl_pct": realized_pnl_pct,
+                        "pre_exit_pnl_pct": cycle.get("pnl_pct"),
+                        "buy_selection_reason": (reentry_leg.get("selection") or {}).get("reason"),
+                        "buy_fallback_used": (reentry_leg.get("selection") or {}).get("fallback_used"),
+                        "buy_fallback_reason": (reentry_leg.get("selection") or {}).get("fallback_reason"),
                         "sell_error": sell_error,
                         "buy_error": buy_error,
                         "sell_status": "failed" if sell_error else "ok",
@@ -797,8 +1046,8 @@ def _farthest_band_worker():
                         "event_action": cycle_action,
                     }
                     stop_loss_trigger_history.append(last_stop_loss_trigger)
-                    if len(stop_loss_trigger_history) > 20:
-                        stop_loss_trigger_history = stop_loss_trigger_history[-20:]
+                    if len(stop_loss_trigger_history) > 5000:
+                        stop_loss_trigger_history = stop_loss_trigger_history[-5000:]
                     _log_stop_loss_trigger(last_stop_loss_trigger)
                 mark = out.get("mark") if isinstance(out, dict) else None
                 pnl_pct = out.get("pnl_pct") if isinstance(out, dict) else None
@@ -829,7 +1078,11 @@ def _farthest_band_worker():
                     )
                 except Exception as exc:
                     scheduled_out = {"action": "error", "reason": str(exc)}
-                _record_strategy_ledger(scheduled_out, source="/strategy/farthest_band/auto")
+                try:
+                    _record_strategy_ledger(scheduled_out, source="/strategy/farthest_band/auto")
+                except Exception:
+                    # Ledger write must never kill the strategy worker.
+                    pass
                 latest_out = scheduled_out
                 scheduled_pos = scheduled_out.get("active_position")
                 if isinstance(scheduled_pos, dict):
@@ -1045,6 +1298,19 @@ def place_best_ask_order(side: str, ticker: str, max_cost_cents: int = 500):
         )
         return {"status_code": resp.status_code, "response": body}
     except Exception as exc:
+        _log_trade_ledger(
+            source="/kalshi/place_best_ask_order",
+            run_mode="live",
+            action="buy",
+            side=str(side or "").lower() if side is not None else None,
+            ticker=ticker,
+            price_cents=None,
+            count=None,
+            status_code=500,
+            success=False,
+            note=f"exception={type(exc).__name__}: {exc}",
+            payload={"traceback": traceback.format_exc().splitlines()[-8:]},
+        )
         return JSONResponse(
             status_code=500,
             content={
@@ -1210,6 +1476,8 @@ def get_portfolio_current_orders(status: str | None = "open", limit: int = 200):
             count = int(abs(raw_side))
         if isinstance(raw_side, (int, float)) and raw_side != 0:
             side = "yes" if raw_side > 0 else "no"
+        if side not in {"yes", "no"}:
+            continue
 
         avg_price = p.get("avg_price") or p.get("average_price")
         avg_price_cents_float = _price_to_cents_float(avg_price)
@@ -1654,7 +1922,7 @@ def strategy_farthest_band_auto_start(
         _farthest_auto_state["next_risk_check_at"] = datetime.datetime.now(timezone.utc).isoformat()
         _farthest_auto_state["last_result"] = None
         _farthest_auto_state["risk_snapshot"] = []
-        history = _get_stop_loss_trigger_history(limit=20)
+        history = _get_stop_loss_trigger_history(limit=5000)
         _farthest_auto_state["stop_loss_trigger_history"] = history
         _farthest_auto_state["last_stop_loss_trigger"] = history[-1] if history else None
         seeded_positions = _seed_active_positions_from_portfolio(config) or []
@@ -1700,7 +1968,7 @@ def strategy_farthest_band_reset():
         _farthest_auto_state["active_position_mode"] = None
         _farthest_auto_state["last_result"] = None
         _farthest_auto_state["risk_snapshot"] = []
-        history = _get_stop_loss_trigger_history(limit=20)
+        history = _get_stop_loss_trigger_history(limit=5000)
         _farthest_auto_state["stop_loss_trigger_history"] = history
         _farthest_auto_state["last_stop_loss_trigger"] = history[-1] if history else None
     return {"ok": True, "message": "Strategy active position reset"}
@@ -1712,7 +1980,7 @@ def strategy_farthest_band_auto_status():
         thread_alive = bool(_farthest_auto_thread and _farthest_auto_thread.is_alive())
         state = dict(_farthest_auto_state)
         state["running"] = thread_alive
-    history = _get_stop_loss_trigger_history(limit=20)
+    history = _get_stop_loss_trigger_history(limit=5000)
     state["stop_loss_trigger_history"] = history
     state["last_stop_loss_trigger"] = history[-1] if history else None
     # Refresh risk snapshot on demand so stop-loss panel can always show latest P/L%.
@@ -2613,11 +2881,12 @@ def dashboard():
                     <th>Count</th>
                     <th>Cost</th>
                     <th>Status</th>
+                    <th>Reason</th>
                     <th>Note</th>
                   </tr>
                 </thead>
                 <tbody id="ledger-body">
-                  <tr><td colspan="10">Click Refresh to load ledger.</td></tr>
+                  <tr><td colspan="11">Click Refresh to load ledger.</td></tr>
                 </tbody>
               </table>
             </div>
@@ -3180,7 +3449,7 @@ def dashboard():
           ? (statusData.last_stop_loss_trigger || triggerHistory[triggerHistory.length - 1] || null)
           : null;
         const recentHistory = triggerHistory
-          .slice(-5)
+          .slice()
           .reverse()
           .map((t, i) => {
             const soldTicker = t?.sold?.ticker || "--";
@@ -3189,11 +3458,14 @@ def dashboard():
             const boughtTicker = t?.bought?.ticker || "--";
             const boughtPx = t?.bought?.price_cents ?? "--";
             const boughtCount = t?.bought?.count ?? "--";
+            const lossPct = (t?.realized_pnl_pct !== null && t?.realized_pnl_pct !== undefined && Number.isFinite(Number(t.realized_pnl_pct)))
+              ? `${(Number(t.realized_pnl_pct) * 100).toFixed(2)}%`
+              : "--";
             const sellStatus = String(t?.sell_status || (t?.sell_error ? "failed" : "ok")).toUpperCase();
             const buyStatus = String(t?.buy_status || (t?.buy_error ? "failed" : "ok")).toUpperCase();
             const sellReason = t?.sell_error ? ` (${t.sell_error})` : "";
-            const buyReason = t?.buy_error ? ` (${t.buy_error})` : "";
-            return `${i + 1}) ${fmtTs(t?.triggered_at)} | Sell: ${soldTicker} @ ${soldPx}c x ${soldCount} [${sellStatus}]${sellReason} | Buy: ${boughtTicker} @ ${boughtPx}c x ${boughtCount} [${buyStatus}]${buyReason}`;
+            const buyReason = t?.buy_error ? ` (${t.buy_error})` : (t?.buy_selection_reason ? ` (${t.buy_selection_reason})` : "");
+            return `${i + 1}) ${fmtTs(t?.triggered_at)} | Sell: ${soldTicker} @ ${soldPx}c x ${soldCount} [${sellStatus}]${sellReason} | Loss: ${lossPct} | Buy: ${boughtTicker} @ ${boughtPx}c x ${boughtCount} [${buyStatus}]${buyReason}`;
           })
           .join("\\n");
         const triggerBlock = trigger
@@ -3201,11 +3473,15 @@ def dashboard():
               "",
               "Last stop-loss trigger snapshot",
               `Time: ${fmtTs(trigger?.triggered_at)}`,
+              `Purchased: ${(trigger?.sold?.ticker || "--")} @ ${(trigger?.entry?.price_cents ?? "--")}c x ${(trigger?.entry?.count ?? "--")} (${formatCents(trigger?.entry?.purchase_value_cents)})`,
               `Sell order: ${(trigger?.sold?.ticker || "--")} @ ${(trigger?.sold?.price_cents ?? "--")}c x ${(trigger?.sold?.count ?? "--")} [${String(trigger?.sell_status || (trigger?.sell_error ? "failed" : "ok")).toUpperCase()}]`,
+              `Sold value: ${formatCents(trigger?.sold_value_cents)} | Realized P/L: ${formatCents(trigger?.realized_pnl_cents)} (${(trigger?.realized_pnl_pct !== null && trigger?.realized_pnl_pct !== undefined && Number.isFinite(Number(trigger?.realized_pnl_pct))) ? `${(Number(trigger.realized_pnl_pct) * 100).toFixed(2)}%` : "--"})`,
               trigger?.sell_error ? `Sell failure reason: ${trigger.sell_error}` : "",
               `Buy order: ${(trigger?.bought?.ticker || "--")} @ ${(trigger?.bought?.price_cents ?? "--")}c x ${(trigger?.bought?.count ?? "--")} [${String(trigger?.buy_status || (trigger?.buy_error ? "failed" : "ok")).toUpperCase()}]`,
+              trigger?.buy_fallback_used ? `Buy fallback: used nearest candidate (${trigger?.buy_fallback_reason || "fallback"})` : "",
+              (!trigger?.buy_fallback_used && trigger?.buy_selection_reason) ? `Buy selection reason: ${trigger.buy_selection_reason}` : "",
               trigger?.buy_error ? `Buy failure reason: ${trigger.buy_error}` : "",
-              recentHistory ? `\\nRecent triggers (${triggerHistory.length})\\n${recentHistory}` : "",
+              recentHistory ? `\\nTrigger history (${triggerHistory.length})\\n${recentHistory}` : "",
             ].filter(Boolean).join("\\n")
           : "";
         const configuredIntervalMin = Math.max(1, Number(statusData?.config?.interval_minutes || strategyIntervalEl.value || 15));
@@ -3664,13 +3940,20 @@ def dashboard():
       }
 
       async function refreshLedger() {
-        ledgerBody.innerHTML = "<tr><td colspan=\\"10\\">Loading ledger...</td></tr>";
+        ledgerBody.innerHTML = "<tr><td colspan=\\"11\\">Loading ledger...</td></tr>";
         try {
           const res = await fetch("/ledger/trades?limit=50");
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
           const data = await res.json();
           const records = data.records || [];
-          const lastAuto = records.find(r => r.source === "/strategy/farthest_band/auto");
+          const autoRecords = records.filter(r => r.source === "/strategy/farthest_band/auto");
+          const isCompleteTrade = (r) => {
+            const hasTicker = Boolean(String(r?.ticker || "").trim());
+            const hasPrice = r?.price_cents !== null && r?.price_cents !== undefined;
+            const hasCount = r?.count !== null && r?.count !== undefined;
+            return hasTicker && hasPrice && hasCount;
+          };
+          const lastAuto = autoRecords.find(isCompleteTrade) || null;
           if (lastAuto) {
             const side = String(lastAuto.side || "--").toUpperCase();
             const action = String(lastAuto.action || "--").toUpperCase();
@@ -3683,16 +3966,73 @@ def dashboard():
               const dt = new Date(tsRaw);
               at = Number.isFinite(dt.getTime()) ? dt.toLocaleString() : String(tsRaw);
             }
-            autoLastTradeBadgeEl.textContent = `Last Auto Trade: ${action} ${side} ${ticker} @ ${px} x ${cnt} (${at})`;
+            const status = lastAuto.status_code !== null && lastAuto.status_code !== undefined ? ` status=${lastAuto.status_code}` : "";
+            autoLastTradeBadgeEl.textContent = `Last Auto Trade: ${action} ${side} ${ticker} @ ${px} x ${cnt} (${at})${status}`;
+          } else if (autoRecords.length) {
+            const lastAttempt = autoRecords[0];
+            const tsRaw = lastAttempt.ts || null;
+            let at = "--";
+            if (tsRaw) {
+              const dt = new Date(tsRaw);
+              at = Number.isFinite(dt.getTime()) ? dt.toLocaleString() : String(tsRaw);
+            }
+            const status = lastAttempt.status_code !== null && lastAttempt.status_code !== undefined ? ` status=${lastAttempt.status_code}` : "";
+            const reason = String(lastAttempt.note || "").trim();
+            autoLastTradeBadgeEl.textContent = `Last Auto Attempt: order not placed (${at})${status}${reason ? ` | ${reason}` : ""}`;
           } else {
             autoLastTradeBadgeEl.textContent = "Last Auto Trade: none yet.";
           }
           if (!records.length) {
-            ledgerBody.innerHTML = "<tr><td colspan=\\"10\\">No ledger records.</td></tr>";
+            ledgerBody.innerHTML = "<tr><td colspan=\\"11\\">No ledger records.</td></tr>";
             return;
           }
+          const extractFailureReason = (statusCode, payloadJson, noteText) => {
+            const s = Number(statusCode);
+            let parsed = null;
+            if (payloadJson) {
+              try {
+                parsed = JSON.parse(payloadJson);
+              } catch (err) {
+                parsed = null;
+              }
+            }
+            const pullMsg = (obj) => {
+              if (!obj || typeof obj !== "object") return "";
+              const keys = ["error", "message", "reason", "detail", "msg", "code"];
+              for (const k of keys) {
+                const v = obj[k];
+                if (typeof v === "string" && v.trim()) return v.trim();
+              }
+              for (const k of keys) {
+                const v = obj[k];
+                if (v && typeof v === "object") {
+                  const nested = pullMsg(v);
+                  if (nested) return nested;
+                }
+              }
+              return "";
+            };
+            const extracted = pullMsg(parsed);
+            if (extracted) return extracted;
+            const note = String(noteText || "");
+            const idx = note.toLowerCase().indexOf("reason=");
+            if (idx >= 0) return note.slice(idx + 7).trim();
+            if (note.toLowerCase().startsWith("exception=")) return note.replace(/^exception=/i, "").trim();
+            if (s === 401) {
+              return "Unauthorized (401): check API key, signature, timestamp, and account permissions.";
+            }
+            if (s >= 400) {
+              return `Request failed with status ${s}`;
+            }
+            return "";
+          };
           const rows = records.map(r => {
-            const ts = r.ts || "--";
+            const tsRaw = r.ts || "";
+            let ts = "--";
+            if (tsRaw) {
+              const d = new Date(tsRaw);
+              ts = Number.isFinite(d.getTime()) ? d.toLocaleString() : String(tsRaw);
+            }
             const source = r.source || "--";
             const action = r.action || "--";
             const side = r.side || "--";
@@ -3701,6 +4041,7 @@ def dashboard():
             const count = r.count ?? "--";
             const cost = r.cost_cents !== null && r.cost_cents !== undefined ? formatCents(r.cost_cents) : "--";
             const status = r.status_code ?? "--";
+            const reason = extractFailureReason(r.status_code, r.payload_json, r.note) || "--";
             const note = r.note || "--";
             return `
               <tr>
@@ -3713,13 +4054,14 @@ def dashboard():
                 <td>${count}</td>
                 <td>${cost}</td>
                 <td>${status}</td>
+                <td>${reason}</td>
                 <td>${note}</td>
               </tr>
             `;
           }).join("");
           ledgerBody.innerHTML = rows;
         } catch (err) {
-          ledgerBody.innerHTML = "<tr><td colspan=\\"10\\">Error loading ledger.</td></tr>";
+          ledgerBody.innerHTML = "<tr><td colspan=\\"11\\">Error loading ledger.</td></tr>";
         }
       }
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Optional
 
 from src.client.kalshi_client import KalshiClient
@@ -35,6 +35,85 @@ def _parse_number(value) -> Optional[float]:
         return float(value)
     except Exception:
         return None
+
+
+def _normalize_contract_price_cents(value) -> Optional[int]:
+    v = _parse_number(value)
+    if v is None or v <= 0:
+        return None
+    if v <= 1.0:
+        cents = v * 100.0
+        return int(round(cents)) if 0 < cents <= 100 else None
+    if v <= 100:
+        return int(round(v))
+    # Over-scaled defensive normalization (e.g., 705 -> 70.5).
+    scaled = float(v)
+    for _ in range(4):
+        scaled /= 10.0
+        if 0 < scaled <= 100:
+            return int(round(scaled))
+    return None
+
+
+def _extract_order_count(order: dict) -> int:
+    filled_count = (
+        order.get("filled_count")
+        or order.get("matched_count")
+        or order.get("executed_count")
+        or 0
+    )
+    c = _parse_number(filled_count)
+    if c is not None and c > 0:
+        return int(round(c))
+    status_txt = str(order.get("status") or "").lower()
+    if status_txt in {"filled", "executed", "closed"}:
+        for k in ("count", "quantity"):
+            v = _parse_number(order.get(k))
+            if v is not None and v > 0:
+                return int(round(v))
+    return 0
+
+
+def _extract_order_price_cents(order: dict) -> Optional[int]:
+    for k in ("avg_price", "yes_price", "no_price", "price", "limit_price"):
+        px = _normalize_contract_price_cents(order.get(k))
+        if px is not None:
+            return px
+    return None
+
+
+def _reconstruct_entry_cents_from_order_history(client: KalshiClient, ticker: str, side: str) -> Optional[int]:
+    """
+    Best-effort weighted-average buy price reconstruction from order history.
+    Used only when seeded entry basis is invalid.
+    """
+    if not ticker or side not in {"yes", "no"}:
+        return None
+    try:
+        orders = client.get_all_orders(ticker=ticker, limit=200, max_pages=50)
+    except Exception:
+        return None
+    total_contracts = 0
+    total_cost = 0.0
+    for o in orders or []:
+        if str(o.get("ticker") or "") != str(ticker):
+            continue
+        if str(o.get("side") or "").lower() != side:
+            continue
+        if str(o.get("action") or "").lower() != "buy":
+            continue
+        count = _extract_order_count(o)
+        if count < 1:
+            continue
+        px = _extract_order_price_cents(o)
+        if px is None:
+            continue
+        total_contracts += int(count)
+        total_cost += float(px) * float(count)
+    if total_contracts < 1:
+        return None
+    avg = total_cost / float(total_contracts)
+    return _normalize_contract_price_cents(avg)
 
 
 def _normalize_direction(direction: str) -> str:
@@ -404,31 +483,33 @@ def run_farthest_band_cycle(
     current_tickers = {str(m.get("ticker")) for m in (markets or []) if m.get("ticker")}
 
     if active:
-        # If the active ticker is not in the latest ingest market set, roll to current event.
-        if str(active.get("ticker")) not in current_tickers:
-            exit_result = _exit_position(client, active, config, reason="rollover_exit_stale_ticker")
-            if str(config.mode).lower() == "live" and exit_result.get("action") == "hold":
+        entry_cents = _normalize_contract_price_cents(active.get("entry_price_cents"))
+        if entry_cents is None:
+            reconstructed = _reconstruct_entry_cents_from_order_history(
+                client=client,
+                ticker=str(active.get("ticker") or ""),
+                side=str(active.get("side") or "").lower(),
+            )
+            if reconstructed is not None:
+                active["entry_price_cents"] = int(reconstructed)
+            else:
                 return {
                     "action": "hold_active",
-                    "reason": "Active ticker stale but live exit could not be placed",
-                    "exit": exit_result,
+                    "reason": (
+                        f"Invalid entry basis for stop-loss ({active.get('entry_price_cents')}); "
+                        "reconstruction from order history failed"
+                    ),
                     "active_position": active,
                 }
-            selection = select_farthest_band_market(spot=spot, markets=markets, config=config)
-            entry = _enter_position(
-                client=client,
-                selection=selection,
-                config=config,
-                spot=spot,
-                reason="rollover_reenter_latest_event",
-            )
+        else:
+            active["entry_price_cents"] = int(entry_cents)
+
+        # If the active ticker is not in the latest ingest market set, roll to current event.
+        if str(active.get("ticker")) not in current_tickers:
             return {
-                "action": "rollover_reenter",
-                "reason": "Active ticker not present in latest ingest markets",
-                "exited_position": active,
-                "exit": exit_result,
-                "entry": entry,
-                "active_position": entry.get("active_position"),
+                "action": "hold_active",
+                "reason": "Active ticker stale; rollover auto-sell disabled",
+                "active_position": active,
             }
 
         mark_state = _mark_price_and_pnl(client, active)
@@ -459,6 +540,19 @@ def run_farthest_band_cycle(
                 exclude_ticker=active.get("ticker"),
             )
             next_selection = _with_nearest_fallback(next_selection, config)
+            # If nearest-level skip removed all directional candidates, retry once with relaxed skip.
+            if not (next_selection or {}).get("selected"):
+                reason_txt = str((next_selection or {}).get("reason") or "").lower()
+                if "after nearest-level skip" in reason_txt:
+                    relaxed = replace(config, skip_nearest_levels=0)
+                    next_selection = select_farthest_band_market(
+                        spot=spot,
+                        markets=markets,
+                        config=relaxed,
+                        min_distance_from_spot=previous_distance,
+                        exclude_ticker=active.get("ticker"),
+                    )
+                    next_selection = _with_nearest_fallback(next_selection, relaxed)
             reentry_result = _enter_position(
                 client=client,
                 selection=next_selection,
