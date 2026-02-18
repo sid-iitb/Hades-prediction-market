@@ -87,6 +87,28 @@ Notes:
 - set `KALSHI_DB_PATH` to override the default SQLite path.
 - Do not commit secrets. `.env` is already ignored by git.
 
+Optional ledger email config:
+- `LEDGER_EMAIL_ENABLED=true|false` (default false)
+- `LEDGER_EMAIL_INTERVAL_MINUTES=15` (minimum 1, fallback interval)
+- `LEDGER_EMAIL_SNAPSHOT_INTERVAL_MINUTES=15` (snapshot cadence)
+- `LEDGER_EMAIL_SNAPSHOT_WINDOW_MINUTES=30` (snapshot lookback window)
+- `LEDGER_EMAIL_TRIGGER_ENABLED=true|false` (send on live buy/sell attempts, including failed attempts)
+- `LEDGER_EMAIL_SMTP_HOST` (e.g. `smtp.gmail.com`)
+- `LEDGER_EMAIL_SMTP_PORT` (e.g. `587`)
+- `LEDGER_EMAIL_SMTP_TLS=true|false`
+- `LEDGER_EMAIL_SMTP_USER`
+- `LEDGER_EMAIL_SMTP_PASS` (for Gmail use an app password) https://myaccount.google.com/apppasswords
+- `LEDGER_EMAIL_FROM` (defaults to SMTP user if omitted)
+- `LEDGER_EMAIL_TO` (recipient email)
+- `LEDGER_EMAIL_SUBJECT_PREFIX` (optional, default `Hades Ledger`)
+- `LEDGER_EMAIL_SEND_ON_STARTUP=true|false` (optional startup connectivity email)
+
+When enabled, the app sends:
+- Trigger emails (`Subject: Buy/Sell/StopLoss Order Triggered`) for live buy/sell attempts with a real ticker (success or failure).
+- Snapshot emails (`Subject: Ledge Snapshot`) every `LEDGER_EMAIL_SNAPSHOT_INTERVAL_MINUTES`, covering the last `LEDGER_EMAIL_SNAPSHOT_WINDOW_MINUTES`.
+- Both trigger and snapshot emails include an HTML ledger table (dashboard-style columns: time/source/action/side/ticker/price/count/cost/status/reason/note), plus plain-text fallback.
+- Snapshot emails append full `/kalshi/portfolio/current` payload.
+Restart the API process after changing email env vars.
 
 
 ### 4) Run the API server + dashboard
@@ -147,6 +169,18 @@ python3 -m src.api
 - `GET /ledger/trades?limit=200`
   - Returns the latest ledger records for buy/sell calls from direct order route and strategy runs/auto cycles.
   - Fields include timestamp, action, side, ticker, price/count/cost, status, source, and payload snapshot.
+
+## Ledger Rules
+- Trade ledger table: `trade_ledger` in the same SQLite DB (`KALSHI_DB_PATH`).
+- Strategy-selection noise is intentionally suppressed:
+  - Rows with reason/note `No market matched ask band filters` are not written.
+- Ledger rows can still include failed order attempts (for debugging/forensics), including `status_code` and error reason extracted from payload/note.
+- `GET /ledger/trades` is the source of truth used by the dashboard Trade Ledger panel.
+- Trigger email noise filtering:
+  - Requires `run_mode=live`
+  - Requires action `buy` or `sell` (or stop-loss note)
+  - Requires a real ticker (not empty/`--`)
+  - Excludes the selection-noise phrase above
 
 ## Stop-Loss Behavior
 - Threshold:

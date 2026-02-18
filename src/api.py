@@ -1,4 +1,5 @@
 import datetime
+import html
 import json
 import os
 import sqlite3
@@ -214,6 +215,17 @@ def _log_trade_ledger(
     note: str | None = None,
     payload: dict | list | str | None = None,
 ):
+    should_trigger_email = _parse_bool_env("LEDGER_EMAIL_TRIGGER_ENABLED", True)
+    action_lower = str(action or "").strip().lower()
+    note_lower = str(note or "").strip().lower()
+    is_trade_action = action_lower in {"buy", "sell"}
+    is_stoploss_note = ("stop_loss" in note_lower) or ("stop-loss" in note_lower)
+    is_live_mode = str(run_mode or "").strip().lower() == "live"
+    has_ticker = bool(str(ticker or "").strip()) and str(ticker).strip() != "--"
+    is_selection_noise = "no market matched ask band filters" in note_lower
+    if is_selection_noise:
+        return
+    is_trigger_event = (is_trade_action or is_stoploss_note) and is_live_mode and has_ticker and not is_selection_noise
     cost_cents = int(price_cents * count) if isinstance(price_cents, int) and isinstance(count, int) else None
     payload_json = None
     if payload is not None:
@@ -221,6 +233,8 @@ def _log_trade_ledger(
             payload_json = json.dumps(payload)
         except Exception:
             payload_json = str(payload)
+    ts_iso = datetime.datetime.now(timezone.utc).isoformat()
+    inserted_id = None
     conn = _open_ledger_db()
     try:
         _ensure_trade_ledger(conn)
@@ -233,7 +247,7 @@ def _log_trade_ledger(
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                datetime.datetime.now(timezone.utc).isoformat(),
+                ts_iso,
                 source,
                 run_mode,
                 action,
@@ -248,9 +262,34 @@ def _log_trade_ledger(
                 payload_json,
             ),
         )
+        inserted_id = cur.lastrowid
         conn.commit()
     finally:
         conn.close()
+
+    if _parse_bool_env("LEDGER_EMAIL_ENABLED", False) and should_trigger_email and is_trigger_event:
+        record = {
+            "id": inserted_id,
+            "ts": ts_iso,
+            "source": source,
+            "run_mode": run_mode,
+            "action": action,
+            "side": side,
+            "ticker": ticker,
+            "price_cents": price_cents,
+            "count": count,
+            "cost_cents": cost_cents,
+            "status_code": status_code,
+            "success": 1 if success is True else (0 if success is False else None),
+            "note": note,
+            "payload_json": payload_json,
+        }
+        threading.Thread(
+            target=_safe_send_ledger_trigger_email,
+            args=(record,),
+            name="ledger-trigger-email",
+            daemon=True,
+        ).start()
 
 
 def _maybe_int(v):
@@ -465,26 +504,148 @@ def _format_local_ts(iso_ts: str | None) -> str:
         return str(iso_ts)
 
 
-def _read_ledger_since(since_iso: str) -> list[dict]:
+def _read_ledger_window(start_iso: str, end_iso: str) -> list[dict]:
     conn = _open_ledger_db()
     try:
         _ensure_trade_ledger(conn)
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT ts, source, action, side, ticker, price_cents, count, status_code, success, note
+            SELECT
+                id, ts, source, run_mode, action, side, ticker, price_cents, count, cost_cents,
+                status_code, success, note, payload_json
             FROM trade_ledger
-            WHERE ts > ?
+            WHERE ts > ? AND ts <= ?
             ORDER BY id ASC
             """,
-            (since_iso,),
+            (start_iso, end_iso),
         )
         return [dict(r) for r in cur.fetchall()]
     finally:
         conn.close()
 
 
-def _send_ledger_email(records: list[dict]):
+def _build_ledger_record_lines(record: dict) -> list[str]:
+    lines = []
+    ordered_keys = [
+        "id",
+        "ts",
+        "source",
+        "run_mode",
+        "action",
+        "side",
+        "ticker",
+        "price_cents",
+        "count",
+        "cost_cents",
+        "status_code",
+        "success",
+        "note",
+        "payload_json",
+    ]
+    for key in ordered_keys:
+        val = record.get(key)
+        lines.append(f"{key}: {val if val is not None else '--'}")
+    return lines
+
+
+def _to_pretty_json(value) -> str:
+    try:
+        return json.dumps(value, indent=2, sort_keys=True, default=str)
+    except Exception:
+        return str(value)
+
+
+def _format_cents_usd(value) -> str:
+    try:
+        if value is None:
+            return "--"
+        return f"${(float(value) / 100.0):,.2f}"
+    except Exception:
+        return "--"
+
+
+def _extract_failure_reason(status_code, payload_json, note_text) -> str:
+    s = _maybe_int(status_code)
+    parsed = None
+    if payload_json:
+        try:
+            parsed = json.loads(payload_json) if isinstance(payload_json, str) else payload_json
+        except Exception:
+            parsed = None
+
+    def pull_msg(obj):
+        if not isinstance(obj, dict):
+            return ""
+        keys = ["error", "message", "reason", "detail", "msg", "code"]
+        for k in keys:
+            v = obj.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        for k in keys:
+            v = obj.get(k)
+            if isinstance(v, dict):
+                nested = pull_msg(v)
+                if nested:
+                    return nested
+        return ""
+
+    extracted = pull_msg(parsed)
+    if extracted:
+        return extracted
+    note = str(note_text or "")
+    idx = note.lower().find("reason=")
+    if idx >= 0:
+        return note[idx + 7 :].strip()
+    if note.lower().startswith("exception="):
+        return note.replace("exception=", "", 1).strip()
+    if s == 401:
+        return "Unauthorized (401): check API key/signature/permissions"
+    if isinstance(s, int) and s >= 400:
+        return f"Request failed with status {s}"
+    return ""
+
+
+def _render_ledger_html_table(records: list[dict]) -> str:
+    rows_html = []
+    for r in records:
+        ts = _format_local_ts(r.get("ts"))
+        source = r.get("source") or "--"
+        action = str(r.get("action") or "--").upper()
+        side = str(r.get("side") or "--").upper()
+        ticker = r.get("ticker") or "--"
+        price = f"{r.get('price_cents')}c" if r.get("price_cents") is not None else "--"
+        count = r.get("count") if r.get("count") is not None else "--"
+        cost = _format_cents_usd(r.get("cost_cents")) if r.get("cost_cents") is not None else "--"
+        status = r.get("status_code") if r.get("status_code") is not None else "--"
+        reason = _extract_failure_reason(r.get("status_code"), r.get("payload_json"), r.get("note")) or "--"
+        note = r.get("note") or "--"
+        cells = [ts, source, action, side, ticker, price, str(count), str(cost), str(status), reason, note]
+        row = "<tr>" + "".join(f"<td>{html.escape(c)}</td>" for c in cells) + "</tr>"
+        rows_html.append(row)
+    if not rows_html:
+        rows_html.append("<tr><td colspan='11'>No ledger records in this window.</td></tr>")
+    return (
+        "<table style='border-collapse:collapse;width:100%;font-family:Arial,sans-serif;font-size:12px;'>"
+        "<thead><tr>"
+        "<th style='border:1px solid #2d3748;padding:6px;background:#111827;color:#f9fafb;'>TIME</th>"
+        "<th style='border:1px solid #2d3748;padding:6px;background:#111827;color:#f9fafb;'>SOURCE</th>"
+        "<th style='border:1px solid #2d3748;padding:6px;background:#111827;color:#f9fafb;'>ACTION</th>"
+        "<th style='border:1px solid #2d3748;padding:6px;background:#111827;color:#f9fafb;'>SIDE</th>"
+        "<th style='border:1px solid #2d3748;padding:6px;background:#111827;color:#f9fafb;'>TICKER</th>"
+        "<th style='border:1px solid #2d3748;padding:6px;background:#111827;color:#f9fafb;'>PRICE</th>"
+        "<th style='border:1px solid #2d3748;padding:6px;background:#111827;color:#f9fafb;'>COUNT</th>"
+        "<th style='border:1px solid #2d3748;padding:6px;background:#111827;color:#f9fafb;'>COST</th>"
+        "<th style='border:1px solid #2d3748;padding:6px;background:#111827;color:#f9fafb;'>STATUS</th>"
+        "<th style='border:1px solid #2d3748;padding:6px;background:#111827;color:#f9fafb;'>REASON</th>"
+        "<th style='border:1px solid #2d3748;padding:6px;background:#111827;color:#f9fafb;'>NOTE</th>"
+        "</tr></thead><tbody>"
+        + "".join(rows_html)
+        + "</tbody></table>"
+    )
+
+
+def _send_email_message(subject: str, body_lines: list[str], html_body: str | None = None):
     smtp_host = os.getenv("LEDGER_EMAIL_SMTP_HOST")
     smtp_port = int(os.getenv("LEDGER_EMAIL_SMTP_PORT", "587"))
     smtp_user = os.getenv("LEDGER_EMAIL_SMTP_USER")
@@ -492,40 +653,17 @@ def _send_ledger_email(records: list[dict]):
     smtp_tls = _parse_bool_env("LEDGER_EMAIL_SMTP_TLS", True)
     to_addr = os.getenv("LEDGER_EMAIL_TO")
     from_addr = os.getenv("LEDGER_EMAIL_FROM") or smtp_user
-    subject_prefix = os.getenv("LEDGER_EMAIL_SUBJECT_PREFIX", "Hades Ledger")
 
     if not smtp_host or not to_addr or not from_addr:
         raise ValueError("Missing email config (LEDGER_EMAIL_SMTP_HOST, LEDGER_EMAIL_TO, LEDGER_EMAIL_FROM)")
 
-    successes = sum(1 for r in records if r.get("success") == 1)
-    failures = sum(1 for r in records if r.get("success") == 0 or (r.get("status_code") and int(r["status_code"]) >= 400))
-    local_now = datetime.datetime.now().astimezone().strftime("%Y-%m-%d %I:%M %p %Z")
-    first_ts = _format_local_ts(records[0].get("ts")) if records else "--"
-    last_ts = _format_local_ts(records[-1].get("ts")) if records else "--"
-
-    lines = [
-        f"Ledger window summary ({local_now})",
-        f"Records: {len(records)} | Success: {successes} | Failure: {failures}",
-        f"Range: {first_ts} -> {last_ts}",
-        "",
-        "Recent entries:",
-    ]
-    for r in records[-30:]:
-        ts = _format_local_ts(r.get("ts"))
-        action = str(r.get("action") or "--").upper()
-        side = str(r.get("side") or "--").upper()
-        ticker = r.get("ticker") or "--"
-        px = f"{r.get('price_cents')}c" if r.get("price_cents") is not None else "--"
-        cnt = r.get("count") if r.get("count") is not None else "--"
-        status = r.get("status_code") if r.get("status_code") is not None else "--"
-        note = r.get("note") or ""
-        lines.append(f"- {ts} | {action} {side} {ticker} @ {px} x {cnt} | status={status} {note}".strip())
-
     msg = EmailMessage()
-    msg["Subject"] = f"{subject_prefix} | {len(records)} updates"
+    msg["Subject"] = subject
     msg["From"] = from_addr
     msg["To"] = to_addr
-    msg.set_content("\n".join(lines))
+    msg.set_content("\n".join(body_lines))
+    if html_body:
+        msg.add_alternative(html_body, subtype="html")
 
     with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as server:
         if smtp_tls:
@@ -535,18 +673,146 @@ def _send_ledger_email(records: list[dict]):
         server.send_message(msg)
 
 
+def _send_ledger_trigger_email(record: dict):
+    now_utc = datetime.datetime.now(timezone.utc)
+    local_now = now_utc.astimezone().strftime("%Y-%m-%d %I:%M:%S %p %Z")
+    utc_now = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+    action = str(record.get("action") or "").strip().lower()
+    note = str(record.get("note") or "").strip().lower()
+    if "stop_loss" in note or "stop-loss" in note:
+        trigger_type = "STOPLOSS"
+    elif action == "buy":
+        trigger_type = "BUY"
+    elif action == "sell":
+        trigger_type = "SELL"
+    else:
+        trigger_type = (action or "UNKNOWN").upper()
+
+    body_lines = [
+        "Buy/Sell/StopLoss Order Triggered",
+        f"Generated at: {local_now} ({utc_now})",
+        f"Trigger type: {trigger_type}",
+        "",
+    ]
+    html_table = _render_ledger_html_table([record])
+    html_body = (
+        "<html><body>"
+        f"<h3 style='font-family:Arial,sans-serif;margin:0 0 8px;'>Buy/Sell/StopLoss Order Triggered</h3>"
+        f"<p style='font-family:Arial,sans-serif;margin:0 0 4px;'>Generated at: {html.escape(local_now)} ({html.escape(utc_now)})</p>"
+        f"<p style='font-family:Arial,sans-serif;margin:0 0 12px;'>Trigger type: {html.escape(trigger_type)}</p>"
+        f"{html_table}"
+        "</body></html>"
+    )
+    _send_email_message("Buy/Sell/StopLoss Order Triggered", body_lines, html_body=html_body)
+
+
+def _safe_send_ledger_trigger_email(record: dict):
+    try:
+        _send_ledger_trigger_email(record)
+    except Exception as exc:
+        print(f"Ledger trigger email error: {exc}")
+
+
+def _send_ledger_snapshot_email(records: list[dict], window_start_iso: str, window_end_iso: str, portfolio_snapshot: dict | None = None):
+    now_utc = datetime.datetime.now(timezone.utc)
+    local_now = now_utc.astimezone().strftime("%Y-%m-%d %I:%M:%S %p %Z")
+    utc_now = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+    window_start_local = _format_local_ts(window_start_iso)
+    window_end_local = _format_local_ts(window_end_iso)
+
+    lines = [
+        "Ledge Snapshot",
+        f"Generated at: {local_now} ({utc_now})",
+        f"Window covered: {window_start_local} -> {window_end_local}",
+        f"Total records: {len(records)}",
+        "",
+    ]
+    for r in records:
+        ts = _format_local_ts(r.get("ts"))
+        source = r.get("source") or "--"
+        action = str(r.get("action") or "--").upper()
+        side = str(r.get("side") or "--").upper()
+        ticker = r.get("ticker") or "--"
+        price = f"{r.get('price_cents')}c" if r.get("price_cents") is not None else "--"
+        count = r.get("count") if r.get("count") is not None else "--"
+        cost = _format_cents_usd(r.get("cost_cents")) if r.get("cost_cents") is not None else "--"
+        status = r.get("status_code") if r.get("status_code") is not None else "--"
+        reason = _extract_failure_reason(r.get("status_code"), r.get("payload_json"), r.get("note")) or "--"
+        note = r.get("note") or "--"
+        lines.append(
+            f"{ts} | {source} | {action} | {side} | {ticker} | {price} | {count} | {cost} | {status} | {reason} | {note}"
+        )
+
+    lines.append("Current Portfolio (full):")
+    lines.append(_to_pretty_json(portfolio_snapshot if portfolio_snapshot is not None else {"error": "Portfolio snapshot unavailable"}))
+
+    html_table = _render_ledger_html_table(records)
+    portfolio_json = _to_pretty_json(portfolio_snapshot if portfolio_snapshot is not None else {"error": "Portfolio snapshot unavailable"})
+    html_body = (
+        "<html><body>"
+        "<h3 style='font-family:Arial,sans-serif;margin:0 0 8px;'>Ledge Snapshot</h3>"
+        f"<p style='font-family:Arial,sans-serif;margin:0 0 4px;'>Generated at: {html.escape(local_now)} ({html.escape(utc_now)})</p>"
+        f"<p style='font-family:Arial,sans-serif;margin:0 0 4px;'>Window covered: {html.escape(window_start_local)} -> {html.escape(window_end_local)}</p>"
+        f"<p style='font-family:Arial,sans-serif;margin:0 0 12px;'>Total records: {len(records)}</p>"
+        f"{html_table}"
+        "<h4 style='font-family:Arial,sans-serif;margin:16px 0 8px;'>Current Portfolio (full)</h4>"
+        f"<pre style='white-space:pre-wrap;background:#f8fafc;border:1px solid #e5e7eb;padding:10px;font-size:12px;'>{html.escape(portfolio_json)}</pre>"
+        "</body></html>"
+    )
+
+    _send_email_message("Ledge Snapshot", lines, html_body=html_body)
+
+
+def _send_ledger_startup_email():
+    if not _parse_bool_env("LEDGER_EMAIL_SEND_ON_STARTUP", True):
+        return
+    smtp_host = os.getenv("LEDGER_EMAIL_SMTP_HOST")
+    smtp_port = int(os.getenv("LEDGER_EMAIL_SMTP_PORT", "587"))
+    smtp_user = os.getenv("LEDGER_EMAIL_SMTP_USER")
+    smtp_pass = os.getenv("LEDGER_EMAIL_SMTP_PASS")
+    smtp_tls = _parse_bool_env("LEDGER_EMAIL_SMTP_TLS", True)
+    to_addr = os.getenv("LEDGER_EMAIL_TO")
+    from_addr = os.getenv("LEDGER_EMAIL_FROM") or smtp_user
+    if not smtp_host or not to_addr or not from_addr:
+        raise ValueError("Missing email config (LEDGER_EMAIL_SMTP_HOST, LEDGER_EMAIL_TO, LEDGER_EMAIL_FROM)")
+
+    now_utc = datetime.datetime.now(timezone.utc)
+    local_now = now_utc.astimezone().strftime("%Y-%m-%d %I:%M:%S %p %Z")
+    utc_now = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    _send_email_message(
+        "Ledger startup check",
+        [
+            "Ledger email startup check",
+            f"Generated at: {local_now} ({utc_now})",
+            "Status: SMTP configuration loaded and startup send attempted.",
+        ],
+    )
+
+
 def _ledger_email_worker():
-    interval_min = max(1, int(os.getenv("LEDGER_EMAIL_INTERVAL_MINUTES", "30")))
-    last_sent_cutoff = datetime.datetime.now(timezone.utc).isoformat()
+    interval_min = max(1, int(os.getenv("LEDGER_EMAIL_SNAPSHOT_INTERVAL_MINUTES", os.getenv("LEDGER_EMAIL_INTERVAL_MINUTES", "15"))))
+    window_min = max(interval_min, int(os.getenv("LEDGER_EMAIL_SNAPSHOT_WINDOW_MINUTES", "30")))
     while not _ledger_email_stop.is_set():
         if _ledger_email_stop.wait(timeout=interval_min * 60):
             break
         try:
-            rows = _read_ledger_since(last_sent_cutoff)
-            last_sent_cutoff = datetime.datetime.now(timezone.utc).isoformat()
-            if not rows:
-                continue
-            _send_ledger_email(rows)
+            window_end_iso = datetime.datetime.now(timezone.utc).isoformat()
+            window_start_iso = (datetime.datetime.now(timezone.utc) - timedelta(minutes=window_min)).isoformat()
+            rows = _read_ledger_window(window_start_iso, window_end_iso)
+            try:
+                portfolio_snapshot = get_portfolio_current_orders()
+            except Exception as portfolio_exc:
+                portfolio_snapshot = {
+                    "error": f"portfolio_fetch_failed: {type(portfolio_exc).__name__}: {portfolio_exc}",
+                    "ts": datetime.datetime.now(timezone.utc).isoformat(),
+                }
+            _send_ledger_snapshot_email(
+                rows,
+                window_start_iso=window_start_iso,
+                window_end_iso=window_end_iso,
+                portfolio_snapshot=portfolio_snapshot,
+            )
         except Exception as exc:
             print(f"Ledger email worker error: {exc}")
 
@@ -571,6 +837,11 @@ def startup_ingest():
     auto_ingest = os.getenv("KALSHI_AUTO_INGEST", "true").lower()
     if auto_ingest in {"1", "true", "yes", "on"}:
         _start_ingest_loop()
+    if _parse_bool_env("LEDGER_EMAIL_ENABLED", False):
+        try:
+            _send_ledger_startup_email()
+        except Exception as exc:
+            print(f"Ledger startup email error: {exc}")
     _start_ledger_email_loop()
 
 
