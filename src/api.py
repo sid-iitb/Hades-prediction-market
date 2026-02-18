@@ -1175,6 +1175,7 @@ def _seed_active_positions_from_portfolio(config: FarthestBandConfig) -> list[di
 
 def _farthest_band_worker():
     next_scheduled_at = datetime.datetime.now(timezone.utc)
+    next_risk_check_due_at = datetime.datetime.now(timezone.utc)
     while not _farthest_auto_stop.is_set():
         now_utc = datetime.datetime.now(timezone.utc)
         with _farthest_auto_lock:
@@ -1201,144 +1202,148 @@ def _farthest_band_worker():
             live_positions = _seed_active_positions_from_portfolio(config)
             if live_positions is not None:
                 active_positions = live_positions
+        had_positions_before = bool(active_positions)
         is_scheduled_run = now_utc >= next_scheduled_at
+        should_check_risk = bool(active_positions) and now_utc >= next_risk_check_due_at
         did_run = False
         run_at = None
         latest_out = None
-        next_active_positions = []
+        next_active_positions = list(active_positions or [])
         risk_snapshot = []
 
         if active_positions or is_scheduled_run:
             did_run = True
             run_at = datetime.datetime.now(timezone.utc).isoformat()
-            for pos in active_positions:
-                try:
-                    out = _run_farthest_band_once(
-                        config,
-                        active_position=pos,
-                        force_rebalance=False,
-                    )
-                except Exception as exc:
-                    out = {"action": "error", "reason": str(exc), "active_position": pos}
-                try:
-                    _record_strategy_ledger(out, source="/strategy/farthest_band/auto")
-                except Exception:
-                    # Ledger write must never kill the strategy worker.
-                    pass
-                latest_out = out
-                cycle = (out or {}).get("result") or {}
-                cycle_action = str(cycle.get("action") or "").lower()
-                cycle_reason = str(cycle.get("reason") or "")
-                stop_loss_failed_exit = (
-                    cycle_action == "hold_active" and "stop-loss triggered" in cycle_reason.lower()
-                )
-                if cycle_action == "stop_loss_rotate" or stop_loss_failed_exit:
-                    exit_leg = cycle.get("exit") or {}
-                    reentry_leg = cycle.get("reentry") or {}
-                    exited = cycle.get("exited_position") or cycle.get("active_position") or {}
-                    rebought = {}
-                    if cycle_action == "stop_loss_rotate":
-                        rebought = (
-                            reentry_leg.get("active_position")
-                            or ((reentry_leg.get("selection") or {}).get("selected") or {})
+            if should_check_risk:
+                next_active_positions = []
+                for pos in active_positions:
+                    try:
+                        out = _run_farthest_band_once(
+                            config,
+                            active_position=pos,
+                            force_rebalance=False,
                         )
-                    sell_error = None
-                    if str(exit_leg.get("action") or "").lower() == "hold":
-                        sell_error = exit_leg.get("reason") or cycle_reason or "Unknown sell failure"
-                    buy_error = None
-                    if cycle_action == "stop_loss_rotate":
-                        if str(reentry_leg.get("action") or "").lower() == "hold":
-                            buy_error = reentry_leg.get("reason") or "Unknown buy failure"
-                    else:
-                        buy_error = "Not attempted because sell leg failed"
-                    entry_price_cents = _maybe_int(exited.get("entry_price_cents"))
-                    sold_price_cents = _maybe_int(exit_leg.get("exit_price_cents"))
-                    sold_count = _maybe_int(exited.get("count"))
-                    purchase_value_cents = (
-                        int(entry_price_cents * sold_count)
-                        if isinstance(entry_price_cents, int) and isinstance(sold_count, int)
-                        else None
+                    except Exception as exc:
+                        out = {"action": "error", "reason": str(exc), "active_position": pos}
+                    try:
+                        _record_strategy_ledger(out, source="/strategy/farthest_band/auto")
+                    except Exception:
+                        # Ledger write must never kill the strategy worker.
+                        pass
+                    latest_out = out
+                    cycle = (out or {}).get("result") or {}
+                    cycle_action = str(cycle.get("action") or "").lower()
+                    cycle_reason = str(cycle.get("reason") or "")
+                    stop_loss_failed_exit = (
+                        cycle_action == "hold_active" and "stop-loss triggered" in cycle_reason.lower()
                     )
-                    sold_value_cents = (
-                        int(sold_price_cents * sold_count)
-                        if isinstance(sold_price_cents, int) and isinstance(sold_count, int)
-                        else None
-                    )
-                    realized_pnl_cents = (
-                        int(sold_value_cents - purchase_value_cents)
-                        if isinstance(sold_value_cents, int) and isinstance(purchase_value_cents, int)
-                        else None
-                    )
-                    realized_pnl_pct = (
-                        (float(sold_price_cents) - float(entry_price_cents)) / float(entry_price_cents)
-                        if isinstance(sold_price_cents, int) and isinstance(entry_price_cents, int) and entry_price_cents > 0
-                        else None
-                    )
-                    last_stop_loss_trigger = {
-                        "triggered_at": run_at,
-                        "sold": {
-                            "ticker": exited.get("ticker"),
-                            "price_cents": _maybe_int(exit_leg.get("exit_price_cents")),
-                            "count": _maybe_int(exited.get("count")),
-                        },
-                        "entry": {
-                            "price_cents": entry_price_cents,
-                            "count": sold_count,
-                            "purchase_value_cents": purchase_value_cents,
-                        },
-                        "bought": {
-                            "ticker": rebought.get("ticker"),
-                            "price_cents": _maybe_int(
-                                rebought.get("entry_price_cents")
-                                if rebought.get("entry_price_cents") is not None
-                                else rebought.get("ask_cents")
+                    if cycle_action == "stop_loss_rotate" or stop_loss_failed_exit:
+                        exit_leg = cycle.get("exit") or {}
+                        reentry_leg = cycle.get("reentry") or {}
+                        exited = cycle.get("exited_position") or cycle.get("active_position") or {}
+                        rebought = {}
+                        if cycle_action == "stop_loss_rotate":
+                            rebought = (
+                                reentry_leg.get("active_position")
+                                or ((reentry_leg.get("selection") or {}).get("selected") or {})
+                            )
+                        sell_error = None
+                        if str(exit_leg.get("action") or "").lower() == "hold":
+                            sell_error = exit_leg.get("reason") or cycle_reason or "Unknown sell failure"
+                        buy_error = None
+                        if cycle_action == "stop_loss_rotate":
+                            if str(reentry_leg.get("action") or "").lower() == "hold":
+                                buy_error = reentry_leg.get("reason") or "Unknown buy failure"
+                        else:
+                            buy_error = "Not attempted because sell leg failed"
+                        entry_price_cents = _maybe_int(exited.get("entry_price_cents"))
+                        sold_price_cents = _maybe_int(exit_leg.get("exit_price_cents"))
+                        sold_count = _maybe_int(exited.get("count"))
+                        purchase_value_cents = (
+                            int(entry_price_cents * sold_count)
+                            if isinstance(entry_price_cents, int) and isinstance(sold_count, int)
+                            else None
+                        )
+                        sold_value_cents = (
+                            int(sold_price_cents * sold_count)
+                            if isinstance(sold_price_cents, int) and isinstance(sold_count, int)
+                            else None
+                        )
+                        realized_pnl_cents = (
+                            int(sold_value_cents - purchase_value_cents)
+                            if isinstance(sold_value_cents, int) and isinstance(purchase_value_cents, int)
+                            else None
+                        )
+                        realized_pnl_pct = (
+                            (float(sold_price_cents) - float(entry_price_cents)) / float(entry_price_cents)
+                            if isinstance(sold_price_cents, int) and isinstance(entry_price_cents, int) and entry_price_cents > 0
+                            else None
+                        )
+                        last_stop_loss_trigger = {
+                            "triggered_at": run_at,
+                            "sold": {
+                                "ticker": exited.get("ticker"),
+                                "price_cents": _maybe_int(exit_leg.get("exit_price_cents")),
+                                "count": _maybe_int(exited.get("count")),
+                            },
+                            "entry": {
+                                "price_cents": entry_price_cents,
+                                "count": sold_count,
+                                "purchase_value_cents": purchase_value_cents,
+                            },
+                            "bought": {
+                                "ticker": rebought.get("ticker"),
+                                "price_cents": _maybe_int(
+                                    rebought.get("entry_price_cents")
+                                    if rebought.get("entry_price_cents") is not None
+                                    else rebought.get("ask_cents")
+                                ),
+                                "count": _maybe_int(
+                                    rebought.get("count")
+                                    if rebought.get("count") is not None
+                                    else (reentry_leg.get("selection") or {}).get("count")
+                                ),
+                            },
+                            "sold_value_cents": sold_value_cents,
+                            "realized_pnl_cents": realized_pnl_cents,
+                            "realized_pnl_pct": realized_pnl_pct,
+                            "pre_exit_pnl_pct": cycle.get("pnl_pct"),
+                            "buy_selection_reason": (reentry_leg.get("selection") or {}).get("reason"),
+                            "buy_fallback_used": (reentry_leg.get("selection") or {}).get("fallback_used"),
+                            "buy_fallback_reason": (reentry_leg.get("selection") or {}).get("fallback_reason"),
+                            "sell_error": sell_error,
+                            "buy_error": buy_error,
+                            "sell_status": "failed" if sell_error else "ok",
+                            "buy_status": (
+                                "failed"
+                                if buy_error and cycle_action == "stop_loss_rotate"
+                                else ("skipped" if buy_error else "ok")
                             ),
-                            "count": _maybe_int(
-                                rebought.get("count")
-                                if rebought.get("count") is not None
-                                else (reentry_leg.get("selection") or {}).get("count")
-                            ),
-                        },
-                        "sold_value_cents": sold_value_cents,
-                        "realized_pnl_cents": realized_pnl_cents,
-                        "realized_pnl_pct": realized_pnl_pct,
-                        "pre_exit_pnl_pct": cycle.get("pnl_pct"),
-                        "buy_selection_reason": (reentry_leg.get("selection") or {}).get("reason"),
-                        "buy_fallback_used": (reentry_leg.get("selection") or {}).get("fallback_used"),
-                        "buy_fallback_reason": (reentry_leg.get("selection") or {}).get("fallback_reason"),
-                        "sell_error": sell_error,
-                        "buy_error": buy_error,
-                        "sell_status": "failed" if sell_error else "ok",
-                        "buy_status": (
-                            "failed"
-                            if buy_error and cycle_action == "stop_loss_rotate"
-                            else ("skipped" if buy_error else "ok")
-                        ),
-                        "event_action": cycle_action,
-                    }
-                    stop_loss_trigger_history.append(last_stop_loss_trigger)
-                    if len(stop_loss_trigger_history) > 5000:
-                        stop_loss_trigger_history = stop_loss_trigger_history[-5000:]
-                    _log_stop_loss_trigger(last_stop_loss_trigger)
-                mark = out.get("mark") if isinstance(out, dict) else None
-                pnl_pct = out.get("pnl_pct") if isinstance(out, dict) else None
-                if pnl_pct is None and isinstance(mark, dict):
-                    pnl_pct = mark.get("pnl_pct")
-                mark_cents = mark.get("mark_cents") if isinstance(mark, dict) else None
-                risk_snapshot.append(
-                    {
-                        "ticker": pos.get("ticker"),
-                        "side": pos.get("side"),
-                        "entry_price_cents": pos.get("entry_price_cents"),
-                        "count": pos.get("count"),
-                        "pnl_pct": pnl_pct,
-                        "mark_cents": mark_cents,
-                        "action": out.get("action") if isinstance(out, dict) else "error",
-                    }
-                )
-                next_pos = out.get("active_position")
-                if isinstance(next_pos, dict):
-                    next_active_positions.append(next_pos)
+                            "event_action": cycle_action,
+                        }
+                        stop_loss_trigger_history.append(last_stop_loss_trigger)
+                        if len(stop_loss_trigger_history) > 5000:
+                            stop_loss_trigger_history = stop_loss_trigger_history[-5000:]
+                        _log_stop_loss_trigger(last_stop_loss_trigger)
+                    mark = out.get("mark") if isinstance(out, dict) else None
+                    pnl_pct = out.get("pnl_pct") if isinstance(out, dict) else None
+                    if pnl_pct is None and isinstance(mark, dict):
+                        pnl_pct = mark.get("pnl_pct")
+                    mark_cents = mark.get("mark_cents") if isinstance(mark, dict) else None
+                    risk_snapshot.append(
+                        {
+                            "ticker": pos.get("ticker"),
+                            "side": pos.get("side"),
+                            "entry_price_cents": pos.get("entry_price_cents"),
+                            "count": pos.get("count"),
+                            "pnl_pct": pnl_pct,
+                            "mark_cents": mark_cents,
+                            "action": out.get("action") if isinstance(out, dict) else "error",
+                        }
+                    )
+                    next_pos = out.get("active_position")
+                    if isinstance(next_pos, dict):
+                        next_active_positions.append(next_pos)
 
             if is_scheduled_run:
                 try:
@@ -1369,7 +1374,7 @@ def _farthest_band_worker():
                 _farthest_auto_state["last_run_at"] = run_at
                 if is_scheduled_run:
                     _farthest_auto_state["last_scheduled_run_at"] = run_at
-                if active_positions:
+                if should_check_risk:
                     _farthest_auto_state["last_risk_check_at"] = run_at
                     _farthest_auto_state["risk_snapshot"] = risk_snapshot
                 _farthest_auto_state["next_scheduled_run_at"] = next_scheduled_at.isoformat()
@@ -1380,14 +1385,21 @@ def _farthest_band_worker():
                 _farthest_auto_state["last_stop_loss_trigger"] = last_stop_loss_trigger
                 _farthest_auto_state["stop_loss_trigger_history"] = stop_loss_trigger_history
 
+        configured_risk_sec = max(1, int(getattr(config, "stop_loss_check_seconds", 300) or 300))
+        if should_check_risk:
+            next_risk_check_due_at = datetime.datetime.now(timezone.utc) + timedelta(seconds=configured_risk_sec)
+        elif next_active_positions and not had_positions_before:
+            # First tracked position was created on a scheduled cycle; start risk cadence from now.
+            next_risk_check_due_at = datetime.datetime.now(timezone.utc) + timedelta(seconds=configured_risk_sec)
+
         # Wake at the earlier of:
         # - next scheduled interval execution
-        # - configured stop-loss risk-check cadence
+        # - next configured stop-loss check time
         now_after = datetime.datetime.now(timezone.utc)
         seconds_until_schedule = max(1, int((next_scheduled_at - now_after).total_seconds()))
-        configured_risk_sec = max(1, int(getattr(config, "stop_loss_check_seconds", 300) or 300))
-        wait_seconds = min(configured_risk_sec, seconds_until_schedule)
-        next_risk_check_at = now_after + timedelta(seconds=wait_seconds)
+        seconds_until_risk_check = max(1, int((next_risk_check_due_at - now_after).total_seconds()))
+        wait_seconds = min(seconds_until_schedule, seconds_until_risk_check) if next_active_positions else seconds_until_schedule
+        next_risk_check_at = next_risk_check_due_at if next_active_positions else now_after + timedelta(seconds=configured_risk_sec)
         with _farthest_auto_lock:
             _farthest_auto_state["next_risk_check_at"] = next_risk_check_at.isoformat()
         if _farthest_auto_stop.wait(timeout=wait_seconds):
@@ -3755,14 +3767,13 @@ def dashboard():
               recentHistory ? `\\nTrigger history (${triggerHistory.length})\\n${recentHistory}` : "",
             ].filter(Boolean).join("\\n")
           : "";
-        const configuredIntervalMin = Math.max(1, Number(statusData?.config?.interval_minutes || strategyIntervalEl.value || 15));
-        const cadenceSec = Math.max(1, Math.min(configuredRiskSec, Math.floor(configuredIntervalMin * 60)));
+        const cadenceSec = Math.max(1, Math.floor(configuredRiskSec));
         const cadenceText = cadenceSec % 60 === 0
           ? `${Math.floor(cadenceSec / 60)}m`
           : `${cadenceSec}s`;
         const stopLossPct = Math.abs(Number(statusData?.config?.stop_loss_pct ?? 0.25)) * 100;
         if (stopLossConfigEl) {
-          stopLossConfigEl.textContent = `Frequency: every up to ${cadenceText} (min(configured risk check, next schedule)) | Trigger: loss > ${stopLossPct.toFixed(2)}%`;
+          stopLossConfigEl.textContent = `Frequency: every ${cadenceText} | Trigger: loss > ${stopLossPct.toFixed(2)}%`;
         }
         if (!statusData || !statusData.running) {
           stopLossNextRunEl.textContent = "Next stop-loss check: auto not running";
