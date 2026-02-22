@@ -18,6 +18,6 @@ run:
       value: /tmp/kalshi_ingest.db
   secrets:
     - name: KALSHI_API_KEY
-      value-from: arn:aws:secretsmanager:us-east-1:763253192628:secret:hades/kalshi/api-key-VNbtuy:KALSHI_API_KEY::
+      value-from: "arn:aws:secretsmanager:us-east-1:763253192628:secret:hades/kalshi/api-key-VNbtuy:KALSHI_API_KEY::"
     - name: KALSHI_PRIVATE_KEY_PEM
-      value-from: arn:aws:secretsmanager:us-east-1:763253192628:secret:hades/kalshi/private-key-Q6uVKp:KALSHI_PRIVATE_KEY_PEM::
+      value-from: "arn:aws:secretsmanager:us-east-1:763253192628:secret:hades/kalshi/private-key-Q6uVKp:KALSHI_PRIVATE_KEY_PEM::"
