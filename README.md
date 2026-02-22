@@ -77,6 +77,7 @@ pip install fastapi uvicorn requests cryptography python-dotenv pytz
 Copy your `.env` file and set:
 - `KALSHI_API_KEY`
 - `KALSHI_PRIVATE_KEY`
+  - or `KALSHI_PRIVATE_KEY_PEM` (recommended for cloud secret managers)
 - `KALSHI_BASE_URL`
 - `KALSHI_DB_PATH`
 - `OPENAI_API_KEY` (optional, future use)
@@ -84,6 +85,7 @@ Copy your `.env` file and set:
 
 Notes:
 - `KALSHI_PRIVATE_KEY` should point to your private key PEM.
+- `KALSHI_PRIVATE_KEY_PEM` can contain full PEM text directly (used first if both are set).
 - set `KALSHI_DB_PATH` to override the default SQLite path.
 - Do not commit secrets. `.env` is already ignored by git.
 
@@ -169,6 +171,38 @@ python3 -m src.api
 - `GET /ledger/trades?limit=200`
   - Returns the latest ledger records for buy/sell calls from direct order route and strategy runs/auto cycles.
   - Fields include timestamp, action, side, ticker, price/count/cost, status, source, and payload snapshot.
+
+## Deploy on AWS App Runner (GitHub Auto Deploy)
+This repository includes `apprunner.yaml` for dashboard-based deployment from GitHub.
+
+### 1) Push code to GitHub
+Make sure these files are in your repo:
+- `apprunner.yaml`
+- `requirements.txt`
+
+Do not commit secrets (`.env`, private keys).
+
+### 2) Create App Runner service in AWS Console
+1. Open AWS Console -> App Runner -> `Create service`.
+2. Source and deployment:
+   - Source: `Source code repository`
+   - Provider: `GitHub`
+   - Connect your GitHub account and select this repo + branch.
+   - Deployment trigger: `Automatic` (deploy on every push).
+3. Build settings:
+   - Configuration file: `Use configuration file` (`apprunner.yaml`).
+4. Service settings:
+   - Set CPU/Memory to smallest (`0.25 vCPU`, `0.5 GB`) for lowest cost.
+   - Environment variables: add your required app vars (e.g. `KALSHI_API_KEY`, `KALSHI_PRIVATE_KEY`, `KALSHI_BASE_URL`).
+   - If `KALSHI_PRIVATE_KEY` is a file path in local dev, store the PEM content in AWS Secrets Manager and pass a path/content strategy your code can read in cloud.
+5. Create service.
+
+### 3) Open dashboard
+After deploy, open:
+- `https://<your-service>.<region>.awsapprunner.com/dashboard`
+
+### 4) Restrict access (recommended)
+By default the URL is public. Add authentication before live trading use.
 
 ## Ledger Rules
 - Trade ledger table: `trade_ledger` in the same SQLite DB (`KALSHI_DB_PATH`).

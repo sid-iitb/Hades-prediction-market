@@ -17,20 +17,27 @@ class KalshiClient:
     ):
         self.api_key_id = os.getenv("KALSHI_API_KEY")
         self.private_key_path = os.getenv("KALSHI_PRIVATE_KEY")
+        self.private_key_pem = os.getenv("KALSHI_PRIVATE_KEY_PEM")
         self.base_url = os.getenv("KALSHI_BASE_URL")
         self._private_key = None
-        print(self.api_key_id)
-        print(self.private_key_path)
 
     def _load_private_key(self):
         if self._private_key is not None:
             return self._private_key
-        if not self.private_key_path:
-            raise ValueError("KALSHI_PRIVATE_KEY_PATH is not set")
-        with open(self.private_key_path, "rb") as f:
+        if self.private_key_pem:
             self._private_key = serialization.load_pem_private_key(
-                f.read(), password=None, backend=default_backend()
+                self.private_key_pem.encode("utf-8"),
+                password=None,
+                backend=default_backend(),
             )
+            return self._private_key
+        if self.private_key_path:
+            with open(self.private_key_path, "rb") as f:
+                self._private_key = serialization.load_pem_private_key(
+                    f.read(), password=None, backend=default_backend()
+                )
+            return self._private_key
+        raise ValueError("Set KALSHI_PRIVATE_KEY (path) or KALSHI_PRIVATE_KEY_PEM (content)")
         return self._private_key
 
     def _sign_request(self, timestamp_ms, method, path):

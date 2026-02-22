@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+requests
+cryptography
+python-dotenv
+pytz
+certifi
