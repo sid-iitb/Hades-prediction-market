@@ -83,7 +83,7 @@ def insert_run(conn, event_ticker, current_price, markets):
             ],
         )
     conn.commit()
-    print("Pushed Record to Storage " + str(ts) + "BTC" + str(current_price))
+    # print("Pushed Record to Storage " + str(ts) + "BTC" + str(current_price))
 
 
 def purge_old(conn, hours=1):
