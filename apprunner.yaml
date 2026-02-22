@@ -16,8 +16,3 @@ run:
       value: https://api.elections.kalshi.com
     - name: KALSHI_DB_PATH
       value: /tmp/kalshi_ingest.db
-  secrets:
-    - name: KALSHI_API_KEY
-      value-from: arn:aws:secretsmanager:REGION:ACCOUNT_ID:secret:REPLACE_WITH_API_KEY_SECRET
-    - name: KALSHI_PRIVATE_KEY_PEM
-      value-from: arn:aws:secretsmanager:REGION:ACCOUNT_ID:secret:REPLACE_WITH_PRIVATE_KEY_SECRET
