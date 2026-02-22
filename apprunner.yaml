@@ -1,11 +1,13 @@
 version: 1.0
-runtime: python3
+runtime: python311
 build:
   commands:
     build:
-      - pip install -r requirements.txt
+      - echo "Using Python 3.11 managed runtime"
 run:
   runtime-version: "3.11"
+  pre-run:
+    - pip3 install -r requirements.txt
   command: uvicorn src.api:app --host 0.0.0.0 --port 8000
   network:
     port: 8000
