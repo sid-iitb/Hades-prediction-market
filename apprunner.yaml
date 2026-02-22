@@ -16,8 +16,36 @@ run:
       value: https://api.elections.kalshi.com
     - name: KALSHI_DB_PATH
       value: /tmp/kalshi_ingest.db
+    - name: LEDGER_EMAIL_ENABLED
+      value: "true"
+    - name: LEDGER_EMAIL_INTERVAL_MINUTES
+      value: "15"
+    - name: LEDGER_EMAIL_SNAPSHOT_INTERVAL_MINUTES
+      value: "15"
+    - name: LEDGER_EMAIL_SNAPSHOT_WINDOW_MINUTES
+      value: "30"
+    - name: LEDGER_EMAIL_TRIGGER_ENABLED
+      value: "false"
+    - name: LEDGER_EMAIL_SMTP_HOST
+      value: smtp.gmail.com
+    - name: LEDGER_EMAIL_SMTP_PORT
+      value: "587"
+    - name: LEDGER_EMAIL_SMTP_TLS
+      value: "true"
+    - name: LEDGER_EMAIL_SMTP_USER
+      value: sid.cse.iitb
+    - name: LEDGER_EMAIL_FROM
+      value: sid.cse.iitb@gmail.com
+    - name: LEDGER_EMAIL_TO
+      value: sid.cse.iitb@gmail.com
+    - name: LEDGER_EMAIL_SUBJECT_PREFIX
+      value: Hades Ledger
+    - name: LEDGER_EMAIL_SEND_ON_STARTUP
+      value: "true"
   secrets:
     - name: KALSHI_API_KEY
       value-from: "arn:aws:secretsmanager:us-east-1:763253192628:secret:hades/kalshi/api-key-VNbtuy:KALSHI_API_KEY::"
     - name: KALSHI_PRIVATE_KEY_PEM
       value-from: "arn:aws:secretsmanager:us-east-1:763253192628:secret:hades/kalshi/private-key-Q6uVKp:KALSHI_PRIVATE_KEY_PEM::"
+    - name: LEDGER_EMAIL_SMTP_PASS
+      value-from: "arn:aws:secretsmanager:us-east-1:763253192628:secret:hades/ledger/smtp-pass-d6xIaN:LEDGER_EMAIL_SMTP_PASS::"
