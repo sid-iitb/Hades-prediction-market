@@ -1249,15 +1249,12 @@ def _seed_active_positions_from_portfolio(config: FarthestBandConfig) -> list[di
                     p,
                     cents_keys=[
                         "market_value_cents",
-                        "market_exposure_cents",
                         "position_value_cents",
                         "positions_value_cents",
                     ],
                     dollar_keys=[
                         "market_value",
                         "market_value_dollars",
-                        "market_exposure_dollars",
-                        "market_exposure",
                         "position_value",
                         "position_value_dollars",
                     ],
@@ -1915,6 +1912,13 @@ def _extract_money_cents(position: dict, cents_keys: list[str], dollar_keys: lis
         v = position.get(k)
         if isinstance(v, (int, float)):
             return int(round(float(v)))
+        if isinstance(v, str):
+            cleaned = v.replace(",", "").strip()
+            if cleaned:
+                try:
+                    return int(round(float(cleaned)))
+                except Exception:
+                    pass
     for k in dollar_keys:
         v = _parse_dollar_str_to_cents(position.get(k))
         if v is not None:
@@ -2006,34 +2010,44 @@ def get_portfolio_current_orders(status: str | None = "open", limit: int = 200):
             p,
             cents_keys=[
                 "market_value_cents",
-                "market_exposure_cents",
                 "position_value_cents",
                 "positions_value_cents",
             ],
             dollar_keys=[
                 "market_value",
                 "market_value_dollars",
-                "market_exposure_dollars",
-                "market_exposure",
                 "position_value",
                 "position_value_dollars",
             ],
         )
+        # If valuation fields are absent, infer mark from live top-of-book.
+        if ticker and side in {"yes", "no"} and mark_cents is None:
+            try:
+                top = client.get_top_of_book(ticker)
+                mark_cents = _maybe_int(top.get(f"{side}_bid"))
+                if mark_cents is None:
+                    bid = _maybe_int(top.get(f"{side}_bid"))
+                    ask = _maybe_int(top.get(f"{side}_ask"))
+                    mark_cents = _midpoint(bid, ask)
+            except Exception:
+                pass
+        if market_value_cents is None and isinstance(mark_cents, int) and count:
+            market_value_cents = int(mark_cents) * int(count)
         pnl_cents = _extract_money_cents(
             p,
             cents_keys=[
                 "unrealized_pnl_cents",
-                "realized_pnl_cents",
                 "pnl_cents",
             ],
             dollar_keys=[
                 "unrealized_pnl_dollars",
                 "unrealized_pnl",
-                "realized_pnl_dollars",
-                "realized_pnl",
                 "pnl",
             ],
         )
+        # For open position rows, prefer direct economics to avoid masking with realized=0.
+        if isinstance(cost_cents, int) and isinstance(market_value_cents, int):
+            pnl_cents = int(market_value_cents - cost_cents)
 
         rows.append(
             {
