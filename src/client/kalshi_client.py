@@ -231,7 +231,7 @@ class KalshiClient:
         headers = self._headers("POST", path)
         return requests.post(self.base_url + path, headers=headers, json=order)
 
-    def place_limit_at_best_ask(self, ticker, side, max_cost_cents=500):
+    def place_limit_at_best_ask(self, ticker, side, max_cost_cents=500, price_offsets=None):
         side = str(side).lower().strip()
         if side not in {"yes", "no"}:
             raise ValueError("side must be 'yes' or 'no'")
@@ -242,22 +242,44 @@ class KalshiClient:
         if ask_cents is None:
             raise RuntimeError(f"No top-of-book data available to infer {side.upper()} ask")
 
-        count = int(max_cost_cents // int(ask_cents))
-        if count < 1:
-            raise ValueError("Budget too small for 1 contract at this ask price")
+        offsets = price_offsets if price_offsets is not None else [-1, 0, -2]
+        normalized_offsets = []
+        for o in offsets:
+            try:
+                oi = int(o)
+            except Exception:
+                continue
+            if oi not in normalized_offsets:
+                normalized_offsets.append(oi)
+        if not normalized_offsets:
+            normalized_offsets = [0]
 
         path = "/trade-api/v2/portfolio/orders"
-        order = {
-            "ticker": ticker,
-            "action": "buy",
-            "side": side,
-            "count": count,
-            "type": "limit",
-            f"{side}_price": int(ask_cents),
-            "client_order_id": str(uuid.uuid4()),
-        }
         headers = self._headers("POST", path)
-        return requests.post(self.base_url + path, headers=headers, json=order)
+        last_resp = None
+        attempted_any = False
+        for off in normalized_offsets:
+            px = max(1, min(99, int(ask_cents) + int(off)))
+            count = int(max_cost_cents // int(px))
+            if count < 1:
+                continue
+            attempted_any = True
+            order = {
+                "ticker": ticker,
+                "action": "buy",
+                "side": side,
+                "count": count,
+                "type": "limit",
+                f"{side}_price": int(px),
+                "client_order_id": str(uuid.uuid4()),
+            }
+            resp = requests.post(self.base_url + path, headers=headers, json=order)
+            last_resp = resp
+            if resp.status_code in {200, 201}:
+                return resp
+        if not attempted_any:
+            raise ValueError("Budget too small for 1 contract across attempted price levels")
+        return last_resp
 
     def place_limit_order(self, ticker, action, side, price_cents, count, client_order_id=None):
         side = str(side).lower().strip()

@@ -378,32 +378,55 @@ def _enter_position(client: KalshiClient, selection: dict, config: FarthestBandC
             "active_position": active,
         }
 
-    resp = client.place_limit_order(
-        ticker=active["ticker"],
-        action="buy",
-        side=side,
-        price_cents=ask_cents,
-        count=count,
-    )
-    status_code = int(resp.status_code)
-    body = _safe_json(resp)
-    if status_code not in {200, 201}:
-        return {
-            "action": "hold",
-            "reason": f"Live buy failed with status {status_code}",
-            "mode": "live",
-            "status_code": status_code,
-            "response": body,
-            "selection": selection,
-            "active_position": None,
-        }
+    candidate_prices = []
+    for p in (ask_cents - 1, ask_cents, ask_cents - 2):
+        px = max(1, min(99, int(p)))
+        if px not in candidate_prices:
+            candidate_prices.append(px)
+
+    attempts = []
+    last_status_code = None
+    last_body = None
+    for px in candidate_prices:
+        resp = client.place_limit_order(
+            ticker=active["ticker"],
+            action="buy",
+            side=side,
+            price_cents=px,
+            count=count,
+        )
+        status_code = int(resp.status_code)
+        body = _safe_json(resp)
+        attempts.append(
+            {
+                "price_cents": int(px),
+                "count": int(count),
+                "status_code": status_code,
+            }
+        )
+        last_status_code = status_code
+        last_body = body
+        if status_code in {200, 201}:
+            active["entry_price_cents"] = int(px)
+            return {
+                "action": reason,
+                "mode": "live",
+                "status_code": status_code,
+                "response": body,
+                "attempts": attempts,
+                "selection": selection,
+                "active_position": active,
+            }
+
     return {
-        "action": reason,
+        "action": "hold",
+        "reason": f"Live buy failed with status {last_status_code}",
         "mode": "live",
-        "status_code": status_code,
-        "response": body,
+        "status_code": last_status_code,
+        "response": last_body,
+        "attempts": attempts,
         "selection": selection,
-        "active_position": active,
+        "active_position": None,
     }
 
 
