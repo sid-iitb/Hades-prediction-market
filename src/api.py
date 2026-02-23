@@ -1,4 +1,5 @@
 import datetime
+import secrets
 import html
 import json
 import os
@@ -6,13 +7,14 @@ import sqlite3
 import smtplib
 import threading
 import traceback
+from base64 import b64decode
 from datetime import timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 
 from src.client.kalshi_client import KalshiClient
@@ -492,6 +494,52 @@ def _parse_bool_env(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _is_protected_path(path: str) -> bool:
+    protected_prefixes = ("/dashboard", "/kalshi", "/strategy", "/ledger")
+    return any(path.startswith(prefix) for prefix in protected_prefixes)
+
+
+def _unauthorized_response() -> Response:
+    return Response(
+        status_code=401,
+        headers={"WWW-Authenticate": 'Basic realm="Hades Dashboard"'},
+    )
+
+
+@app.middleware("http")
+async def basic_auth_middleware(request: Request, call_next):
+    if not _parse_bool_env("BASIC_AUTH_ENABLED", False):
+        return await call_next(request)
+    if not _is_protected_path(request.url.path):
+        return await call_next(request)
+
+    expected_user = os.getenv("BASIC_AUTH_USER", "")
+    expected_pass = os.getenv("BASIC_AUTH_PASS", "")
+    if not expected_user or not expected_pass:
+        return Response(
+            content="BASIC_AUTH is enabled but BASIC_AUTH_USER/BASIC_AUTH_PASS are missing.",
+            status_code=500,
+        )
+
+    auth_header = request.headers.get("authorization", "")
+    if not auth_header.startswith("Basic "):
+        return _unauthorized_response()
+
+    token = auth_header.split(" ", 1)[1].strip()
+    try:
+        decoded = b64decode(token).decode("utf-8")
+        username, password = decoded.split(":", 1)
+    except Exception:
+        return _unauthorized_response()
+
+    user_ok = secrets.compare_digest(username, expected_user)
+    pass_ok = secrets.compare_digest(password, expected_pass)
+    if not (user_ok and pass_ok):
+        return _unauthorized_response()
+
+    return await call_next(request)
 
 
 def _format_local_ts(iso_ts: str | None) -> str:

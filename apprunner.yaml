@@ -16,6 +16,10 @@ run:
       value: https://api.elections.kalshi.com
     - name: KALSHI_DB_PATH
       value: /tmp/kalshi_ingest.db
+    - name: BASIC_AUTH_ENABLED
+      value: "true"
+    - name: BASIC_AUTH_USER
+      value: admin
     - name: LEDGER_EMAIL_ENABLED
       value: "true"
     - name: LEDGER_EMAIL_INTERVAL_MINUTES
@@ -49,3 +53,5 @@ run:
       value-from: "arn:aws:secretsmanager:us-east-1:763253192628:secret:hades/kalshi/private-key-Q6uVKp:KALSHI_PRIVATE_KEY_PEM::"
     - name: LEDGER_EMAIL_SMTP_PASS
       value-from: "arn:aws:secretsmanager:us-east-1:763253192628:secret:hades/ledger/smtp-pass-d6xIaN:LEDGER_EMAIL_SMTP_PASS::"
+    - name: BASIC_AUTH_PASS
+      value-from: "arn:aws:secretsmanager:us-east-1:763253192628:secret:hades/basic-auth/pass-lm8kEX:BASIC_AUTH_PASS::"
