@@ -3,6 +3,7 @@ Structured logging and console summary for the bot.
 """
 import json
 import logging
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -10,6 +11,46 @@ from typing import Any, Dict, List, Optional
 from bot.execution import ExecutionResult
 from bot.state import get_per_ticker_counts, get_total_order_count
 from bot.strategy import Signal
+
+# Console tee: writes to both stdout and console log file (append)
+_console_tee: Optional["_TeeWriter"] = None
+
+
+class _TeeWriter:
+    """Write to both stdout and a file (append mode)."""
+    def __init__(self, file_path: str):
+        self._stdout = sys.__stdout__
+        self._path = Path(file_path)
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._file = open(self._path, "a", encoding="utf-8")
+
+    def write(self, data: str):
+        self._stdout.write(data)
+        self._file.write(data)
+        self._file.flush()
+
+    def flush(self):
+        self._stdout.flush()
+        self._file.flush()
+
+    def close(self):
+        self._file.close()
+
+
+def setup_console_log(console_log_file: Optional[str], project_root: Optional[Path] = None) -> None:
+    """
+    Redirect stdout so console output is appended to console_log_file.
+    Call early in main(). Survives Ctrl+C and restart.
+    """
+    global _console_tee
+    if not console_log_file or not console_log_file.strip():
+        return
+    path = Path(console_log_file)
+    if not path.is_absolute() and project_root:
+        path = project_root / path
+    path = path.resolve()
+    _console_tee = _TeeWriter(str(path))
+    sys.stdout = _console_tee
 
 
 def setup_logging(log_file: str, level: str = "INFO") -> logging.Logger:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime
 import json
+from urllib.parse import quote
 import os
 import sqlite3
 import threading
@@ -10,9 +11,9 @@ from typing import Optional
 from datetime import timedelta, timezone
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 
 from src.client.kalshi_client import KalshiClient
@@ -30,6 +31,13 @@ _project_root = Path(__file__).resolve().parent.parent
 load_dotenv(_project_root / ".env")
 
 app = FastAPI()
+
+
+@app.get("/api/version")
+def api_version():
+    """Returns API version; use to verify you're hitting the right server."""
+    return {"version": "reports-with-why-v2", "why_column": "first"}
+
 
 # Enable CORS for frontend
 app.add_middleware(
@@ -58,6 +66,37 @@ def _open_ledger_db():
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _ensure_reports_hourly(conn):
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bot_reports_hourly (
+            id TEXT PRIMARY KEY,
+            generated_at TEXT,
+            hour_bucket_utc TEXT,
+            hour_window_id TEXT,
+            report_json TEXT,
+            report_tsv TEXT,
+            eval_hourly INTEGER,
+            entry_decisions_hourly INTEGER,
+            submitted_hourly INTEGER,
+            failed_hourly INTEGER,
+            skipped_hourly INTEGER,
+            stoploss_hourly INTEGER,
+            eval_fifteen INTEGER,
+            entry_decisions_fifteen INTEGER,
+            submitted_fifteen INTEGER,
+            failed_fifteen INTEGER,
+            skipped_fifteen INTEGER,
+            stoploss_fifteen INTEGER
+        )
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_reports_hour_bucket ON bot_reports_hourly(hour_bucket_utc)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_reports_window_id ON bot_reports_hourly(hour_window_id)")
+    conn.commit()
 
 
 def _ensure_trade_ledger(conn):
@@ -1382,6 +1421,147 @@ def get_trade_ledger(limit: int = 200):
         conn.close()
 
 
+@app.get("/api/reports/hourly")
+def list_reports_hourly(limit: int = 200, offset: int = 0):
+    limit = max(1, min(int(limit), 500))
+    offset = max(0, int(offset))
+    conn = _open_ledger_db()
+    try:
+        _ensure_reports_hourly(conn)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, generated_at, hour_bucket_utc, hour_window_id,
+                   eval_hourly, entry_decisions_hourly, submitted_hourly, failed_hourly, skipped_hourly, stoploss_hourly,
+                   eval_fifteen, entry_decisions_fifteen, submitted_fifteen, failed_fifteen, skipped_fifteen, stoploss_fifteen
+            FROM bot_reports_hourly
+            ORDER BY hour_bucket_utc DESC
+            LIMIT ? OFFSET ?
+            """,
+            (limit, offset),
+        )
+        rows = cur.fetchall()
+        out = []
+        for r in rows:
+            out.append({
+                "id": r["id"],
+                "generated_at": r["generated_at"],
+                "hour_bucket_utc": r["hour_bucket_utc"],
+                "hour_window_id": r["hour_window_id"],
+                "metrics": {
+                    "hourly": {
+                        "eval": r["eval_hourly"] or 0,
+                        "entry_decisions": r["entry_decisions_hourly"] or 0,
+                        "submitted": r["submitted_hourly"] or 0,
+                        "failed": r["failed_hourly"] or 0,
+                        "skipped": r["skipped_hourly"] or 0,
+                        "stoploss": r["stoploss_hourly"] or 0,
+                    },
+                    "fifteen_min": {
+                        "eval": r["eval_fifteen"] or 0,
+                        "entry_decisions": r["entry_decisions_fifteen"] or 0,
+                        "submitted": r["submitted_fifteen"] or 0,
+                        "failed": r["failed_fifteen"] or 0,
+                        "skipped": r["skipped_fifteen"] or 0,
+                        "stoploss": r["stoploss_fifteen"] or 0,
+                    },
+                },
+            })
+        return out
+    finally:
+        conn.close()
+
+
+def _recompute_report_from_log(report_id: str):
+    """Recompute report trade_rows/window_rows from bot log so UI shows current analysis logic. Returns report dict or None."""
+    parts = report_id.split("_")
+    if len(parts) < 3:
+        return None
+    hour_market_id = parts[2]
+    mid = (hour_market_id or "").upper()
+    asset = "eth" if "KXETHD" in mid or mid.startswith("KXETHD") else "btc"
+    try:
+        from tools.analyze_bot_log import build_summary_for_window_keys, parse_log_lines
+        from bot.market import get_15min_window_ids_for_hour
+    except Exception:
+        return None
+    window_keys = {("hourly", asset, hour_market_id)}
+    for w in get_15min_window_ids_for_hour(hour_market_id):
+        window_keys.add(("fifteen_min", asset, w))
+    log_path = "logs/bot.log"
+    try:
+        from bot.config_loader import load_config, resolve_config_path
+        cfg_path = resolve_config_path(_project_root)
+        if cfg_path.exists():
+            config = load_config(str(cfg_path))
+            log_cfg = config.get("logging", {}) or {}
+            if log_cfg.get("file"):
+                log_path = log_cfg["file"]
+    except Exception:
+        pass
+    log_file = _project_root / log_path if not Path(log_path).is_absolute() else Path(log_path)
+    if not log_file.exists():
+        return None
+    events = list(parse_log_lines(str(log_file)))
+    trade_rows, window_rows, totals_by_interval, block_aggregations = build_summary_for_window_keys(events, window_keys)
+    return {
+        "trade_rows": trade_rows,
+        "window_rows": window_rows,
+        "totals_by_interval": totals_by_interval,
+        "block_aggregations": block_aggregations,
+    }
+
+
+@app.get("/api/reports/hourly/{report_id}")
+def get_report_hourly(report_id: str, refresh: bool = False):
+    conn = _open_ledger_db()
+    try:
+        _ensure_reports_hourly(conn)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, generated_at, hour_bucket_utc, hour_window_id, report_json FROM bot_reports_hourly WHERE id = ?",
+            (report_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Report not found")
+        if refresh:
+            recomputed = _recompute_report_from_log(report_id)
+            if recomputed is not None:
+                report = recomputed
+            else:
+                report = json.loads(row["report_json"]) if row["report_json"] else {}
+        else:
+            report = json.loads(row["report_json"]) if row["report_json"] else {}
+        return {
+            "id": row["id"],
+            "generated_at": row["generated_at"],
+            "hour_bucket_utc": row["hour_bucket_utc"],
+            "hour_window_id": row["hour_window_id"],
+            "report": report,
+        }
+    finally:
+        conn.close()
+
+
+@app.get("/api/reports/hourly/{report_id}/tsv", response_class=Response)
+def get_report_hourly_tsv(report_id: str):
+    conn = _open_ledger_db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT report_tsv FROM bot_reports_hourly WHERE id = ?", (report_id,))
+        row = cur.fetchone()
+        if not row or not row["report_tsv"]:
+            raise HTTPException(status_code=404, detail="TSV not available")
+        return Response(
+            content=row["report_tsv"],
+            media_type="text/tab-separated-values",
+            headers={"Content-Disposition": f"attachment; filename=\"{report_id}.tsv\""},
+        )
+    finally:
+        conn.close()
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
     return """
@@ -1983,6 +2163,10 @@ def dashboard():
     </style>
   </head>
   <body>
+    <nav style="margin-bottom:12px;display:flex;gap:12px;">
+      <a href="/dashboard" style="color:var(--accent);">Dashboard</a>
+      <a href="/reports" style="color:var(--muted);">Reports</a>
+    </nav>
     <div class="wrap">
       <div class="card">
         <div class="grid">
@@ -2463,13 +2647,6 @@ def dashboard():
           const yesNum = parseNum(yesAskRaw);
           const rowHot = Number.isFinite(yesNum) && yesNum >= 90 && yesNum <= 99;
           const subtitle = m.subtitle || "";
-          const inRange = v => { const n = Math.round(v); return !isNaN(v) && n >= 85 && n <= 99; };
-          const yesInRange = inRange(yesAskVal);
-          const noInRange = inRange(noAskVal);
-          const classes = [];
-          if (yesInRange) classes.push('row-highlight-yes');
-          if (noInRange) classes.push('row-highlight-no');
-          const rowClass = classes.length ? ` class="${classes.join(' ')}"` : '';
           const inRange = v => { const n = Math.round(v); return !isNaN(v) && n >= 85 && n <= 99; };
           const yesInRange = inRange(parseNum(yesAskRaw));
           const noInRange = inRange(parseNum(noAskRaw));
@@ -3263,6 +3440,529 @@ def dashboard():
   </body>
 </html>
     """
+
+
+def _get_reports_list(limit: int = 50, offset: int = 0):
+    """Fetch reports list from DB for server-side rendering."""
+    limit = max(1, min(int(limit), 500))
+    offset = max(0, int(offset))
+    conn = _open_ledger_db()
+    try:
+        _ensure_reports_hourly(conn)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, generated_at, hour_bucket_utc, hour_window_id,
+                   eval_hourly, entry_decisions_hourly, submitted_hourly, failed_hourly, skipped_hourly, stoploss_hourly,
+                   eval_fifteen, entry_decisions_fifteen, submitted_fifteen, failed_fifteen, skipped_fifteen, stoploss_fifteen
+            FROM bot_reports_hourly
+            ORDER BY hour_bucket_utc DESC
+            LIMIT ? OFFSET ?
+            """,
+            (limit, offset),
+        )
+        return [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def _html_escape(s):
+    if s is None:
+        return ""
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def _get_report_detail(report_id: str, refresh: bool = False):
+    """Fetch full report from DB for server-side rendering. If refresh=True, recompute trade_rows from log."""
+    conn = _open_ledger_db()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, generated_at, hour_bucket_utc, hour_window_id, report_json FROM bot_reports_hourly WHERE id = ?",
+            (report_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        if refresh:
+            recomputed = _recompute_report_from_log(report_id)
+            report = recomputed if recomputed is not None else (json.loads(row["report_json"]) if row["report_json"] else {})
+        else:
+            report = json.loads(row["report_json"]) if row["report_json"] else {}
+        return {
+            "id": row["id"],
+            "generated_at": row["generated_at"],
+            "hour_bucket_utc": row["hour_bucket_utc"],
+            "hour_window_id": row["hour_window_id"],
+            "report": report,
+        }
+    finally:
+        conn.close()
+
+
+@app.get("/reports", response_class=HTMLResponse)
+def reports_page(limit: int = 50, offset: int = 0, id: Optional[str] = None):
+    reports_list = _get_reports_list(limit=limit, offset=offset)
+    selected_id = id
+    if not reports_list:
+        list_html = '<span class="empty">No reports found.</span>'
+        pagination_html = ""
+    else:
+        items = []
+        for r in reports_list:
+            rid = _html_escape(r.get("id", ""))
+            hb = _html_escape(r.get("hour_bucket_utc", ""))
+            mh = r.get("eval_hourly") or 0
+            mf = r.get("eval_fifteen") or 0
+            sel = ' class="report-item selected"' if rid == selected_id else ' class="report-item"'
+            items.append(
+                '<a href="/reports?limit=' + str(limit) + '&offset=' + str(offset) + '&id=' + quote(rid, safe="") + '"' + sel + '>'
+                '<div class="id">' + rid + '</div>'
+                '<div class="meta">' + hb + ' | Eval: ' + str(mh + mf) + '</div>'
+                '</a>'
+            )
+        list_html = "\n".join(items)
+        pagination_html = (
+            '<div class="pagination" id="pagination">'
+            '<button id="prev-btn" type="button">Prev</button>'
+            '<span id="page-info">Showing ' + str(offset + 1) + '-' + str(offset + len(reports_list)) + '</span>'
+            '<button id="next-btn" type="button">Next</button>'
+            '</div>'
+        )
+    page_limit = limit
+    page_offset = offset
+
+    detail_data = _get_report_detail(selected_id, refresh=True) if selected_id else None
+    if detail_data:
+        r = detail_data["report"]
+        h = r.get("totals_by_interval", {}).get("hourly", {})
+        f = r.get("totals_by_interval", {}).get("fifteen_min", {})
+        hourly = (h.get("eval_count") or 0, h.get("orders_submitted") or 0, h.get("exits_stoploss") or 0)
+        fifteen = (f.get("eval_count") or 0, f.get("orders_submitted") or 0, f.get("exits_stoploss") or 0)
+        trade_rows = r.get("trade_rows", [])
+        window_rows = r.get("window_rows", [])
+        wr = "".join(
+            "<tr><td>" + _html_escape(str(w.get("interval", ""))) + "</td><td>" + _html_escape(str(w.get("window_id", "")))
+            + "</td><td>" + str(w.get("eval_count", "")) + "</td><td>" + str(w.get("entry_decisions", ""))
+            + "</td><td>" + str(w.get("orders_submitted", "")) + "</td><td>" + str(w.get("orders_failed", ""))
+            + "</td><td>" + str(w.get("orders_skipped", "")) + "</td><td>" + str(w.get("exits_stoploss", "")) + "</td></tr>"
+            for w in window_rows
+        ) or "<tr><td colspan=\"8\" class=\"empty\">None</td></tr>"
+        def _drawer_content(t):
+            parts = []
+            br = t.get("block_reason") or t.get("exec_reason") or t.get("fail_or_skip_reason") or ""
+            er = t.get("entry_reason_compact") or ""
+            if br or er:
+                parts.append("<strong>Why:</strong> " + _html_escape(br or er))
+            raw = []
+            for k in ("distance", "min_distance_required", "dist_margin", "dist_status", "persistence_streak",
+                      "persistence_required", "persist_margin", "persist_status", "seconds_to_close",
+                      "cutoff_seconds", "cutoff_margin", "cutoff_status", "cap_current_total", "cap_max_total",
+                      "cap_current_ticker", "cap_max_ticker", "strike"):
+                v = t.get(k)
+                if v is not None and v != "":
+                    raw.append("%s=%s" % (k, v))
+            if raw:
+                parts.append("<br><strong>Raw:</strong> " + ", ".join(_html_escape(str(x)) for x in raw))
+            fallback = "Ticker: %s | Side: %s | Status: %s" % (
+                t.get("ticker", ""), t.get("side", ""), t.get("status", "")
+            )
+            return "".join(parts) if parts else ("<em>Details:</em> " + _html_escape(fallback))
+
+        tr_parts = []
+        for t in trade_rows:
+            drawer = _drawer_content(t)
+            why_val = t.get("fail_or_skip_reason") or t.get("block_reason") or t.get("exec_reason") or t.get("entry_reason_compact") or ""
+            br_val = t.get("block_reason") or t.get("exec_reason") or t.get("fail_or_skip_reason") or ""
+            why_display = _html_escape(str(why_val)) if why_val else "\u00a0"  # nbsp so column doesn't collapse
+            tr_parts.append(
+                "<tr class=\"trade-row\" data-block-reason=\"" + _html_escape(str(br_val)) + "\">"
+                "<td class=\"col-why\" style=\"min-width:120px;\" title=\"" + _html_escape(str(why_val)) + "\">" + why_display + "</td>"
+                "<td>" + _html_escape(str((t.get("ts_first_seen") or t.get("ts_entry_decision") or "")[:19])) + "</td>"
+                "<td>" + _html_escape(str(t.get("interval", ""))) + "</td>"
+                "<td>" + _html_escape(str(t.get("window_id", ""))) + "</td>"
+                "<td>" + _html_escape(str(t.get("ticker", ""))) + "</td>"
+                "<td>" + _html_escape(str(t.get("side", ""))) + "</td>"
+                "<td>" + _html_escape(str(t.get("status", ""))) + "</td>"
+                "<td>" + _html_escape(str(t.get("block_reason", ""))) + "</td>"
+                "<td>" + str(t.get("entry_price_cents", "")) + "</td>"
+                "<td class=\"col-description\" style=\"min-width:200px;max-width:400px;word-break:break-word;\">" + drawer + "</td>"
+                "</tr>"
+            )
+        tr = "".join(tr_parts) if tr_parts else "<tr><td colspan=\"10\" class=\"empty\">None</td></tr>"
+
+        block_agg = r.get("block_aggregations", {})
+        block_agg_html = ""
+        for interval, by_asset in block_agg.items():
+            for asset, data in by_asset.items():
+                top5 = data.get("top_5_block_reason", [])[:5]
+                if top5:
+                    chips = []
+                    for x in top5:
+                        reason = str(x.get("reason", ""))
+                        count = str(x.get("count", 0))
+                        chips.append(
+                            '<button type="button" class="block-reason-chip" data-block-reason="' + _html_escape(reason) + '" title="Filter Trade Rows">'
+                            + _html_escape(reason) + " (" + count + ")"
+                            + "</button>"
+                        )
+                    block_agg_html += "<div class=\"block-agg\"><strong>" + _html_escape(str(interval)) + " / " + _html_escape(str(asset)) + "</strong> Top blocks: <span class=\"block-chips\">" + " ".join(chips) + "</span> <button type=\"button\" class=\"block-reason-clear\" style=\"display:none;margin-left:6px;\">Show all</button></div>"
+
+        detail_html = (
+            '<a href="/api/reports/hourly/' + _html_escape(selected_id) + '/tsv" class="btn" download>Download TSV</a>'
+            '<div class="kpi-grid">'
+            '<div class="kpi-card"><div class="k">Hourly Eval</div><div class="v">' + str(hourly[0]) + '</div></div>'
+            '<div class="kpi-card"><div class="k">Hourly Submitted</div><div class="v">' + str(hourly[1]) + '</div></div>'
+            '<div class="kpi-card"><div class="k">Hourly Stop Loss</div><div class="v">' + str(hourly[2]) + '</div></div>'
+            '<div class="kpi-card"><div class="k">15min Eval</div><div class="v">' + str(fifteen[0]) + '</div></div>'
+            '<div class="kpi-card"><div class="k">15min Submitted</div><div class="v">' + str(fifteen[1]) + '</div></div>'
+            '<div class="kpi-card"><div class="k">15min Stop Loss</div><div class="v">' + str(fifteen[2]) + '</div></div>'
+            '</div>'
+            '<div class="section"><h4>Window Rows</h4><div style="max-height:180px;overflow:auto;">'
+            '<table><thead><tr><th>interval</th><th>window_id</th><th>eval</th><th>entry_dec</th><th>submitted</th><th>failed</th><th>skipped</th><th>stoploss</th></tr></thead><tbody>'
+            + wr + '</tbody></table></div></div>'
+            + (('<div class="section"><h4>Block summary</h4>' + block_agg_html + '</div>') if block_agg_html else "")
+            + '<div class="section"><h4>Trade Rows</h4><div style="max-height:320px;overflow:auto;">'
+            '<table><thead><tr><th class=\"col-why\">why</th><th>ts</th><th>interval</th><th>window_id</th><th>ticker</th><th>side</th><th>status</th><th>block_reason</th><th>entry_c</th><th>description</th></tr></thead><tbody>'
+            + tr + '</tbody></table></div></div>'
+        )
+    else:
+        detail_html = '<span class="empty">Select a report from the list.</span>'
+
+    html = """
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Hourly Reports</title>
+    <style>
+      :root {
+        --bg-1: #0b1020;
+        --bg-2: #141b2f;
+        --accent: #f4c430;
+        --text: #eef2ff;
+        --muted: #9aa4bf;
+        --card: rgba(255, 255, 255, 0.06);
+        --border: rgba(255, 255, 255, 0.12);
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        color: var(--text);
+        background: linear-gradient(160deg, var(--bg-1), var(--bg-2));
+        font-family: "Space Grotesk", "IBM Plex Sans", "Segoe UI", sans-serif;
+        padding: 12px;
+      }
+      nav { margin-bottom: 12px; display: flex; gap: 12px; }
+      nav a { color: var(--muted); text-decoration: none; }
+      nav a:hover, nav a.active { color: var(--accent); }
+      .reports-layout {
+        display: grid;
+        grid-template-columns: 320px 1fr;
+        gap: 16px;
+        max-width: 1600px;
+        margin: 0 auto;
+      }
+      .list-panel, .detail-panel {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 16px;
+        min-height: 400px;
+      }
+      .list-panel h3, .detail-panel h3 {
+        margin: 0 0 12px 0;
+        font-size: 13px;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+      }
+      .report-item {
+        display: block;
+        padding: 10px 12px;
+        border-radius: 8px;
+        cursor: pointer;
+        font-size: 13px;
+        border: 1px solid transparent;
+        margin-bottom: 4px;
+        color: inherit;
+        text-decoration: none;
+      }
+      .report-item:hover { background: rgba(255, 255, 255, 0.06); }
+      .report-item.selected {
+        background: rgba(244, 196, 48, 0.15);
+        border-color: rgba(244, 196, 48, 0.4);
+      }
+      .report-item .id { color: var(--text); }
+      .report-item .meta { color: var(--muted); font-size: 11px; margin-top: 4px; }
+      .kpi-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 10px;
+        margin-bottom: 16px;
+      }
+      .kpi-card {
+        background: rgba(255, 255, 255, 0.04);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 10px;
+      }
+      .kpi-card .k { font-size: 11px; color: var(--muted); text-transform: uppercase; }
+      .kpi-card .v { font-size: 18px; font-weight: 700; margin-top: 4px; }
+      .section { margin-bottom: 16px; }
+      .section h4 { font-size: 12px; color: var(--muted); margin: 0 0 8px 0; }
+      table { width: 100%; border-collapse: collapse; font-size: 12px; }
+      th, td { padding: 6px 8px; border-bottom: 1px solid var(--border); text-align: left; }
+      th { color: var(--muted); font-size: 11px; text-transform: uppercase; }
+      .btn {
+        padding: 6px 12px;
+        border-radius: 8px;
+        border: 1px solid var(--border);
+        background: rgba(244, 196, 48, 0.18);
+        color: var(--accent);
+        font-size: 12px;
+        cursor: pointer;
+        text-decoration: none;
+        display: inline-block;
+        margin-bottom: 12px;
+      }
+      .btn:hover { background: rgba(244, 196, 48, 0.26); }
+      .empty { color: var(--muted); font-style: italic; }
+      .loading { color: var(--muted); }
+      .trade-row:hover { background: rgba(255, 255, 255, 0.06); }
+      .section table { table-layout: auto; width: 100%; }
+      th.col-why, td.col-why { min-width: 120px !important; width: 120px; word-break: break-word; }
+      .row-details summary::-webkit-details-marker { color: var(--accent); }
+      .row-details[open] .drawer-content { display: block; }
+      .drawer-content { font-size: 12px; color: var(--text); line-height: 1.5; padding: 10px 12px; background: rgba(0, 0, 0, 0.4); border-top: 1px solid var(--border); }
+      .block-agg { font-size: 12px; margin-bottom: 8px; }
+      .pagination { margin-top: 12px; display: flex; gap: 8px; align-items: center; }
+      .pagination button {
+        padding: 4px 10px;
+        border-radius: 6px;
+        border: 1px solid var(--border);
+        background: rgba(255, 255, 255, 0.06);
+        color: var(--text);
+        cursor: pointer;
+        font-size: 12px;
+      }
+      .pagination button:disabled { opacity: 0.5; cursor: not-allowed; }
+      .block-reason-chip {
+        cursor: pointer;
+        padding: 2px 8px;
+        margin: 0 2px;
+        border-radius: 6px;
+        border: 1px solid var(--border);
+        background: rgba(255,255,255,0.06);
+        color: var(--text);
+        font-size: 12px;
+      }
+      .block-reason-chip:hover { background: rgba(244,196,48,0.2); border-color: var(--accent); }
+      .block-reason-chip.active { background: rgba(244,196,48,0.25); border-color: var(--accent); color: var(--accent); }
+      .block-reason-clear { cursor: pointer; padding: 2px 8px; font-size: 11px; border-radius: 6px; border: 1px solid var(--border); background: rgba(255,255,255,0.06); color: var(--muted); }
+      .block-reason-clear:hover { color: var(--accent); }
+    </style>
+  </head>
+  <body>
+    <nav>
+      <a href="/dashboard">Dashboard</a>
+      <a href="/reports" class="active">Reports</a>
+    </nav>
+    <div class="reports-layout">
+      <div class="list-panel">
+        <h3>Hourly Reports</h3>
+        <div id="list-body">""" + list_html + """</div>
+        """ + pagination_html + """
+      </div>
+      <div class="detail-panel">
+        <h3>Report Detail</h3>
+        <div id="detail-body">""" + detail_html + """</div>
+      </div>
+    </div>
+    <script>
+      const API = (typeof window !== "undefined" && window.location && window.location.origin) ? window.location.origin : "";
+      const PAGE_LIMIT = """ + str(page_limit) + """;
+      const PAGE_OFFSET = """ + str(page_offset) + """;
+      let limit = PAGE_LIMIT;
+      let offset = PAGE_OFFSET;
+      let reports = [];
+      let selectedId = null;
+
+      function fetchWithTimeout(url, ms) {
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(), ms);
+        return fetch(url, { signal: ctrl.signal }).finally(() => clearTimeout(t));
+      }
+
+      async function loadList() {
+        const el = document.getElementById("list-body");
+        el.innerHTML = "<span class=\"loading\">Loading...</span>";
+        el.className = "loading";
+        try {
+          const url = API + "/api/reports/hourly?limit=" + limit + "&offset=" + offset;
+          const res = await fetchWithTimeout(url, 10000);
+          if (!res.ok) throw new Error("HTTP " + res.status);
+          reports = await res.json();
+          if (!reports.length) {
+            el.innerHTML = "<span class=\"empty\">No reports found.</span><br><button class=\"btn\" type=\"button\" onclick=\"loadList()\" style=\"margin-top:8px;\">Retry</button>";
+            document.getElementById("pagination").style.display = "none";
+            return;
+          }
+          el.innerHTML = reports.map(r => `
+            <div class="report-item" data-id="${r.id}">
+              <div class="id">${r.id}</div>
+              <div class="meta">${r.hour_bucket_utc || ""} | Eval: ${(r.metrics?.hourly?.eval ?? 0) + (r.metrics?.fifteen_min?.eval ?? 0)}</div>
+            </div>
+          `).join("");
+          el.querySelectorAll(".report-item").forEach(item => {
+            item.addEventListener("click", () => selectReport(item.dataset.id));
+          });
+          document.getElementById("pagination").style.display = "flex";
+          document.getElementById("page-info").textContent = `Showing ${offset + 1}-${offset + reports.length}`;
+          if (selectedId) {
+            el.querySelector(`[data-id="${selectedId}"]`)?.classList.add("selected");
+          }
+        } catch (e) {
+          const msg = e.name === "AbortError" ? "Request timed out." : ("Error: " + (e.message || "Failed to load"));
+          el.innerHTML = "<span class=\"empty\">" + msg + "</span><br><button class=\"btn\" type=\"button\" onclick=\"loadList()\" style=\"margin-top:8px;\">Retry</button>";
+          document.getElementById("pagination").style.display = "none";
+        }
+      }
+
+      async function selectReport(id) {
+        selectedId = id;
+        document.querySelectorAll(".report-item").forEach(el => el.classList.remove("selected"));
+        document.querySelector(`[data-id="${id}"]`)?.classList.add("selected");
+        const el = document.getElementById("detail-body");
+        el.innerHTML = "<span class=\"loading\">Loading...</span>";
+        try {
+          const res = await fetchWithTimeout(API + "/api/reports/hourly/" + encodeURIComponent(id) + "?refresh=1", 10000);
+          if (!res.ok) throw new Error("Not found");
+          const data = await res.json();
+          const r = data.report || {};
+          const h = r.totals_by_interval?.hourly || {};
+          const f = r.totals_by_interval?.fifteen_min || {};
+          const hourly = { eval: h.eval_count ?? 0, entry_decisions: h.entry_decisions ?? 0, submitted: h.orders_submitted ?? 0, failed: h.orders_failed ?? 0, skipped: h.orders_skipped ?? 0, stoploss: h.exits_stoploss ?? 0 };
+          const fifteen = { eval: f.eval_count ?? 0, entry_decisions: f.entry_decisions ?? 0, submitted: f.orders_submitted ?? 0, failed: f.orders_failed ?? 0, skipped: f.orders_skipped ?? 0, stoploss: f.exits_stoploss ?? 0 };
+          const tradeRows = r.trade_rows || [];
+          const windowRows = r.window_rows || [];
+          const blockAgg = r.block_aggregations || {};
+          let blockAggHtml = "";
+          for (const [interval, byAsset] of Object.entries(blockAgg)) {
+            for (const [asset, data] of Object.entries(byAsset || {})) {
+              const top5 = (data.top_5_block_reason || []).slice(0, 5);
+              if (top5.length) {
+                const chips = top5.map(x => `<button type="button" class="block-reason-chip" data-block-reason="${(x.reason || "").replace(/"/g, "&quot;")}" title="Filter Trade Rows">${(x.reason || "")} (${x.count || 0})</button>`).join(" ");
+                blockAggHtml += `<div class="block-agg"><strong>${interval} / ${asset}</strong> Top blocks: <span class="block-chips">${chips}</span> <button type="button" class="block-reason-clear" style="display:none;margin-left:6px;">Show all</button></div>`;
+              }
+            }
+          }
+          function drawerContent(t) {
+            const br = t.block_reason || t.exec_reason || t.fail_or_skip_reason || "";
+            const er = t.entry_reason_compact || "";
+            let parts = [];
+            if (br || er) parts.push("<strong>Why:</strong> " + (br || er));
+            const rawKeys = ["distance", "min_distance_required", "dist_margin", "dist_status", "persistence_streak", "persistence_required", "persist_margin", "persist_status", "seconds_to_close", "cutoff_seconds", "cutoff_margin", "cutoff_status", "cap_current_total", "cap_max_total", "cap_current_ticker", "cap_max_ticker", "strike"];
+            const raw = rawKeys.filter(k => t[k] != null && t[k] !== "").map(k => k + "=" + t[k]);
+            if (raw.length) parts.push("<br><strong>Raw:</strong> " + raw.join(", "));
+            return parts.length ? parts.join("") : ("<em>Details:</em> Ticker: " + (t.ticker || "") + " | Side: " + (t.side || "") + " | Status: " + (t.status || ""));
+          }
+          const esc = s => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
+          const tradeRowsHtml = tradeRows.length ? tradeRows.map(t => {
+            const br = t.block_reason || t.exec_reason || t.fail_or_skip_reason || "";
+            const why = t.fail_or_skip_reason || t.block_reason || t.exec_reason || t.entry_reason_compact || "";
+            const whyDisplay = why ? esc(why) : "\u00a0";
+            const ts = (t.ts_first_seen || t.ts_entry_decision || "").slice(0, 19);
+            const drawer = drawerContent(t);
+            return `<tr class="trade-row" data-block-reason="${esc(br)}"><td class="col-why" style="min-width:120px" title="${esc(why)}">${whyDisplay}</td><td>${esc(ts)}</td><td>${esc(t.interval)}</td><td>${esc(t.window_id)}</td><td>${esc(t.ticker)}</td><td>${esc(t.side)}</td><td>${esc(t.status)}</td><td>${esc(t.block_reason)}</td><td>${t.entry_price_cents ?? ""}</td><td class="col-description" style="min-width:200px;max-width:400px;word-break:break-word;">${drawer}</td></tr>`;
+          }).join("") : '<tr><td colspan="10" class="empty">None</td></tr>';
+          el.innerHTML = `
+            <a href="/api/reports/hourly/${encodeURIComponent(id)}/tsv" class="btn" download>Download TSV</a>
+            <div class="kpi-grid">
+              <div class="kpi-card"><div class="k">Hourly Eval</div><div class="v">${hourly.eval}</div></div>
+              <div class="kpi-card"><div class="k">Hourly Submitted</div><div class="v">${hourly.submitted}</div></div>
+              <div class="kpi-card"><div class="k">Hourly Stop Loss</div><div class="v">${hourly.stoploss}</div></div>
+              <div class="kpi-card"><div class="k">15min Eval</div><div class="v">${fifteen.eval}</div></div>
+              <div class="kpi-card"><div class="k">15min Submitted</div><div class="v">${fifteen.submitted}</div></div>
+              <div class="kpi-card"><div class="k">15min Stop Loss</div><div class="v">${fifteen.stoploss}</div></div>
+            </div>
+            <div class="section">
+              <h4>Window Rows</h4>
+              <div style="max-height:180px;overflow:auto;">
+                <table>
+                  <thead><tr><th>interval</th><th>window_id</th><th>eval</th><th>entry_dec</th><th>submitted</th><th>failed</th><th>skipped</th><th>stoploss</th></tr></thead>
+                  <tbody>
+                    ${windowRows.length ? windowRows.map(w => `<tr><td>${w.interval || ""}</td><td>${w.window_id || ""}</td><td>${w.eval_count ?? ""}</td><td>${w.entry_decisions ?? ""}</td><td>${w.orders_submitted ?? ""}</td><td>${w.orders_failed ?? ""}</td><td>${w.orders_skipped ?? ""}</td><td>${w.exits_stoploss ?? ""}</td></tr>`).join("") : "<tr><td colspan=\"8\" class=\"empty\">None</td></tr>"}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+            ${blockAggHtml ? '<div class="section"><h4>Block summary</h4>' + blockAggHtml + '</div>' : ""}
+            <div class="section">
+              <h4>Trade Rows</h4>
+              <div style="max-height:320px;overflow:auto;">
+                <table>
+                  <thead><tr><th class="col-why">why</th><th>ts</th><th>interval</th><th>window_id</th><th>ticker</th><th>side</th><th>status</th><th>block_reason</th><th>entry_c</th><th>description</th></tr></thead>
+                  <tbody>${tradeRowsHtml}</tbody>
+                </table>
+              </div>
+            </div>
+          `;
+        } catch (e) {
+          el.innerHTML = "<span class=\"empty\">Failed to load report.</span>";
+        }
+      }
+
+      var prevBtn = document.getElementById("prev-btn");
+      var nextBtn = document.getElementById("next-btn");
+      if (prevBtn) prevBtn.addEventListener("click", function() {
+        if (offset >= limit) location.href = "/reports?limit=" + limit + "&offset=" + (offset - limit);
+      });
+      if (nextBtn) nextBtn.addEventListener("click", function() {
+        location.href = "/reports?limit=" + limit + "&offset=" + (offset + limit);
+      });
+
+      document.addEventListener("DOMContentLoaded", function init() {
+        const params = new URLSearchParams(window.location.search);
+        const idFromUrl = params.get("id");
+        if (idFromUrl) {
+          selectedId = idFromUrl;
+          loadList().then(function() {
+            selectReport(selectedId);
+          });
+        }
+        document.body.addEventListener("click", function(e) {
+          const chip = e.target.closest(".block-reason-chip");
+          const clearBtn = e.target.closest(".block-reason-clear");
+          if (chip) {
+            const reason = chip.dataset.blockReason || "";
+            document.querySelectorAll(".trade-row").forEach(function(tr) {
+              tr.style.display = (tr.dataset.blockReason === reason) ? "" : "none";
+            });
+            document.querySelectorAll(".block-reason-chip").forEach(function(b) { b.classList.remove("active"); });
+            chip.classList.add("active");
+            chip.closest(".block-agg")?.querySelectorAll(".block-reason-clear").forEach(function(b) { b.style.display = "inline"; });
+          } else if (clearBtn) {
+            document.querySelectorAll(".trade-row").forEach(function(tr) { tr.style.display = ""; });
+            document.querySelectorAll(".block-reason-chip").forEach(function(b) { b.classList.remove("active"); });
+            document.querySelectorAll(".block-reason-clear").forEach(function(b) { b.style.display = "none"; });
+          }
+        });
+      });
+    </script>
+  </body>
+</html>
+    """
+    return HTMLResponse(
+        content=html,
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
 
 
 if __name__ == "__main__":

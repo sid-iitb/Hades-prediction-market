@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import yaml
 from dotenv import load_dotenv
 
+from bot.config_loader import load_config
 from bot.market import fetch_15min_market_result
 from bot.outcomes_15min import get_stored_outcome
 
@@ -27,9 +28,6 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 KALSHI_API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 
 
-def load_config(config_path: str) -> dict:
-    with open(config_path) as f:
-        return yaml.safe_load(f) or {}
 
 
 def parse_log_line(line: str) -> Optional[Dict]:

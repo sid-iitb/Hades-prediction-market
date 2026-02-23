@@ -20,6 +20,7 @@ from bot.market import TickerQuote
 from bot.state import get_ticker_order_count, get_total_order_count, increment_order_count
 import tempfile
 import os
+from bot.main import _select_hourly_stoploss_roll_ticker
 
 
 class TestTimeComputations(unittest.TestCase):
@@ -118,6 +119,34 @@ class TestThresholdChecks(unittest.TestCase):
         self.assertEqual(len(signals), 1)
         self.assertEqual(signals[0].side, "yes")
         self.assertEqual(signals[0].reason, "YES_BUY")
+
+
+class TestStoplossRollSelection(unittest.TestCase):
+    def test_roll_yes_picks_next_lower_strike(self):
+        quotes = [
+            TickerQuote("STOPPED", 2000, yes_ask=85, no_ask=10, yes_bid=84, no_bid=9, subtitle=""),
+            TickerQuote("A", 1990, yes_ask=80, no_ask=20, yes_bid=79, no_bid=19, subtitle=""),
+            TickerQuote("B", 1980, yes_ask=80, no_ask=25, yes_bid=79, no_bid=24, subtitle=""),
+        ]
+        picked = _select_hourly_stoploss_roll_ticker(
+            quotes, stopped_ticker="STOPPED", side="yes",
+            stopped_strike=2000, ask_min_cents=70, ask_max_cents=98,
+        )
+        self.assertIsNotNone(picked)
+        self.assertEqual(picked.ticker, "A")
+
+    def test_roll_no_picks_next_higher_strike(self):
+        quotes = [
+            TickerQuote("STOPPED", 2000, yes_ask=85, no_ask=85, yes_bid=84, no_bid=84, subtitle=""),
+            TickerQuote("A", 2010, yes_ask=10, no_ask=80, yes_bid=9, no_bid=79, subtitle=""),
+            TickerQuote("B", 2020, yes_ask=10, no_ask=80, yes_bid=9, no_bid=79, subtitle=""),
+        ]
+        picked = _select_hourly_stoploss_roll_ticker(
+            quotes, stopped_ticker="STOPPED", side="no",
+            stopped_strike=2000, ask_min_cents=70, ask_max_cents=98,
+        )
+        self.assertIsNotNone(picked)
+        self.assertEqual(picked.ticker, "A")
 
     def test_generate_signals_no_only(self):
         quotes = [

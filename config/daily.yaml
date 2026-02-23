@@ -1,0 +1,50 @@
+# Daily: Iron Condor / Basket Scalping strategy
+# Two-speed schedule: 30 min normally, 5 min in last 4 hours
+# Profit zone: 65-80¢ for both YES and NO legs
+
+daily:
+  spot_window: 5000
+  spot_window_by_asset:
+    btc: 5000
+    eth: 500
+
+  # The 2-Speed Schedule
+  schedule:
+    interval_minutes: 30         # Run every 30 mins normally
+    lookahead_hours: 24          # Only look at today's market
+    late_window_minutes: 240     # Start aggressive hunting 4 hours before close
+    late_interval_minutes: 5     # Run every 5 mins in the late window
+
+  # The "Profit Zone" Thresholds (Caps the top at 80¢)
+  thresholds:
+    normal:
+      yes_min: 65
+      yes_max: 80
+      no_min: 65
+      no_max: 80
+    late:
+      yes_min: 65
+      yes_max: 80
+      no_min: 65
+      no_max: 80
+
+  risk_guards:
+    enabled: true
+    no_new_entry_cutoff_seconds: 1800  # Stop entering in the final 30 mins (avoids flash crashes)
+    persistence_polls: 1               # Enter/Exit instantly on a valid 5-min poll
+    distance_buffer:
+      enabled: true
+      assets:
+        btc: { pct: 0.0075, floor_usd: 500 }  # Requires 500 points of padding for 80¢ entry
+        eth: { pct: 0.0100, floor_usd: 30 }   # Requires 30 points of padding for 80¢ entry
+
+  # Basket Scalping Architecture (Iron Condor)
+  basket_scalping:
+    enabled: true
+    take_profit_pct: 0.05       # Exit BOTH legs if combined profit is >= 5% of entry cost
+    cooldown_minutes: 60        # Wait 1 hour after a basket profit before re-entering that market
+
+  exit_criteria:
+    stop_loss_pct: 0.35                # Individual Leg Stop Loss at -35%
+    evaluation_interval_minutes: 5     # Check SL/TP every 5 minutes
+    panic_stop_loss_pct: 0.60         # Glass-break emergency exit

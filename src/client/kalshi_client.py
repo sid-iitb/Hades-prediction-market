@@ -82,13 +82,19 @@ class KalshiClient:
         return resp.json()
 
     def get_top_of_book(self, ticker):
-        data = self.get_market_orderbook(ticker, depth=1)
+        """
+        Kalshi orderbook returns bids only; arrays are sorted ascending by price,
+        so the best (highest) bid is the last element, not the first.
+        """
+        # Request multiple levels so we can take the last (best bid); API sorts ascending.
+        data = self.get_market_orderbook(ticker, depth=10)
         orderbook = data.get("orderbook", {})
         yes = orderbook.get("yes", [])
         no = orderbook.get("no", [])
 
-        best_yes_bid = self._extract_price(yes[0]) if yes else None
-        best_no_bid = self._extract_price(no[0]) if no else None
+        # Best bid = highest price = last element (ascending order per Kalshi docs)
+        best_yes_bid = self._extract_price(yes[-1]) if yes else None
+        best_no_bid = self._extract_price(no[-1]) if no else None
 
         yes_ask = 100 - best_no_bid if best_no_bid is not None else None
         no_ask = 100 - best_yes_bid if best_yes_bid is not None else None
@@ -99,6 +105,29 @@ class KalshiClient:
             "yes_ask": yes_ask,
             "no_ask": no_ask,
         }
+
+    def get_order(self, order_id: str):
+        """
+        Fetch a single order by ID.
+        Returns order dict with status (resting|canceled|executed), fill_count, remaining_count, etc.
+        """
+        path = f"/trade-api/v2/portfolio/orders/{order_id}"
+        headers = self._headers("GET", path)
+        resp = requests.get(self.base_url + path, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("order", data)
+
+    def cancel_order(self, order_id: str):
+        """
+        Cancel an order (reduces remaining contracts to zero).
+        Returns response with order and reduced_by info.
+        """
+        path = f"/trade-api/v2/portfolio/orders/{order_id}"
+        headers = self._headers("DELETE", path)
+        resp = requests.delete(self.base_url + path, headers=headers)
+        resp.raise_for_status()
+        return resp.json() if resp.text else {}
 
     def get_orders(self, status=None, ticker=None, cursor=None, limit=100):
         """
@@ -228,7 +257,7 @@ class KalshiClient:
         headers = self._headers("POST", path)
         return requests.post(self.base_url + path, headers=headers, json=order)
 
-    def place_limit_at_best_ask(self, ticker, side, max_cost_cents=500):
+    def place_limit_at_best_ask(self, ticker, side, max_cost_cents=500, client_order_id=None):
         side = str(side).lower().strip()
         if side not in {"yes", "no"}:
             raise ValueError("side must be 'yes' or 'no'")
@@ -251,7 +280,7 @@ class KalshiClient:
             "count": count,
             "type": "limit",
             f"{side}_price": int(ask_cents),
-            "client_order_id": str(uuid.uuid4()),
+            "client_order_id": client_order_id or str(uuid.uuid4()),
         }
         headers = self._headers("POST", path)
         return requests.post(self.base_url + path, headers=headers, json=order)

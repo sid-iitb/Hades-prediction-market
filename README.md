@@ -194,17 +194,20 @@ The bot runs in **OBSERVE** mode by default (no trading). Use **TRADE** mode onl
 
 ```bash
 # OBSERVE mode (default) - log signals, no orders
-python -m bot.main --config config.yaml
+python -m bot.main --config config/config.yaml
 
 # Run once and exit (no loop)
-python -m bot.main --config config.yaml --once
+python -m bot.main --config config/config.yaml --once
+
+# Legacy: single-file config at project root
+python -m bot.main --config config.yaml
 ```
 
 ### Switch to TRADE mode
 
 1. Set env var: `export MODE=TRADE`
-2. Or edit `config.yaml`: `mode: TRADE`
-3. Run: `python -m bot.main --config config.yaml`
+2. Or edit `config/common.yaml`: `mode: TRADE`
+3. Run: `python -m bot.main --config config/config.yaml`
 
 ### Sample output (OBSERVE mode)
 
@@ -247,13 +250,17 @@ HADES BOT RUN SUMMARY
 - `bot/state.py` - SQLite persistence for order counts
 - `bot/logging.py` - Structured logs + console summary
 
-### Config (`config.yaml`)
+### Config (`config/`)
 
-- `mode`: OBSERVE | TRADE
-- `assets`: btc, eth, sol, xrp (15-min trading supports all four)
-- `thresholds`: normal (93-98), late (94-99)
-- `schedule`: interval_minutes=5, start_offset_minutes=1, late_window_minutes=10
-- `caps`: max_orders_per_ticker=5, max_total_orders_per_hour=50
+Split config for easier maintenance:
+- `config/common.yaml` - assets, intervals, caps, order, state, reports, logging (exit_criteria fallbacks only)
+- `config/hourly.yaml` - schedule (late window, risk guards), thresholds, exit_criteria, spot_window
+- `config/fifteen_min.yaml` - 15-min thresholds, risk guards, exit_criteria
+- `config/daily.yaml` - daily schedule, thresholds, risk guards, exit_criteria, spot_window
+- `config/weekly.yaml` - weekly schedule, thresholds, risk guards, exit_criteria, spot_window
+- `config/config.yaml` - main entry (loader merges all)
+
+Legacy single-file `config.yaml` at project root still works.
 
 ---
 
@@ -285,7 +292,8 @@ bot/
   state.py                      # SQLite persistence
   logging.py                    # Structured logging
 
-config.yaml                     # Bot config
+config/                         # Split config (common + interval files)
+config.yaml                     # Legacy single-file config (optional)
 logs/
   bot.log                       # Bot run logs (generated)
 ```

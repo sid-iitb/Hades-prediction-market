@@ -2,3 +2,7 @@ kalshi_private_key
 *.db
 .env
 logs/
+.venv/
+data/
+reports/
+console.log

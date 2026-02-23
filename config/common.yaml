@@ -1,0 +1,102 @@
+# Shared config: assets, schedule defaults, caps, order, state, reports, logging
+# Merged with interval-specific files (hourly, fifteen_min, daily, weekly)
+# exit_criteria and spot_window live in each interval file
+
+mode: TRADE  # OBSERVE | TRADE
+run_mode: both  # hourly | fifteen_min | both
+
+assets:
+  - btc
+  - eth
+  - sol
+
+intervals:
+  hourly:
+    enabled: true
+    assets: [btc, eth]
+    mode: TRADE
+  fifteen_min:
+    enabled: true
+    assets: [btc, ETH]
+    mode: TRADE
+  daily:
+    enabled: true
+    assets: [btc, eth]
+    mode: TRADE
+  weekly:
+    enabled: true
+    assets: [btc, eth]
+    mode: OBSERVE
+
+# Caps – per interval
+caps:
+  cap_scope: per_side
+  hourly:
+    max_orders_per_ticker: 10
+    max_total_orders_per_hour: 20
+  fifteen_min:
+    max_orders_per_ticker: 10
+    max_total_orders_per_15min: 20
+  daily:
+    max_orders_per_ticker: 1
+    max_total_orders_per_window: 2
+  weekly:
+    max_orders_per_ticker: 1
+    max_total_orders_per_window: 2
+
+# Order size: global defaults, per-interval, and per-asset overrides.
+# Use max_cost_cents_by_asset for liquidity differences (e.g. BTC > ETH > SOL > XRP).
+# max_limit_price_cents: when set (e.g. 99), place limit at this price so order can fill at any price up to it (e.g. 96-99).
+# ladder: try bid at ask-2, ask-1, ask back-to-back (50ms between). If no fill, fall back to ask for immediate fill.
+order:
+  contracts: 1
+  max_cost_cents: 100000
+  ladder:
+    enabled: true
+    offsets_from_ask: [2, 1, 0]   # try x-2, x-1, x (x=best ask)
+    wait_ms: 10
+  hourly:
+    contracts: 1
+    max_cost_cents: 100000
+    max_limit_price_cents: 99   # optional: place at 99 so fill can be 96-99
+    max_cost_cents_by_asset:
+      btc: 100
+      eth: 100
+      sol: 100
+      xrp: 100
+  fifteen_min:
+    contracts: 1
+    max_cost_cents: 100000
+    max_limit_price_cents: 99   # optional: fill at any price up to 99
+    ladder:
+      enabled: true
+    max_cost_cents_by_asset:
+      btc: 100
+      eth: 100
+      sol: 100
+      xrp: 100
+  daily:
+    contracts: 1
+    max_cost_cents: 100
+    max_limit_price_cents: 80   # optional: daily basket 65-80 band
+    ladder:
+      enabled: false   # daily uses different bands; ladder optional
+  weekly:
+    contracts: 1
+    max_cost_cents: 100
+
+# Global fallbacks only; per-interval exit_criteria in hourly/fifteen_min/daily/weekly
+exit_criteria:
+  profit_target_pct: null
+  stop_loss_persistence_polls: 1
+
+state:
+  db_path: data/bot_state.db
+
+reports:
+  db_path: data/kalshi_ingest.db
+
+logging:
+  file: logs/bot.log
+  level: INFO
+  console_log_file: logs/console.log

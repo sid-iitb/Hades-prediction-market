@@ -35,18 +35,18 @@ def generate_signals_farthest(
     Trade YES or NO depending on what's in range; if both, pick cheaper.
     Returns at most one Signal.
     """
+    # Support both { normal: {...}, late: {...} } and flat { yes_min, yes_max, no_min, no_max } for both.
+    band = thresholds.get("late") if ctx_late_window else thresholds.get("normal")
+    if band is None:
+        band = thresholds
+    yes_lo = band.get("yes_min", 94)
+    yes_hi = band.get("yes_max", 99)
+    no_lo = band.get("no_min", 94)
+    no_hi = band.get("no_max", 99)
     if ctx_late_window:
-        yes_lo = thresholds.get("late", {}).get("yes_min", 94)
-        yes_hi = thresholds.get("late", {}).get("yes_max", 99)
-        no_lo = thresholds.get("late", {}).get("no_min", 94)
-        no_hi = thresholds.get("late", {}).get("no_max", 99)
         yes_reason = "YES_BUY_LATE"
         no_reason = "NO_BUY_LATE"
     else:
-        yes_lo = thresholds.get("normal", {}).get("yes_min", 93)
-        yes_hi = thresholds.get("normal", {}).get("yes_max", 98)
-        no_lo = thresholds.get("normal", {}).get("no_min", 93)
-        no_hi = thresholds.get("normal", {}).get("no_max", 98)
         yes_reason = "YES_BUY"
         no_reason = "NO_BUY"
 
@@ -78,7 +78,14 @@ def generate_signals_farthest(
     if yes_qual and no_qual:
         if q.yes_ask == q.no_ask:
             return []
-        side = "yes" if (q.yes_ask or 999) < (q.no_ask or 999) else "no"
+        # Use spot vs strike for directional choice: strike > spot -> NO, strike < spot -> YES
+        strike = float(q.strike or 0)
+        if strike > spot:
+            side = "no"   # Spot below strike: bet price stays below (NO)
+        elif strike < spot:
+            side = "yes"  # Spot above strike: bet price stays above (YES)
+        else:
+            side = "yes" if (q.yes_ask or 999) < (q.no_ask or 999) else "no"
     elif yes_qual:
         side = "yes"
     else:
@@ -98,18 +105,17 @@ def generate_signals(
     Generate signals for all quotes.
     If both YES and NO qualify, pick the cheaper side. If equal, skip (AMBIGUOUS_BOTH_SIDES).
     """
+    band = thresholds.get("late") if ctx_late_window else thresholds.get("normal")
+    if band is None:
+        band = thresholds
+    yes_lo = band.get("yes_min", 94)
+    yes_hi = band.get("yes_max", 99)
+    no_lo = band.get("no_min", 94)
+    no_hi = band.get("no_max", 99)
     if ctx_late_window:
-        yes_lo = thresholds.get("late", {}).get("yes_min", 94)
-        yes_hi = thresholds.get("late", {}).get("yes_max", 99)
-        no_lo = thresholds.get("late", {}).get("no_min", 94)
-        no_hi = thresholds.get("late", {}).get("no_max", 99)
         yes_reason = "YES_BUY_LATE"
         no_reason = "NO_BUY_LATE"
     else:
-        yes_lo = thresholds.get("normal", {}).get("yes_min", 93)
-        yes_hi = thresholds.get("normal", {}).get("yes_max", 98)
-        no_lo = thresholds.get("normal", {}).get("no_min", 93)
-        no_hi = thresholds.get("normal", {}).get("no_max", 98)
         yes_reason = "YES_BUY"
         no_reason = "NO_BUY"
 

@@ -1,0 +1,262 @@
+# ARCHIVED: Legacy single-file config (was project root config.yaml).
+# This file used order.hourly.max_cost_cents: 5000 ($50), causing larger orders than intended.
+# Use split config instead: run with --config config/config.yaml (default).
+# Contents below are a copy of the original root config.yaml for reference only.
+
+# Bot Configuration - Phase 1: Verification Mode
+# Default: OBSERVE (no trading). Set MODE=TRADE to enable orders.
+
+mode: TRADE  # OBSERVE | TRADE
+run_mode: both  # hourly | fifteen_min | both
+
+assets:
+  - btc
+  - eth
+  - sol
+
+intervals:
+  hourly:
+    enabled: true
+    assets: [btc, eth]
+    mode: TRADE  # OBSERVE | TRADE (overrides top-level mode)
+  fifteen_min:
+    enabled: true
+    assets: [btc, ETH]  # sol, xrp very high volatility; 15-min not supported
+    mode: TRADE
+  daily:
+    enabled: true
+    assets: [btc, eth]
+    mode: OBSERVE  # DAILY/WEEKLY are OBSERVE-only (no orders)
+  weekly:
+    enabled: true
+    assets: [btc, eth]
+    mode: OBSERVE
+
+spot_window: 1500
+spot_window_by_asset:
+  btc: 1500
+  eth: 200
+  sol: 50
+  xrp: 1
+
+schedule:
+  late_window_minutes: 15
+  late_interval_minutes: 1
+  hourly_risk_guards:
+    enabled: true
+    no_new_entry_cutoff_seconds: 120
+    persistence_polls: 2
+    late_persistence_override:
+      enabled: false
+    stop_once_disable:
+      enabled: true
+      max_stopouts_per_ticker: 1
+    recent_cross:
+      enabled: true
+      from_below_cents: 90
+      to_at_least_cents: 94
+      extra_persistence_polls: 1
+    distance_buffer:
+      enabled: true
+      assets:
+        btc: { pct: 0.0025, floor_usd: 167 }
+        eth: { pct: 0.0050, floor_usd: 15 }
+    anchor_one_per_side:
+      enabled: true
+      lock_per_window: true
+      lock_on_stop_loss_only: true
+      recent_cross_penalty: 999
+    stoploss_roll_reentry:
+      enabled: true
+      ask_min_cents: 75
+      ask_max_cents: 98
+      order_size_multiplier: 5
+    hard_flip_exit:
+      enabled: false
+      enable_only_if_seconds_to_close_lte: 120
+
+thresholds:
+  yes_min: 90
+  yes_max: 99
+  no_min: 90
+  no_max: 99
+
+caps:
+  cap_scope: per_side
+  hourly:
+    max_orders_per_ticker: 10
+    max_total_orders_per_hour: 30
+  fifteen_min:
+    max_orders_per_ticker: 10
+    max_total_orders_per_15min: 20
+  daily:
+    max_orders_per_ticker: 3
+    max_total_orders_per_window: 5
+  weekly:
+    max_orders_per_ticker: 2
+    max_total_orders_per_window: 3
+
+fifteen_min:
+  late_window_seconds: 140
+  late_window_interval_seconds: 5
+  yes_min: 90
+  yes_max: 99
+  no_min: 90
+  no_max: 99
+  risk_guards:
+    enabled: true
+    no_new_entry_cutoff_seconds: 90
+    persistence_polls: 2
+    late_persistence_override:
+      enabled: false
+    hard_flip_exit: true
+    stop_once_disable:
+      enabled: true
+      max_stopouts_per_ticker: 1
+    recent_cross:
+      enabled: true
+      from_below_cents: 90
+      to_at_least_cents: 94
+      extra_persistence_polls: 1
+    distance_buffer:
+      enabled: true
+      assets:
+        btc: { pct: 0.0015, floor_usd: 100 }
+        eth: { pct: 0.0030, floor_usd: 8 }
+        sol: { pct: 0.0015, floor_usd: 0.11 }
+    reversal_after_stop:
+      enabled: true
+      max_reversals_per_ticker: 1
+      allow_inside_cutoff: true
+      require_opposite_price_at_least_cents: 98
+
+daily:
+  spot_window: 5000
+  spot_window_by_asset:
+    btc: 5000
+    eth: 500
+  schedule:
+    interval_minutes: 60
+    lookahead_hours: 48
+    late_window_minutes: 180
+    late_interval_minutes: 60
+  thresholds:
+    normal:
+      yes_min: 65
+      yes_max: 98
+      no_min: 65
+      no_max: 98
+    late:
+      yes_min: 65
+      yes_max: 98
+      no_min: 65
+      no_max: 98
+  risk_guards:
+    enabled: true
+    no_new_entry_cutoff_seconds: 14400
+    persistence_polls: 1
+    stop_once_disable:
+      enabled: true
+      max_stopouts_per_ticker: 1
+    recent_cross:
+      enabled: true
+      from_below_cents: 90
+      to_at_least_cents: 94
+      extra_persistence_polls: 1
+    distance_buffer:
+      enabled: false
+      assets:
+        btc: { pct: 0.0015, floor_usd: 100 }
+        eth: { pct: 0.0030, floor_usd: 8 }
+    anchor_one_per_side:
+      enabled: false
+
+weekly:
+  spot_window: 10000
+  spot_window_by_asset:
+    btc: 10000
+    eth: 1000
+  schedule:
+    interval_minutes: 360
+    lookahead_days: 14
+    late_window_minutes: 1440
+    late_interval_minutes: 360
+  thresholds:
+    normal:
+      yes_min: 65
+      yes_max: 98
+      no_min: 65
+      no_max: 98
+    late:
+      yes_min: 65
+      yes_max: 98
+      no_min: 65
+      no_max: 98
+  risk_guards:
+    enabled: true
+    no_new_entry_cutoff_seconds: 86400
+    persistence_polls: 1
+    stop_once_disable:
+      enabled: true
+      max_stopouts_per_ticker: 1
+    recent_cross:
+      enabled: true
+      from_below_cents: 90
+      to_at_least_cents: 94
+      extra_persistence_polls: 1
+    distance_buffer:
+      enabled: false
+      assets:
+        btc: { pct: 0.0015, floor_usd: 100 }
+        eth: { pct: 0.0030, floor_usd: 8 }
+    anchor_one_per_side:
+      enabled: false
+
+order:
+  contracts: 1
+  max_cost_cents: 1000
+  hourly:
+    contracts: 1
+    max_cost_cents: 5000
+  fifteen_min:
+    contracts: 1
+    max_cost_cents: 5000
+  daily:
+    contracts: 1
+    max_cost_cents: 100
+  weekly:
+    contracts: 1
+    max_cost_cents: 100
+
+exit_criteria:
+  profit_target_pct: null
+  stop_loss_persistence_polls: 2
+  hourly:
+    stop_loss_pct: 0.30
+    panic_stop_loss_pct: 0.50
+    evaluation_interval_seconds: 60
+  fifteen_min:
+    stop_loss_pct: 0.50
+    panic_stop_loss_pct: 0.70
+    evaluation_interval_seconds: 15
+  daily:
+    stop_loss_pct: 0.30
+    profit_target_pct: 0.10
+    evaluation_interval_minutes: 60
+    stop_loss_persistence_polls: 1
+  weekly:
+    stop_loss_pct: 0.30
+    profit_target_pct: 0.10
+    evaluation_interval_minutes: 360
+    stop_loss_persistence_polls: 1
+
+state:
+  db_path: data/bot_state.db
+
+reports:
+  db_path: data/kalshi_ingest.db
+
+logging:
+  file: logs/bot.log
+  level: INFO
+  console_log_file: logs/console.log

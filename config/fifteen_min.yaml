@@ -1,0 +1,41 @@
+# 15-min: entry window + exit criteria (aligned), then price bands and risk guards
+
+fifteen_min:
+  # --- Entry window & exit criteria (same window: bot sleeps until seconds_to_close <= late_window_seconds) ---
+  late_window_seconds: 120   # entry: start trading when seconds_to_close <= this
+  late_window_interval_seconds: 10  # entry: run bot every N sec while in window
+  exit_criteria:             # exit: same interval as entry so exit is evaluated every run (no conflict)
+    stop_loss_pct: 0.30
+    panic_stop_loss_pct: 0.50
+    evaluation_interval_seconds: 10  # same as late_window_interval_seconds: exit checked on every run
+
+  yes_min: 90
+  yes_max: 99
+  no_min: 90
+  no_max: 99
+  risk_guards:
+    enabled: true
+    no_new_entry_cutoff_seconds: 60
+    persistence_polls: 1
+    late_persistence_override:
+      enabled: false
+    hard_flip_exit: true
+    stop_once_disable:
+      enabled: true
+      max_stopouts_per_ticker: 1
+    recent_cross:
+      enabled: true
+      from_below_cents: 90
+      to_at_least_cents: 94
+      extra_persistence_polls: 1
+    distance_buffer:
+      enabled: true
+      assets:
+        btc: { pct: 0.0015, floor_usd: 100 }
+        eth: { pct: 0.0030, floor_usd: 8 }
+        sol: { pct: 0.0015, floor_usd: 0.11 }
+    reversal_after_stop:
+      enabled: true
+      max_reversals_per_ticker: 1
+      allow_inside_cutoff: true
+      require_opposite_price_at_least_cents: 98

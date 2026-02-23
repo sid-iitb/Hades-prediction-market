@@ -1,0 +1,59 @@
+# Hourly: entry window + exit criteria (aligned), then risk guards, thresholds, spot_window
+
+# --- Entry window & exit criteria (same window: bot sleeps until minutes_to_close <= late_window) ---
+
+schedule:
+  # --- Entry window & exit criteria (same window: bot runs when minutes_to_close <= late_window) ---
+  entry_window:
+    late_window_minutes: 15   # entry: start trading when minutes_to_close <= this
+    late_interval_seconds: 10  # entry: run bot every N sec while in window (overrides late_interval_minutes if set)
+  exit_criteria:
+    stop_loss_pct: 0.20
+    panic_stop_loss_pct: 0.50
+    evaluation_interval_seconds: 10  # exit checked every 10 sec (aligned with entry run interval)
+  hourly_risk_guards:
+    enabled: true
+    no_new_entry_cutoff_seconds: 120
+    persistence_polls: 1
+    late_persistence_override:
+      enabled: false
+    stop_once_disable:
+      enabled: true
+      max_stopouts_per_ticker: 1
+    recent_cross:
+      enabled: true
+      from_below_cents: 90
+      to_at_least_cents: 94
+      extra_persistence_polls: 1
+    distance_buffer:
+      enabled: true
+      assets:
+        btc: { pct: 0.0025, floor_usd: 167 }
+        eth: { pct: 0.0050, floor_usd: 15 }
+    anchor_one_per_side:
+      enabled: true
+      lock_per_window: true
+      lock_on_stop_loss_only: true
+      recent_cross_penalty: 999
+    stoploss_roll_reentry:
+      enabled: true
+      ask_min_cents: 75
+      ask_max_cents: 98
+      order_size_multiplier: 5
+    hard_flip_exit:
+      enabled: false
+      enable_only_if_seconds_to_close_lte: 120
+
+
+spot_window: 1500
+spot_window_by_asset:
+  btc: 1500
+  eth: 200
+  sol: 50
+  xrp: 1
+
+thresholds:
+  yes_min: 90
+  yes_max: 99
+  no_min: 90
+  no_max: 99

@@ -1,0 +1,4 @@
+# Main config entry point.
+# Loader merges: common.yaml + hourly.yaml + fifteen_min.yaml + daily.yaml + weekly.yaml
+# Missing interval files are skipped. Default: --config config/config.yaml
+# Legacy: --config config.yaml (root) still works for single-file config.

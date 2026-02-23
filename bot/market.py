@@ -98,6 +98,33 @@ def get_previous_15min_market_id(asset: str = "btc") -> str:
     return slug.upper()
 
 
+def fetch_ticker_outcome(ticker: str) -> Optional[str]:
+    """
+    Fetch market resolution for a specific ticker from Kalshi API.
+    GET /markets/{ticker} returns market with 'result' field.
+    Returns 'yes', 'no', 'scalar', or None if not yet determined / unavailable.
+    """
+    if not ticker or not str(ticker).strip():
+        return None
+    try:
+        url = f"{KALSHI_API_URL}/{ticker.strip()}"
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        m = data.get("market") if isinstance(data, dict) else data
+        if not m or not isinstance(m, dict):
+            return None
+        result = m.get("result")
+        if result in ("yes", "no", "scalar"):
+            return result
+        if isinstance(result, str) and result.strip():
+            r = result.lower().strip()
+            return r if r in ("yes", "no", "scalar") else None
+        return None
+    except Exception:
+        return None
+
+
 def fetch_15min_market_result(market_id: str) -> Optional[str]:
     """
     Fetch market resolution from Kalshi API.
@@ -119,14 +146,13 @@ def get_hourly_schedule_state(
     assets: List[str],
     late_window_minutes: float = 10,
     late_interval_minutes: float = 1,
-    late_interval_seconds_under_5: float = 30,
+    late_interval_seconds: Optional[float] = None,
     fallback_interval_minutes: float = 3,
 ) -> Tuple[bool, float]:
     """
     Returns (should_run_now, sleep_seconds) for hourly bot.
-    - In late window (0 < minutes_to_close <= late_window_minutes): should_run=True.
-    - When 5 < minutes_to_close <= 10: sleep = late_interval_minutes * 60.
-    - When 0 < minutes_to_close <= 5: sleep = late_interval_seconds_under_5.
+    - In late window (0 < minutes_to_close <= late_window_minutes): should_run=True, sleep from late_interval_seconds
+      (if set) or late_interval_minutes * 60.
     - Outside late window: should_run=False, sleep until late window.
     - Market closed: should_run=False, sleep fallback.
     """
@@ -146,10 +172,12 @@ def get_hourly_schedule_state(
         # Outside late window: sleep until we hit it
         sleep_seconds = (min_mins - late_window_minutes) * 60.0
         return (False, max(1.0, sleep_seconds))
-    # In late window
-    if min_mins <= 5:
-        return (True, float(late_interval_seconds_under_5))
-    return (True, float(late_interval_minutes * 60))
+    # In late window: prefer late_interval_seconds, else late_interval_minutes * 60
+    if late_interval_seconds is not None and late_interval_seconds > 0:
+        interval_sec = float(late_interval_seconds)
+    else:
+        interval_sec = float(late_interval_minutes * 60)
+    return (True, interval_sec)
 
 
 def get_15min_schedule_state(
@@ -233,6 +261,38 @@ def get_minutes_to_close_15min(market_id: str) -> float:
         return 999.0
 
 
+def get_15min_window_ids_for_hour(hour_market_id: str) -> List[str]:
+    """
+    Return the four 15-min market IDs that fall inside the given hourly market.
+    E.g. KXBTCD-26FEB1616 -> [KXBTC15M-26FEB161600, KXBTC15M-26FEB161615, KXBTC15M-26FEB161630, KXBTC15M-26FEB161645].
+    """
+    slug = (hour_market_id or "").strip().upper()
+    dash = slug.find("-")
+    if dash < 0:
+        return []
+    prefix_hourly = slug[:dash]
+    rest = slug[dash + 1:]
+    if len(rest) < 9:
+        return []
+    # Map hourly prefix to 15m prefix
+    prefix_15m_map = {
+        "KXBTCD": "KXBTC15M",
+        "KXETHD": "KXETH15M",
+        "KXSOLD": "KXSOL15M",
+        "KXXRPD": "KXXRP15M",
+    }
+    prefix_15m = prefix_15m_map.get(prefix_hourly.upper())
+    if not prefix_15m:
+        return []
+    base = rest[:9]
+    return [
+        f"{prefix_15m}-{base}00",
+        f"{prefix_15m}-{base}15",
+        f"{prefix_15m}-{base}30",
+        f"{prefix_15m}-{base}45",
+    ]
+
+
 def get_minutes_to_close(hour_market_id: str) -> float:
     """
     Minutes until market close (top of the hour).
@@ -297,10 +357,150 @@ def fetch_markets_for_event(event_ticker: str) -> Tuple[List[Dict], Optional[str
         return [], str(e)
 
 
-def parse_strike(subtitle: str) -> float:
-    match = re.search(r"\$([\d,]+)", subtitle or "")
+def fetch_markets_by_close_window(
+    min_close_ts: int,
+    max_close_ts: int,
+    series_ticker: Optional[str] = None,
+    event_ticker: Optional[str] = None,
+) -> Tuple[List[Dict], Optional[str]]:
+    """
+    Fetch markets from Kalshi API (public) that close within [min_close_ts, max_close_ts].
+    Use series_ticker or event_ticker to filter. Per Kalshi docs, min_close_ts/max_close_ts
+    are compatible with status=closed or empty; we fetch without status then filter for active.
+    """
+    try:
+        params: Dict[str, Any] = {
+            "limit": 200,
+            "min_close_ts": min_close_ts,
+            "max_close_ts": max_close_ts,
+        }
+        if series_ticker:
+            params["series_ticker"] = series_ticker
+        if event_ticker:
+            params["event_ticker"] = event_ticker
+        resp = requests.get(KALSHI_API_URL, params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        markets = data.get("markets", [])
+        cursor = data.get("cursor")
+        while cursor and len(markets) < 500:
+            params2 = dict(params)
+            params2["cursor"] = cursor
+            resp2 = requests.get(KALSHI_API_URL, params=params2, timeout=15)
+            resp2.raise_for_status()
+            data2 = resp2.json()
+            more = data2.get("markets", [])
+            markets.extend(more)
+            cursor = data2.get("cursor")
+            if not more or not cursor:
+                break
+        return markets, None
+    except Exception as e:
+        return [], str(e)
+
+
+def parse_strike_from_text(text: str) -> float:
+    """
+    Parse strike from text. Supports:
+    - "$1,950" (existing)
+    - "1950" or "1,950" without "$"
+    Returns 0.0 if no valid strike found.
+    """
+    if not text or not isinstance(text, str):
+        return 0.0
+    # Format: $1,950 or $1950 or $1950.50
+    match = re.search(r"\$([\d,]+(?:\.[\d]+)?)", text)
     if match:
-        return float(match.group(1).replace(",", ""))
+        try:
+            return float(match.group(1).replace(",", ""))
+        except (ValueError, TypeError):
+            pass
+    # Format: 1,950 or 1950 or 1950.50 (no $) - require 3+ digits to avoid dates
+    match = re.search(r"([\d,]{3,}(?:\.[\d]+)?)", text)
+    if match:
+        try:
+            v = float(match.group(1).replace(",", ""))
+            if v > 0 and v < 1e9:  # Sanity: plausible strike
+                return v
+        except (ValueError, TypeError):
+            pass
+    return 0.0
+
+
+def parse_strike(subtitle: str) -> float:
+    """Parse strike from subtitle. Delegates to parse_strike_from_text for compatibility."""
+    return parse_strike_from_text(subtitle or "")
+
+
+def _parse_strike_from_ticker(ticker: str) -> float:
+    """
+    Try to extract strike from ticker if encoded (e.g. KXBTCD-26FEB1615-T67749.99).
+    Returns 0.0 if no strike-like suffix found.
+    """
+    if not ticker or not isinstance(ticker, str):
+        return 0.0
+    # Pattern: -T1234.56 or -T1234 (hourly style)
+    match = re.search(r"-T([\d.]+)$", ticker, re.IGNORECASE)
+    if match:
+        try:
+            v = float(match.group(1))
+            if v > 0 and v < 1e9:
+                return v
+        except (ValueError, TypeError):
+            pass
+    # Pattern: -1234.56 or -1234 at end (decimal strike)
+    match = re.search(r"-(\d{3,}\.?\d*)$", ticker)
+    if match:
+        try:
+            v = float(match.group(1))
+            if v > 0 and v < 1e9:
+                return v
+        except (ValueError, TypeError):
+            pass
+    return 0.0
+
+
+def extract_strike_from_market(m: Dict[str, Any], ticker: str) -> float:
+    """
+    Robust strike extraction for 15-min (and hourly) markets.
+    Fallback chain:
+    a) floor_strike, strike (API fields)
+    b) parse from subtitle
+    c) parse from rules/description text (rules_primary, rules_secondary, etc.)
+    d) parse from title/name
+    e) parse from ticker symbol if strike encoded
+    """
+    if not m or not isinstance(m, dict):
+        return 0.0
+    # a) API strike fields (15-min uses floor_strike)
+    for key in ("floor_strike", "strike", "ceiling_strike"):
+        strike_val = m.get(key)
+        if strike_val is not None:
+            try:
+                v = float(strike_val)
+                if v > 0:
+                    return v
+            except (ValueError, TypeError):
+                pass
+    # b) Subtitle
+    v = parse_strike_from_text(m.get("subtitle", ""))
+    if v > 0:
+        return v
+    # c) Rules and description text (where 15-min strike often lives)
+    for key in ("rules_primary", "rules_secondary", "rules", "rulebook", "rules_summary",
+                "description", "yes_description", "event_description"):
+        v = parse_strike_from_text(str(m.get(key, "")))
+        if v > 0:
+            return v
+    # d) Title or name
+    for key in ("title", "name", "market_name"):
+        v = parse_strike_from_text(str(m.get(key, "")))
+        if v > 0:
+            return v
+    # e) Ticker
+    v = _parse_strike_from_ticker(ticker or m.get("ticker", ""))
+    if v > 0:
+        return v
     return 0.0
 
 
@@ -318,7 +518,7 @@ def fetch_eligible_tickers(
         return []
     result = []
     for m in markets:
-        strike = parse_strike(m.get("subtitle", ""))
+        strike = extract_strike_from_market(m, m.get("ticker", ""))
         if strike <= 0:
             continue
         if spot_price is not None and abs(strike - spot_price) > window:
@@ -362,14 +562,16 @@ def fetch_15min_quote(
     ticker = m.get("ticker")
     if not ticker:
         return None
+    subtitle = m.get("subtitle", "")
+    strike = extract_strike_from_market(m, ticker)
     tickers = [{
         "ticker": ticker,
-        "strike": 0,
+        "strike": strike,
         "yes_bid": m.get("yes_bid"),
         "yes_ask": m.get("yes_ask"),
         "no_bid": m.get("no_bid"),
         "no_ask": m.get("no_ask"),
-        "subtitle": m.get("subtitle", ""),
+        "subtitle": subtitle,
     }]
     if client:
         quotes = enrich_with_orderbook(client, tickers)
@@ -385,7 +587,7 @@ def fetch_15min_quote(
         quotes = [
             TickerQuote(
                 ticker=ticker,
-                strike=0,
+                strike=t.get("strike", 0) or 0,
                 yes_ask=_int_or_none(t.get("yes_ask")),
                 no_ask=_int_or_none(t.get("no_ask")),
                 yes_bid=_int_or_none(t.get("yes_bid")),
