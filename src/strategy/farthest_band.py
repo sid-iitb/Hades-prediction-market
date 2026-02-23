@@ -307,6 +307,28 @@ def _mark_price_and_pnl(client: KalshiClient, active_position: dict) -> dict:
     if side not in {"yes", "no"}:
         return {"error": "active_position side must be yes/no"}
 
+    # Prefer Kalshi portfolio economics when available:
+    # pnl_pct = (market_value_cents - cost_cents) / cost_cents
+    cost_cents = _parse_number(active_position.get("cost_cents"))
+    market_value_cents = _parse_number(active_position.get("market_value_cents"))
+    count = _parse_number(active_position.get("count"))
+    if (
+        cost_cents is not None
+        and market_value_cents is not None
+        and cost_cents > 0
+    ):
+        pnl_pct = (float(market_value_cents) - float(cost_cents)) / float(cost_cents)
+        mark_cents = None
+        if count is not None and count > 0:
+            mark_cents = int(round(float(market_value_cents) / float(count)))
+        return {
+            "top_of_book": None,
+            "mark_cents": mark_cents,
+            "pnl_pct": pnl_pct,
+            "cost_cents": int(round(cost_cents)),
+            "market_value_cents": int(round(market_value_cents)),
+        }
+
     top = client.get_top_of_book(active_position["ticker"])
     bid_key = f"{side}_bid"
     mark_cents = top.get(bid_key)

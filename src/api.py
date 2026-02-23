@@ -470,6 +470,7 @@ _farthest_auto_state = {
     "active_positions": [],
     "active_position_mode": None,
     "risk_snapshot": [],
+    "risk_decisions": [],
     "last_stop_loss_trigger": None,
     "stop_loss_trigger_history": [],
 }
@@ -1098,11 +1099,23 @@ def _build_risk_snapshot(active_positions):
         error = None
         if ticker and side in {"yes", "no"} and entry > 0:
             try:
-                top = client.get_top_of_book(ticker)
-                mark_cents = _maybe_int(top.get(f"{side}_bid"))
-                if mark_cents is None:
-                    mark_cents = 0
-                pnl_pct = (float(mark_cents) - float(entry)) / float(entry)
+                # Prefer exact portfolio economics from Kalshi when present.
+                cost_cents = _maybe_int(p.get("cost_cents"))
+                market_value_cents = _maybe_int(p.get("market_value_cents"))
+                if (
+                    isinstance(cost_cents, int)
+                    and isinstance(market_value_cents, int)
+                    and cost_cents > 0
+                ):
+                    pnl_pct = (float(market_value_cents) - float(cost_cents)) / float(cost_cents)
+                    if count > 0:
+                        mark_cents = int(round(float(market_value_cents) / float(count)))
+                else:
+                    top = client.get_top_of_book(ticker)
+                    mark_cents = _maybe_int(top.get(f"{side}_bid"))
+                    if mark_cents is None:
+                        mark_cents = 0
+                    pnl_pct = (float(mark_cents) - float(entry)) / float(entry)
             except Exception as exc:
                 error = str(exc)
         snapshot.append(
@@ -1111,6 +1124,8 @@ def _build_risk_snapshot(active_positions):
                 "side": side,
                 "entry_price_cents": entry,
                 "count": count,
+                "cost_cents": _maybe_int(p.get("cost_cents")),
+                "market_value_cents": _maybe_int(p.get("market_value_cents")),
                 "mark_cents": mark_cents,
                 "pnl_pct": pnl_pct,
                 "error": error,
@@ -1215,6 +1230,38 @@ def _seed_active_positions_from_portfolio(config: FarthestBandConfig) -> list[di
                 "entry_price_cents": int(entry_price),
                 "count": int(count),
                 "opened_spot": None,
+                "cost_cents": _extract_money_cents(
+                    p,
+                    cents_keys=[
+                        "total_cost_cents",
+                        "cost_cents",
+                        "position_cost_cents",
+                    ],
+                    dollar_keys=[
+                        "total_cost_dollars",
+                        "total_cost",
+                        "cost",
+                        "position_cost",
+                        "position_cost_dollars",
+                    ],
+                ),
+                "market_value_cents": _extract_money_cents(
+                    p,
+                    cents_keys=[
+                        "market_value_cents",
+                        "market_exposure_cents",
+                        "position_value_cents",
+                        "positions_value_cents",
+                    ],
+                    dollar_keys=[
+                        "market_value",
+                        "market_value_dollars",
+                        "market_exposure_dollars",
+                        "market_exposure",
+                        "position_value",
+                        "position_value_dollars",
+                    ],
+                ),
             }
         )
 
@@ -1258,6 +1305,7 @@ def _farthest_band_worker():
         latest_out = None
         next_active_positions = list(active_positions or [])
         risk_snapshot = []
+        risk_decisions = []
 
         if active_positions or is_scheduled_run:
             did_run = True
@@ -1282,6 +1330,24 @@ def _farthest_band_worker():
                     cycle = (out or {}).get("result") or {}
                     cycle_action = str(cycle.get("action") or "").lower()
                     cycle_reason = str(cycle.get("reason") or "")
+                    mark = cycle.get("mark") if isinstance(cycle, dict) else None
+                    pnl_pct = cycle.get("pnl_pct") if isinstance(cycle, dict) else None
+                    if pnl_pct is None and isinstance(mark, dict):
+                        pnl_pct = mark.get("pnl_pct")
+                    mark_cents = mark.get("mark_cents") if isinstance(mark, dict) else None
+                    cost_cents = mark.get("cost_cents") if isinstance(mark, dict) else None
+                    market_value_cents = mark.get("market_value_cents") if isinstance(mark, dict) else None
+                    basis = (
+                        "portfolio_cost_value"
+                        if isinstance(cost_cents, int) and isinstance(market_value_cents, int)
+                        else "top_of_book_bid_fallback"
+                    )
+                    trigger_threshold_pct = -abs(float(getattr(config, "stop_loss_pct", 0.25) or 0.25))
+                    trigger_crossed = (
+                        (float(pnl_pct) < float(trigger_threshold_pct))
+                        if pnl_pct is not None
+                        else None
+                    )
                     stop_loss_failed_exit = (
                         cycle_action == "hold_active" and "stop-loss triggered" in cycle_reason.lower()
                     )
@@ -1373,20 +1439,92 @@ def _farthest_band_worker():
                         if len(stop_loss_trigger_history) > 5000:
                             stop_loss_trigger_history = stop_loss_trigger_history[-5000:]
                         _log_stop_loss_trigger(last_stop_loss_trigger)
-                    mark = out.get("mark") if isinstance(out, dict) else None
-                    pnl_pct = out.get("pnl_pct") if isinstance(out, dict) else None
-                    if pnl_pct is None and isinstance(mark, dict):
-                        pnl_pct = mark.get("pnl_pct")
-                    mark_cents = mark.get("mark_cents") if isinstance(mark, dict) else None
                     risk_snapshot.append(
                         {
                             "ticker": pos.get("ticker"),
                             "side": pos.get("side"),
                             "entry_price_cents": pos.get("entry_price_cents"),
                             "count": pos.get("count"),
+                            "cost_cents": _maybe_int(pos.get("cost_cents")),
+                            "market_value_cents": _maybe_int(pos.get("market_value_cents")),
                             "pnl_pct": pnl_pct,
                             "mark_cents": mark_cents,
-                            "action": out.get("action") if isinstance(out, dict) else "error",
+                            "action": cycle_action or "error",
+                        }
+                    )
+                    exit_leg = cycle.get("exit") if isinstance(cycle, dict) else None
+                    reentry_leg = cycle.get("reentry") if isinstance(cycle, dict) else None
+                    risk_decisions.append(
+                        {
+                            "checked_at": run_at,
+                            "ticker": pos.get("ticker"),
+                            "side": pos.get("side"),
+                            "count": _maybe_int(pos.get("count")),
+                            "entry_price_cents": _maybe_int(pos.get("entry_price_cents")),
+                            "cost_cents": _maybe_int(pos.get("cost_cents")),
+                            "market_value_cents": _maybe_int(pos.get("market_value_cents")),
+                            "mark_cents": _maybe_int(mark_cents),
+                            "pnl_pct": pnl_pct,
+                            "trigger_threshold_pct": trigger_threshold_pct,
+                            "trigger_crossed": trigger_crossed,
+                            "evaluation_basis": basis,
+                            "decision_action": cycle_action or "error",
+                            "decision_reason": cycle_reason or (out.get("reason") if isinstance(out, dict) else None),
+                            "sell_attempted": isinstance(exit_leg, dict),
+                            "sell_status": (
+                                "failed"
+                                if isinstance(exit_leg, dict) and str(exit_leg.get("action") or "").lower() == "hold"
+                                else ("ok" if isinstance(exit_leg, dict) else "not_applicable")
+                            ),
+                            "sell_failure_reason": (
+                                exit_leg.get("reason") if isinstance(exit_leg, dict) and str(exit_leg.get("action") or "").lower() == "hold" else None
+                            ),
+                            "sell_order": (
+                                {
+                                    "ticker": pos.get("ticker"),
+                                    "price_cents": _maybe_int(exit_leg.get("exit_price_cents")) if isinstance(exit_leg, dict) else None,
+                                    "status_code": _maybe_int(exit_leg.get("status_code")) if isinstance(exit_leg, dict) else None,
+                                }
+                                if isinstance(exit_leg, dict)
+                                else None
+                            ),
+                            "buy_attempted": isinstance(reentry_leg, dict),
+                            "buy_status": (
+                                "failed"
+                                if isinstance(reentry_leg, dict) and str(reentry_leg.get("action") or "").lower() == "hold"
+                                else ("ok" if isinstance(reentry_leg, dict) else "not_applicable")
+                            ),
+                            "buy_failure_reason": (
+                                reentry_leg.get("reason") if isinstance(reentry_leg, dict) and str(reentry_leg.get("action") or "").lower() == "hold" else None
+                            ),
+                            "buy_selection_reason": (
+                                ((reentry_leg.get("selection") or {}).get("reason")) if isinstance(reentry_leg, dict) else None
+                            ),
+                            "buy_fallback_used": (
+                                ((reentry_leg.get("selection") or {}).get("fallback_used")) if isinstance(reentry_leg, dict) else None
+                            ),
+                            "buy_fallback_reason": (
+                                ((reentry_leg.get("selection") or {}).get("fallback_reason")) if isinstance(reentry_leg, dict) else None
+                            ),
+                            "buy_order": (
+                                {
+                                    "ticker": (
+                                        (reentry_leg.get("active_position") or {}).get("ticker")
+                                        or ((reentry_leg.get("selection") or {}).get("selected") or {}).get("ticker")
+                                    ),
+                                    "price_cents": _maybe_int(
+                                        (reentry_leg.get("active_position") or {}).get("entry_price_cents")
+                                        or ((reentry_leg.get("selection") or {}).get("selected") or {}).get("ask_cents")
+                                    ),
+                                    "count": _maybe_int(
+                                        (reentry_leg.get("active_position") or {}).get("count")
+                                        or (reentry_leg.get("selection") or {}).get("count")
+                                    ),
+                                    "status_code": _maybe_int(reentry_leg.get("status_code")),
+                                }
+                                if isinstance(reentry_leg, dict)
+                                else None
+                            ),
                         }
                     )
                     next_pos = out.get("active_position")
@@ -1425,6 +1563,7 @@ def _farthest_band_worker():
                 if should_check_risk:
                     _farthest_auto_state["last_risk_check_at"] = run_at
                     _farthest_auto_state["risk_snapshot"] = risk_snapshot
+                    _farthest_auto_state["risk_decisions"] = risk_decisions
                 _farthest_auto_state["next_scheduled_run_at"] = next_scheduled_at.isoformat()
                 _farthest_auto_state["last_result"] = latest_out
                 _farthest_auto_state["active_positions"] = normalized_positions
@@ -1846,64 +1985,55 @@ def get_portfolio_current_orders(status: str | None = "open", limit: int = 200):
         if cost_cents is None and price_cents is not None and count:
             cost_cents = price_cents * int(count)
         max_payout_cents = 100 * int(count) if count else None
-        mark_cents = None
-        market_value_cents = None
-        pnl_cents = None
-        if ticker and side in {"yes", "no"} and count:
-            try:
-                top = client.get_top_of_book(ticker)
-                mark_cents = _maybe_int(top.get(f"{side}_bid"))
-            except Exception:
-                mark_cents = None
-        # Preferred valuation for portfolio panel: executable bid mark.
-        if mark_cents is not None and int(count) > 0:
-            market_value_cents = int(mark_cents) * int(count)
-            if cost_cents is not None:
-                pnl_cents = int(market_value_cents) - int(cost_cents)
-        # Fallback to Kalshi payload market value/pnl when bid mark is unavailable.
-        if market_value_cents is None:
-            market_value_cents = _extract_money_cents(
-                p,
-                cents_keys=[
-                    "market_value_cents",
-                    "market_exposure_cents",
-                    "position_value_cents",
-                    "positions_value_cents",
-                ],
-                dollar_keys=[
-                    "market_value",
-                    "market_value_dollars",
-                    "market_exposure_dollars",
-                    "market_exposure",
-                    "position_value",
-                    "position_value_dollars",
-                ],
-            )
-        if pnl_cents is None:
-            pnl_cents = _extract_money_cents(
-                p,
-                cents_keys=[
-                    "unrealized_pnl_cents",
-                    "realized_pnl_cents",
-                    "pnl_cents",
-                ],
-                dollar_keys=[
-                    "unrealized_pnl_dollars",
-                    "unrealized_pnl",
-                    "realized_pnl_dollars",
-                    "realized_pnl",
-                    "pnl",
-                ],
-            )
-        if pnl_cents is None and market_value_cents is not None and cost_cents is not None:
-            pnl_cents = market_value_cents - cost_cents
-        if cost_cents is None and market_value_cents is not None and pnl_cents is not None:
-            cost_cents = market_value_cents - pnl_cents
-        if pnl_cents is None and ticker and count:
-            if price_cents is None and total_traded_cents is not None and count:
-                price_cents = int(round(total_traded_cents / int(count)))
-            if mark_cents is not None and price_cents is not None:
-                pnl_cents = int((mark_cents - price_cents) * int(count))
+        # Use Kalshi-provided valuation fields as source of truth for portfolio panel.
+        mark_cents = _extract_money_cents(
+            p,
+            cents_keys=[
+                "mark_price_cents",
+                "bid_price_cents",
+                "current_price_cents",
+            ],
+            dollar_keys=[
+                "mark_price",
+                "bid_price",
+                "current_price",
+                "mark_price_dollars",
+                "bid_price_dollars",
+                "current_price_dollars",
+            ],
+        )
+        market_value_cents = _extract_money_cents(
+            p,
+            cents_keys=[
+                "market_value_cents",
+                "market_exposure_cents",
+                "position_value_cents",
+                "positions_value_cents",
+            ],
+            dollar_keys=[
+                "market_value",
+                "market_value_dollars",
+                "market_exposure_dollars",
+                "market_exposure",
+                "position_value",
+                "position_value_dollars",
+            ],
+        )
+        pnl_cents = _extract_money_cents(
+            p,
+            cents_keys=[
+                "unrealized_pnl_cents",
+                "realized_pnl_cents",
+                "pnl_cents",
+            ],
+            dollar_keys=[
+                "unrealized_pnl_dollars",
+                "unrealized_pnl",
+                "realized_pnl_dollars",
+                "realized_pnl",
+                "pnl",
+            ],
+        )
 
         rows.append(
             {
@@ -2253,6 +2383,7 @@ def strategy_farthest_band_auto_start(
         _farthest_auto_state["next_risk_check_at"] = datetime.datetime.now(timezone.utc).isoformat()
         _farthest_auto_state["last_result"] = None
         _farthest_auto_state["risk_snapshot"] = []
+        _farthest_auto_state["risk_decisions"] = []
         history = _get_stop_loss_trigger_history(limit=5000)
         _farthest_auto_state["stop_loss_trigger_history"] = history
         _farthest_auto_state["last_stop_loss_trigger"] = history[-1] if history else None
@@ -2281,6 +2412,7 @@ def strategy_farthest_band_auto_stop():
     with _farthest_auto_lock:
         _farthest_auto_state["running"] = False
         _farthest_auto_state["risk_snapshot"] = []
+        _farthest_auto_state["risk_decisions"] = []
         active_position = _farthest_auto_state.get("active_position")
         active_positions = list(_farthest_auto_state.get("active_positions") or [])
     return {
@@ -2299,6 +2431,7 @@ def strategy_farthest_band_reset():
         _farthest_auto_state["active_position_mode"] = None
         _farthest_auto_state["last_result"] = None
         _farthest_auto_state["risk_snapshot"] = []
+        _farthest_auto_state["risk_decisions"] = []
         history = _get_stop_loss_trigger_history(limit=5000)
         _farthest_auto_state["stop_loss_trigger_history"] = history
         _farthest_auto_state["last_stop_loss_trigger"] = history[-1] if history else None
@@ -2317,7 +2450,10 @@ def strategy_farthest_band_auto_status():
     # Refresh risk snapshot on demand so stop-loss panel can always show latest P/L%.
     if thread_alive:
         active_positions = state.get("active_positions") or []
-        state["risk_snapshot"] = _build_risk_snapshot(active_positions)
+        live_snapshot = _build_risk_snapshot(active_positions)
+        state["risk_snapshot_live"] = live_snapshot
+        if not state.get("risk_snapshot"):
+            state["risk_snapshot"] = live_snapshot
     return state
 
 
