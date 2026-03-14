@@ -1,12 +1,29 @@
-# Hades Prediction Market - Dependencies
+# Project Hermes - Python dependencies
+# Python 3.11+
+
+# HTTP and Kalshi API
+requests>=2.28.0,<3
+
+# Kalshi request signing (RSA-PSS)
+cryptography>=41.0.0
+
+# Config and environment
+python-dotenv>=1.0.0
+PyYAML>=6.0
+
+# Optional: API server / dashboard (legacy or future)
 fastapi>=0.100.0
 uvicorn>=0.20.0
-requests>=2.28.0
-cryptography>=41.0.0
-python-dotenv>=1.0.0
+
+# Time and TLS
 pytz>=2023.0
 certifi>=2023.0
-PyYAML>=6.0
-pytest>=7.0
+
+# Data and tooling (telemetry export, reports)
 pandas>=1.5.0
+
+# WebSocket (Kalshi WS, oracle feeds if enabled)
 websockets>=12.0
+
+# Tests
+pytest>=7.0

@@ -1,311 +1,182 @@
-# Hades Prediction Market
+# Project Hermes
 
-A research-grade trading workstation for Kalshi's Bitcoin hourly markets. It ingests live BTC price data, maps it to the currently active Kalshi market, stores snapshots in SQLite, and serves a real-time dashboard plus API endpoints for downstream strategy work.
-
-The core objective is to evolve from signal collection into automated, risk-aware execution.
-
-## Dashboard
-![Dashboard 1](Dashboard.png)
-
-The dashboard includes:
-- Live BTC price, timestamp, event ticker, and large expiry countdown.
-- Top-middle portfolio snapshot (Cash + Portfolio) beside BTC/expiry.
-- Compact BTC trend graph with hover tooltip (time + price).
-- `Latest 10 Kalshi Markets` panel:
-  - One-click YES/NO order buttons.
-  - Configurable `Max Cost (c)`.
-  - Bright row highlighting for rows where YES ask is in the 90-99c band.
-  - Inline error/success status with per-row pending/error/success highlighting.
-- Four top panels in one row on desktop:
-  - `Latest 10 Kalshi Markets`
-  - `Farthest Strategy: Manual`
-  - `Farthest Strategy: Auto`
-  - `Current Portfolio`
-- `Farthest Strategy: Manual`:
-  - `Preview` + `Run Once`.
-  - Planned order and nearest-candidates output.
-- `Farthest Strategy: Auto`:
-  - `Auto Start`, `Auto Status`, `Auto Stop`.
-  - Next scheduled-run countdown + progress bar.
-  - Stop-loss schedule panel (next risk check + protected positions).
-  - Last auto trade badge.
-  - Planned order and nearest-candidates output.
-- `Current Portfolio`:
-  - BTC-only filter toggle.
-  - Auto-refresh every 3 seconds.
-  - Per-position table (side/cost/P/L/max) and summary.
-- `Trade Ledger`:
-  - Recorded buy/sell legs from direct order route and strategy paths.
-  - Includes source, mode, action, price/count/cost, status, and note.
-- `P/L Summary (All Orders)`:
-  - Realized/unrealized/net/fees totals.
-  - Per-market breakdown from historical fills/orders.
-
-
-## Highlights
-- Live BTC price from Kraken.
-- Kalshi market discovery for the current hour.
-- Continuous ingest pipeline with SQLite storage.
-- FastAPI service with JSON endpoints and a built-in dashboard.
-- Persistent trade ledger in SQLite for buy/sell calls (timestamp, price, side, ticker, status, payload).
-- Strategy auto state with seeded active positions from live portfolio.
-- FIFO-style realized/unrealized/net P/L summary from historical orders.
-
-## Requirements
-- Python 3.11+
-
-## Architecture
-1. **Market discovery**: Identify the current Kalshi event ticker based on the next hour (ET).
-2. **Price fetch**: Pull the latest BTC price from Kraken.
-3. **Market snapshot**: Fetch Kalshi YES/NO quotes for the event.
-4. **Ingest**: Store snapshots in SQLite and prune old data.
-5. **Serve**: FastAPI provides API routes and a real-time dashboard.
-
-## Quickstart
-### 1) Create a virtual environment
-```bash
-python -m venv .venv
-source .venv/bin/activate
-```
-
-### 2) Install dependencies
-```bash
-pip install fastapi uvicorn requests cryptography python-dotenv pytz
-```
-
-### 3) Configure environment
-Copy your `.env` file and set:
-- `KALSHI_API_KEY`
-- `KALSHI_PRIVATE_KEY`
-- `KALSHI_BASE_URL`
-- `KALSHI_DB_PATH`
-- `OPENAI_API_KEY` (optional, future use)
-- `XAI_API_KEY` (optional, future use)
-
-Notes:
-- `KALSHI_PRIVATE_KEY` should point to your private key PEM.
-- set `KALSHI_DB_PATH` to override the default SQLite path.
-- Do not commit secrets. `.env` is already ignored by git.
-
-
-
-### 4) Run the API server + dashboard
-```bash
-python3 -m src.api
-```
-- This continuously writes market snapshots to `data/kalshi_ingest.db` (once per second) and prunes data older than 24 hours.
-- Then open: `http://localhost:8090/dashboard`
-
-## API Endpoints
-- `GET /get_price_ticker`
-  - Returns the latest BTC price from Kraken.
-- `GET /kalshi_ingest/latest`
-  - Returns the most recent Kalshi ingest snapshots (last 2 hours).
-- `GET /kalshi_ingest/last_hour`
-  - Returns BTC price samples for the last hour.
-- `GET /kalshi/place_best_ask_order?side=yes|no&ticker=...&max_cost_cents=...`
-  - Places a best-ask limit order for YES/NO based on the current order book.
-- `GET /kalshi/portfolio/balance`
-  - Returns current portfolio balance.
-- `GET /kalshi/portfolio/orders`
-  - Returns current orders (filter with `status`, `ticker`, `limit`).
-- `GET /kalshi/portfolio/current`
-  - Returns portfolio balance and current positions/orders with estimated cost, mark-based P/L, and max payout.
-- `GET /kalshi/pnl/summary`
-  - Aggregates order history into buys/sells/fees plus realized, unrealized, and net P/L.
-  - Includes per-market breakdown and diagnostics (`orders_considered`, `fills_count`, etc.).
-- `GET /kalshi/portfolio/positions_debug`
-  - Returns raw positions payload plus a small sample for debugging field mappings.
-- `GET /strategy/farthest_band/preview?side=yes|no&ask_min_cents=95&ask_max_cents=99&max_cost_cents=500`
-  - Uses latest spot + latest ingest snapshot to show the planned order (lower-direction strategy only).
-  - If no exact band match exists, returns nearest candidates.
-- `GET /strategy/farthest_band/run?side=yes|no&ask_min_cents=95&ask_max_cents=99&max_cost_cents=500&mode=paper|live`
-  - Executes one strategy cycle immediately.
-  - `mode=paper` returns planned action only; `mode=live` places a real order.
-  - If an active tracked position loss is greater than `25%`, it exits and attempts to rebuy a farther strike.
-- `GET /strategy/farthest_band/run?side=yes|no&ask_min_cents=95&ask_max_cents=99&max_cost_cents=500&mode=paper|live&force_new_order=1`
-  - Forces a fresh entry on run-once (ignores currently tracked active position state).
-- `GET /strategy/farthest_band/auto/start?side=yes|no&ask_min_cents=95&ask_max_cents=99&max_cost_cents=500&mode=paper|live&interval_minutes=15`
-  - Starts background auto-execution on interval (default 15 minutes).
-  - Seeds strategy-tracked active positions from live portfolio (matching latest event prefix/tickers).
-  - Auto cycles apply the same stop-loss exit-and-rotate behavior.
-  - Stop-loss/risk evaluation cadence is `min(5 minutes, time to next scheduled run)`.
-  - Scheduled interval runs add a new entry when a candidate exists, without selling the current active position.
-  - Sells happen only on stop-loss or ticker rollover.
-- `GET /strategy/farthest_band/auto/status`
-  - Returns running state, active config, last run time, and last result.
-- `GET /strategy/farthest_band/auto/stop`
-  - Stops background auto-execution.
-- `GET /strategy/farthest_band/reset`
-  - Clears tracked strategy active position/state cache.
-- `GET /ledger/trades?limit=200`
-  - Returns the latest ledger records for buy/sell calls from direct order route and strategy runs/auto cycles.
-  - Fields include timestamp, action, side, ticker, price/count/cost, status, source, and payload snapshot.
-
-## Stop-Loss Behavior
-- Threshold:
-  - Triggered when unrealized PnL is strictly below `-25%` from entry price (`loss > 25%`).
-  - PnL formula: `(mark_price_cents - entry_price_cents) / entry_price_cents`.
-- Mark source:
-  - YES positions use `yes_bid`.
-  - NO positions use `no_bid`.
-  - If bid is unavailable, stop-loss mark is treated conservatively as `0`.
-- `Preview`:
-  - Selection only, no orders, no stop-loss actions.
-- `Run Once`:
-  - If no active tracked position, enters selected candidate.
-  - If active position exists, evaluates stop-loss; on trigger, exits then re-enters farther strike.
-  - With `force_new_order=1`, ignores active tracked state and enters fresh immediately.
-- `Auto`:
-  - Scheduled interval runs follow `interval_minutes`.
-  - Stop-loss checks run on risk cadence (`min(5m, time-to-next-schedule)`).
-  - On scheduled runs, can add new entries without closing existing positions.
-  - On stop-loss trigger, exits active position at market-like executable bid and re-enters a farther candidate.
-  - Re-entry excludes the same ticker and enforces farther distance than the exited strike.
-  - On hourly event rollover, exits stale ticker and re-enters from latest ingest markets.
-- Entry selection risk filters:
-  - Default ask band is `95-99c`.
-  - Strategy skips the nearest 2 strike levels in the chosen direction (`skip_nearest_levels=2`) before selecting.
-- Execution modes:
-  - `paper`: decision path only, no exchange order.
-  - `live`: real Kalshi orders are submitted for exit/re-entry.
-- Visibility:
-  - Every buy/sell leg (run, auto, and direct order route) is written to `trade_ledger`.
-  - Use `GET /ledger/trades` or the dashboard Trade Ledger panel to verify actions.
-  - Use `GET /kalshi/pnl/summary` for aggregate realized/unrealized/net P/L.
-
-
-## Bot (Phase 1: Verification Mode)
-
-### Repo scan summary
-
-| Module | Purpose |
-|--------|---------|
-| `src/client/kalshi_client.py` | Kalshi API client: `get_top_of_book`, `place_limit_at_best_ask`, `get_orders`, `get_positions`, `get_balance` |
-| `src/client/kraken_client.py` | Kraken prices: `latest_btc_price()`, `latest_eth_price()`, `latest_sol_price()`, `latest_xrp_price()` |
-| `src/utils/fetch_current_predictions_kalshi.py` | Fetch markets by event ticker (public API) |
-| `src/utils/get_current_trading_markets.py` | Resolve current market URL |
-| `src/offline_processing/generate_all_kalshi_urls.py` | Generate Kalshi event slug (kxbtcd-YYmmDDHH) |
-| `src/api.py` | FastAPI dashboard + ingest |
-
-The bot runs in **OBSERVE** mode by default (no trading). Use **TRADE** mode only after verifying signals.
-
-### Run the bot
-
-```bash
-# OBSERVE mode (default) - log signals, no orders
-python -m bot.main --config config/config.yaml
-
-# Run once and exit (no loop)
-python -m bot.main --config config/config.yaml --once
-
-# Legacy: single-file config at project root
-python -m bot.main --config config.yaml
-```
-
-### Switch to TRADE mode
-
-1. Set env var: `export MODE=TRADE`
-2. Or edit `config/common.yaml`: `mode: TRADE`
-3. Run: `python -m bot.main --config config/config.yaml`
-
-### Sample output (OBSERVE mode)
-
-```
-============================================================
-HADES BOT RUN SUMMARY
-============================================================
-  Timestamp:        2026-02-14 12:35:00 UTC
-  Market ID:        KXBTCD-26FEB1414
-  Market Hour:      KXBTCD-26FEB1414
-  Minutes to close: 25.0
-  Mode:             OBSERVE
-------------------------------------------------------------
-  Tickers checked:  12
-  Signals YES:      2
-  Signals NO:       1
-  Would trade:      3
-------------------------------------------------------------
-  SIGNALS:
-    - KXBTCD-26FEB1414-T68999.99 | YES @ 95c | YES_BUY | late=False
-    - KXBTCD-26FEB1414-T69249.99 | NO @ 96c | NO_BUY | late=False
-------------------------------------------------------------
-  CAP USAGE:
-    Total orders (this hour): 0
-    Per ticker (top 10): (none)
-------------------------------------------------------------
-  EXECUTION:
-    KXBTCD-26FEB1414-T68999.99 YES: WOULD_TRADE
-    KXBTCD-26FEB1414-T69249.99 NO: WOULD_TRADE
-============================================================
-```
-
-### Bot modules
-
-- `bot/main.py` - Entrypoint
-- `bot/scheduler.py` - Run loop, time logic (H+1 min start, 5-min interval)
-- `bot/market.py` - Current hourly market, tickers, orderbook
-- `bot/strategy.py` - Signal generation (YES_BUY, NO_BUY, late window)
-- `bot/execution.py` - Place orders (TRADE mode only), cap enforcement
-- `bot/state.py` - SQLite persistence for order counts
-- `bot/logging.py` - Structured logs + console summary
-
-### Config (`config/`)
-
-Split config for easier maintenance:
-- `config/common.yaml` - assets, intervals, caps, order, state, reports, logging (exit_criteria fallbacks only)
-- `config/hourly.yaml` - schedule (late window, risk guards), thresholds, exit_criteria, spot_window
-- `config/fifteen_min.yaml` - 15-min thresholds, risk guards, exit_criteria
-- `config/daily.yaml` - daily schedule, thresholds, risk guards, exit_criteria, spot_window
-- `config/weekly.yaml` - weekly schedule, thresholds, risk guards, exit_criteria, spot_window
-- `config/config.yaml` - main entry (loader merges all)
-
-Legacy single-file `config.yaml` at project root still works.
+A cross-domain, low-latency quantitative trading bot for **Kalshi** prediction markets. It runs statistical arbitrage and event-driven strategies: limit orders in the final seconds of 15‑minute windows (**last_90s_limit_99**), and directional breakout entries with take-profit/stop-loss (**atm_breakout_strategy**). Hermes uses live spot data (Kraken, Coinbase) and Kalshi order books to place and manage positions with configurable risk (stop-loss, panic close, distance filters).
 
 ---
 
-## Repository Layout
-```
-src/
-  api.py                        # FastAPI app and dashboard UI
-  client/
-    kalshi_client.py            # Signed API client for Kalshi
-    kraken_client.py            # Kraken BTC price client
-  offline_processing/
-    ingest_kalshi.py            # Ingest loop + SQLite storage
-    generate_all_kalshi_urls.py # Utility for batch Kalshi URLs
-    kalshi_urls_2026.txt        # Precomputed URLs
-  utils/
-    fetch_current_predictions_kalshi.py  # Pull markets + normalize
-    get_current_trading_markets.py       # Resolve current market URL
+## Features
 
-data/
-  kalshi_ingest.db              # SQLite ingest store (generated)
-  bot_state.db                  # Bot order state (generated)
+- **V2 unified pipeline** — Single process, config-driven; runs 15‑min (and optionally hourly) intervals in separate threads. Order registry and strategy reports in SQLite (`data/v2_state.db`).
+- **last_90s_limit_99** — Places limit-at-99¢ orders in the last N seconds of each 15‑min window when distance and bid thresholds pass; per-asset `min_bid_cents`, `min_distance_at_placement`, `stop_loss_distance_factor`. Exits via stop-loss (including panic close when spot crosses strike) using min(Kraken, Coinbase) distance.
+- **atm_breakout_strategy** — Momentum-based ITM entries when spot crosses strike and momentum triggers; take-profit and stop-loss executed as aggressive limit sells (IoC + reduce_only) on Kalshi.
+- **Data layer** — Spot from Kraken + Coinbase; entry uses average distance (non‑BTC) or min distance (BTC); exit/stop-loss uses min distance for all assets.
+- **Execution** — TP/SL and last_90s stop-loss go through a single executor path: aggressive limit sell (1¢) with `reduce_only` and `time_in_force: immediate_or_cancel`. SL execution attempts are audited to `v2_sl_execution_audit` for analysis.
+
+---
+
+## Requirements
+
+- **Python 3.11+**
+- **Kalshi API** — API key and RSA private key (PEM) for signed requests.
+- **Kraken** (and optionally Coinbase) — Used for spot prices and distance-to-strike.
+
+---
+
+## Quick start
+
+### 1. Clone and virtual environment
+
+```bash
+git clone https://github.com/aajsearch/Project-Hermes.git
+cd Project-Hermes
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+```
+
+### 2. Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### 3. Environment and config
+
+- Copy `.env.example` to `.env` and set:
+  - **KALSHI_API_KEY** — Your Kalshi API key ID.
+  - **KALSHI_PRIVATE_KEY** — Path to your RSA private key PEM file, or inline PEM content (e.g. for CI).
+  - **KALSHI_BASE_URL** — Kalshi API base (no path). Production: `https://api.elections.kalshi.com`. Demo: use Kalshi’s demo base URL if applicable.
+- V2 config lives under `config/`:
+  - **v2_common.yaml** — Intervals (fifteen_min, hourly), assets, caps, no_trade_windows, `dry_run`.
+  - **v2_fifteen_min.yaml** — Pipeline `run_interval_seconds`, `strategy_priority`; strategy blocks for `last_90s_limit_99` and `atm_breakout_strategy` (per-asset knobs where noted).
+
+Do not commit `.env` or PEM files; they are in `.gitignore`.
+
+### 4. Run the V2 bot (recommended)
+
+```bash
+# Dry run (default): no real orders, strategies and executor logic run
+python -m bot.v2_main
+
+# Live trading: set in v2_common.yaml (dry_run: false) or env
+V2_DRY_RUN=false python -m bot.v2_main
+```
+
+- The bot starts the **fifteen_min** pipeline (and hourly if enabled). Each cycle: resolve markets and spot, build context, evaluate entry/exit per strategy, then execute (place/cancel/sell) when not in dry run.
+- Logs go to stdout. SL/TP and execution audit rows go to `data/v2_state.db` (e.g. `v2_sl_execution_audit`).
+
+### 5. Legacy bot (optional)
+
+The legacy single-loop bot and dashboard are still available:
+
+```bash
+# OBSERVE mode (no orders)
+python -m bot.main --config config/config.yaml
+
+# TRADE mode (after setting mode in config or MODE=TRADE)
+python -m bot.main --config config/config.yaml
+```
+
+Config is merged from `config/common.yaml`, `config/fifteen_min.yaml`, `config/hourly.yaml`, etc., with `config/config.yaml` as the main entry.
+
+---
+
+## Config overview (V2)
+
+| File | Purpose |
+|------|--------|
+| **config/v2_common.yaml** | Intervals (fifteen_min, hourly), assets, caps, no_trade_windows, `dry_run`. |
+| **config/v2_fifteen_min.yaml** | Pipeline `run_interval_seconds`, `strategy_priority`; strategy blocks for `last_90s_limit_99` and `atm_breakout_strategy`. |
+| **config/v2_hourly.yaml** | Hourly pipeline and strategies (if used). |
+
+Key strategy knobs (see YAML comments):
+
+- **last_90s_limit_99:** `window_seconds`, `min_bid_cents` (per-asset), `min_distance_at_placement`, `stop_loss_pct`, `stop_loss_distance_factor` (per-asset), `order_count`, `max_cost_cents`, `side`.
+- **atm_breakout_strategy:** `min_distance_at_placement`, `min_entry_price`, `max_entry_price`, `momentum_window_seconds`, `momentum_trigger_3s`, `take_profit_cents`, `stop_loss_cents`, `order_count`, `contracts`, `max_cost_cents`.
+
+---
+
+## Tools (scripts)
+
+Run from project root. Most read from `data/v2_state.db` or `data/bot_state.db`.
+
+| Script | Purpose |
+|--------|--------|
+| `tools/export_last_90s_telemetry_csv.py` | Export last_90s telemetry to CSV (e.g. `--hours 12`, `--out data/last_90s_telemetry_12h.csv`). |
+| `tools/export_atm_breakout_trades_7h_csv.py` | Export ATM breakout trades (TP/SL/WindowEnd) to CSV; `--hours 7 --trades-only` or `--all --trades-only`. |
+| `tools/export_atm_breakout_csv.py` | Export full `strategy_report_atm_breakout` table to CSV. |
+| `tools/verify_v2_dry_run.py` | Verify V2 pipeline in dry run (no orders). |
+| `tools/verify_config.py` | Check config files and strategy enablement. |
+| `tools/strategy_report_generator.py` | Generate strategy reports (last_90s, hourly) from DB. |
+
+Example:
+
+```bash
+python -m tools.export_last_90s_telemetry_csv --hours 4 --out data/last_90s_4h.csv
+python -m tools.export_atm_breakout_trades_7h_csv --hours 7 --trades-only
+```
+
+---
+
+## Repository layout
+
+```
+config/
+  v2_common.yaml          # V2 intervals, caps, dry_run
+  v2_fifteen_min.yaml     # 15-min pipeline + last_90s + ATM breakout
+  v2_hourly.yaml          # Hourly pipeline (optional)
+  common.yaml             # Legacy shared config
+  fifteen_min.yaml        # Legacy 15-min
+  config.yaml             # Legacy merged entry
 
 bot/
-  main.py                       # Bot entrypoint
-  scheduler.py                  # Run loop
-  market.py                     # Market discovery + orderbook
-  strategy.py                   # Signal generation
-  execution.py                  # Order placement (TRADE mode)
-  state.py                      # SQLite persistence
-  logging.py                    # Structured logging
+  v2_main.py              # V2 entry: load config, start pipeline threads
+  pipeline/
+    run_unified.py        # Single pipeline cycle (context → intents → exits → executor)
+    data_layer.py         # Spot (Kraken/Coinbase), strike, distance (min/avg)
+    executor.py           # Place/cancel orders; TP/SL market-style sells; SL audit
+    registry.py           # Order registry + strategy reports (v2_state.db)
+    strategies/
+      last_90s.py         # last_90s_limit_99
+      atm_breakout.py     # atm_breakout_strategy
+  v2_config_loader.py    # Load and validate V2 YAML
+  main.py                 # Legacy bot entry
 
-config/                         # Split config (common + interval files)
-config.yaml                     # Legacy single-file config (optional)
-logs/
-  bot.log                       # Bot run logs (generated)
+src/
+  client/
+    kalshi_client.py      # Kalshi REST client (orders, positions, place_market_order, etc.)
+    kraken_client.py      # Kraken spot prices
+
+data/                     # Created at runtime; gitignored
+  v2_state.db             # V2 registry, telemetry, SL audit
+  bot_state.db            # Legacy state
+  *.csv                   # Exports (e.g. telemetry, ATM trades)
+
+tools/                    # Scripts for telemetry export, ATM trade export, reports
+docs/                     # Audit and verification notes
 ```
 
-## Strategy Roadmap (High Level)
-- Integrate LLM-assisted market selection (OpenAI/xAI).
-- Add risk controls (exposure caps, kill-switches, dry-run mode).
-- Enhance execution logic (slippage tolerance, order retries).
-- Expand market coverage; 15-min bot supports BTC, ETH, SOL, XRP.
+---
 
-## Safety & Compliance
-This repository is for research and experimentation. Prediction markets involve real financial risk. Ensure you understand Kalshi's rules and applicable regulations before trading.
+## Environment variables
 
-## Disclaimer
-This software is provided "as is" with no warranties. Use at your own risk.
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `KALSHI_API_KEY` | Yes (for live) | Kalshi API key ID. |
+| `KALSHI_PRIVATE_KEY` | Yes (for live) | Path to PEM file or inline PEM content for request signing. |
+| `KALSHI_BASE_URL` | Yes (for live) | Kalshi API base URL with no path (e.g. `https://api.elections.kalshi.com` for production). |
+| `V2_DRY_RUN` | No | Override config: `true` or `false` to force dry run or live. |
+| `SMTP_*` | No | Optional; used for legacy hourly report email. |
+
+---
+
+## Safety and compliance
+
+- **Dry run by default** — V2 starts with `dry_run: true` unless overridden in config or `V2_DRY_RUN=false`.
+- Prediction markets involve real financial risk. Understand Kalshi’s rules and your local regulations before trading.
+- This software is provided “as is” without warranty. Use at your own risk.
+
+---
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE) in the repository.
