@@ -1,0 +1,7 @@
+# V2 hourly: pipeline + strategies (strict schema)
+hourly:
+  pipeline:
+    run_interval_seconds: 1
+    strategy_priority: []
+
+  strategies: {}

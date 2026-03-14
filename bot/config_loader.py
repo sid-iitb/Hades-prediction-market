@@ -79,6 +79,9 @@ def _load_split_config(config_dir: Path) -> Dict[str, Any]:
             if "spot_window_by_asset" not in cfg:
                 cfg["spot_window_by_asset"] = {}
             _deep_merge(cfg["spot_window_by_asset"], hourly["spot_window_by_asset"])
+        # Hourly last-90s limit-99 (separate thread)
+        if "hourly_last_90s_limit_99" in hourly:
+            cfg["hourly_last_90s_limit_99"] = hourly["hourly_last_90s_limit_99"]
 
     # fifteen_min, daily, weekly: set cfg[key] = content; pull exit_criteria into cfg["exit_criteria"][key]
     for name in ("fifteen_min", "daily", "weekly"):

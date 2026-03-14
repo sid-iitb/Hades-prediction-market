@@ -4,12 +4,22 @@ import pytz
 # Base URL for Kalshi events
 BASE_URL = "https://kalshi.com/markets/kxbtcd/bitcoin-price-abovebelow/"
 
-# Kalshi event ticker prefixes for hourly price markets
+# Kalshi event ticker prefixes for hourly price markets (above/below)
 ASSET_PREFIXES = {
     "btc": "kxbtcd",
     "eth": "kxethd",
     "sol": "kxsold",
     "xrp": "kxxrpd",
+    "doge": "kxdoge",  # doge has range only (no above/below)
+}
+
+# Hourly range market prefixes (2 per asset for btc/eth/sol/xrp; 1 for doge -> 9 markets total)
+ASSET_PREFIXES_HOURLY_RANGE = {
+    "btc": "kxbtc",
+    "eth": "kxeth",
+    "sol": "kxsol",
+    "xrp": "kxxrp",
+    "doge": "kxdoge",
 }
 
 # 15-minute crypto market prefixes (format: YYmmmDDHHMM)
@@ -21,26 +31,39 @@ ASSET_PREFIXES_15M = {
 }
 
 
-def generate_kalshi_slug(target_time, asset: str = "btc"):
-    """
-    Generates the Kalshi event slug for a given datetime and asset.
-    Format: {prefix}-[YY][MMM][DD][HH]
-    Example: kxbtcd-25nov2614 (Nov 26, 2025, 14:00 ET), kxethd-25nov2614 for ETH
-    """
-    prefix = ASSET_PREFIXES.get(str(asset).lower(), "kxbtcd")
-    # Ensure time is in Eastern Time
-    et_tz = pytz.timezone('US/Eastern')
+def _slug_for_prefix_and_time(prefix: str, target_time) -> str:
+    """Build hourly slug for a given prefix and Eastern time. Format: prefix-YYmmmDDHH."""
+    et_tz = pytz.timezone("US/Eastern")
     if target_time.tzinfo is None:
         target_time = pytz.utc.localize(target_time).astimezone(et_tz)
     else:
         target_time = target_time.astimezone(et_tz)
-
     year = target_time.strftime("%y")
     month = target_time.strftime("%b").lower()
     day = target_time.strftime("%d")
     hour = target_time.strftime("%H")
-    slug = f"{prefix}-{year}{month}{day}{hour}"
-    return slug
+    return f"{prefix}-{year}{month}{day}{hour}"
+
+
+def generate_kalshi_slug(target_time, asset: str = "btc"):
+    """
+    Generates the Kalshi event slug for a given datetime and asset (above/below).
+    Format: {prefix}-[YY][MMM][DD][HH]
+    Example: kxbtcd-25nov2614 (Nov 26, 2025, 14:00 ET), kxethd-25nov2614 for ETH
+    """
+    prefix = ASSET_PREFIXES.get(str(asset).lower(), "kxbtcd")
+    return _slug_for_prefix_and_time(prefix, target_time)
+
+
+def generate_kalshi_slug_range(target_time, asset: str):
+    """
+    Generates the Kalshi hourly range event slug (e.g. kxbtc-26jan2817).
+    Returns None if asset has no range prefix.
+    """
+    prefix = ASSET_PREFIXES_HOURLY_RANGE.get(str(asset).lower())
+    if not prefix:
+        return None
+    return _slug_for_prefix_and_time(prefix, target_time)
 
 
 def generate_15min_slug(target_time, asset: str = "btc"):

@@ -1,0 +1,71 @@
+========================================================================
+  360° TECHNICAL VERIFICATION — last_90s strategy
+  Window: last 60 minutes (since 2026-03-02T21:47:46 UTC)
+  DB: /Users/amareshpandey/Desktop/Start-up-Aajsearch/Hades-prediction-market/data/bot_state.db
+  Log: /Users/amareshpandey/Desktop/Start-up-Aajsearch/Hades-prediction-market/logs/bot.log
+========================================================================
+
+--- 1. Time-Decay Placement Check (placed == 1) ---
+  window_id=KXBTC15M-26MAR021745 asset=btc limit_or_market=limit seconds_to_close=4.299833 distance=19.589999999996508 min_distance_threshold=7.0
+    ts_utc=2026-03-02T22:44:57.656208+00:00
+  window_id=KXBTC15M-26MAR021745 asset=btc limit_or_market=market seconds_to_close=27.898936 distance=15.410000000003492 min_distance_threshold=14.0
+    ts_utc=2026-03-02T22:44:32.815489+00:00
+  window_id=KXSOL15M-26MAR021745 asset=sol limit_or_market=limit seconds_to_close=29.923984 distance=0.22679999999999723 min_distance_threshold=0.04000000000000001
+    ts_utc=2026-03-02T22:44:30.825122+00:00
+  window_id=KXETH15M-26MAR021745 asset=eth limit_or_market=limit seconds_to_close=29.924247 distance=3.7100000000000364 min_distance_threshold=1.0
+    ts_utc=2026-03-02T22:44:30.805685+00:00
+  window_id=KXBTC15M-26MAR021730 asset=btc limit_or_market=limit seconds_to_close=28.426654 distance=90.56999999999243 min_distance_threshold=14.0
+    ts_utc=2026-03-02T22:29:32.252785+00:00
+  window_id=KXXRP15M-26MAR021730 asset=xrp limit_or_market=limit seconds_to_close=28.42607 distance=0.0022500000000000853 min_distance_threshold=0.0012000000000000001
+    ts_utc=2026-03-02T22:29:32.219895+00:00
+  window_id=KXSOL15M-26MAR021730 asset=sol limit_or_market=limit seconds_to_close=28.426267 distance=0.29299999999999216 min_distance_threshold=0.04000000000000001
+    ts_utc=2026-03-02T22:29:32.210603+00:00
+  window_id=KXETH15M-26MAR021730 asset=eth limit_or_market=limit seconds_to_close=28.42644 distance=6.449999999999818 min_distance_threshold=1.0
+    ts_utc=2026-03-02T22:29:32.198261+00:00
+  window_id=KXSOL15M-26MAR021715 asset=sol limit_or_market=market seconds_to_close=20.127663 distance=0.04229999999999734 min_distance_threshold=0.020000000000000004
+    ts_utc=2026-03-02T22:14:40.607026+00:00
+  window_id=KXXRP15M-26MAR021715 asset=xrp limit_or_market=limit seconds_to_close=24.816052 distance=0.0011799999999999589 min_distance_threshold=0.0006000000000000001
+    ts_utc=2026-03-02T22:14:35.981398+00:00
+  window_id=KXETH15M-26MAR021715 asset=eth limit_or_market=limit seconds_to_close=28.99953 distance=2.1399999999998727 min_distance_threshold=1.0
+    ts_utc=2026-03-02T22:14:31.728344+00:00
+  window_id=KXBTC15M-26MAR021715 asset=btc limit_or_market=limit seconds_to_close=28.999837 distance=133.31999999999243 min_distance_threshold=14.0
+    ts_utc=2026-03-02T22:14:31.656722+00:00
+  window_id=KXBTC15M-26MAR021700 asset=btc limit_or_market=limit seconds_to_close=19.033981 distance=14.430000000007567 min_distance_threshold=7.0
+    ts_utc=2026-03-02T21:59:42.681922+00:00
+  window_id=KXBTC15M-26MAR021700 asset=btc limit_or_market=market seconds_to_close=21.502912 distance=14.430000000007567 min_distance_threshold=7.0
+    ts_utc=2026-03-02T21:59:39.409050+00:00
+  window_id=KXSOL15M-26MAR021700 asset=sol limit_or_market=limit seconds_to_close=28.931927 distance=0.10829999999999984 min_distance_threshold=0.04000000000000001
+    ts_utc=2026-03-02T21:59:32.143743+00:00
+  window_id=KXXRP15M-26MAR021700 asset=xrp limit_or_market=limit seconds_to_close=28.931583 distance=0.002729999999999899 min_distance_threshold=0.0012000000000000001
+    ts_utc=2026-03-02T21:59:31.874394+00:00
+  window_id=KXETH15M-26MAR021700 asset=eth limit_or_market=limit seconds_to_close=28.932339 distance=1.6399999999998727 min_distance_threshold=1.0
+    ts_utc=2026-03-02T21:59:31.796622+00:00
+  window_id=KXSOL15M-26MAR021700 asset=sol limit_or_market=market seconds_to_close=64.681578 distance=0.12829999999999586 min_distance_threshold=0.1
+    ts_utc=2026-03-02T21:58:56.556554+00:00
+
+--- 2. Aggregated Skip Analysis (placed == 0) — full skip_details ---
+  [1] window_id=KXXRP15M-26MAR021745 asset=xrp skip_reason=aggregated_skips
+      skip_details (full): No skip history recorded
+
+--- 3. Dual-Strike (Multi-Order) Check ---
+  window_id=KXBTC15M-26MAR021700 asset=btc count=2
+    order_id=1793dde4-6dfd-40c2-b059-f77857b82ba0 limit_or_market=market price_cents=99 ts_utc=2026-03-02T21:59:39.409050+00:00
+    order_id=d5e6ec0f-5da5-4e8b-b95f-7d3419fcd2b5 limit_or_market=limit price_cents=99 ts_utc=2026-03-02T21:59:42.681922+00:00
+  window_id=KXBTC15M-26MAR021745 asset=btc count=2
+    order_id=796e565b-81f6-4ce0-bffe-bf8afc59562b limit_or_market=market price_cents=94 ts_utc=2026-03-02T22:44:32.815489+00:00
+    order_id=fd31d11f-9395-4a74-a544-3b72bead201e limit_or_market=limit price_cents=99 ts_utc=2026-03-02T22:44:57.656208+00:00
+  window_id=KXSOL15M-26MAR021700 asset=sol count=2
+    order_id=027aa832-f4b3-4be4-9620-cf05244af3fd limit_or_market=market price_cents=99 ts_utc=2026-03-02T21:58:56.556554+00:00
+    order_id=39d3749c-297b-44ba-a9ea-b07bba4482ab limit_or_market=limit price_cents=99 ts_utc=2026-03-02T21:59:32.143743+00:00
+
+--- 4. Stop-Loss & Resolution Integrity ---
+  Rows with is_stop_loss == 1: none in last 60 min.
+  Completed windows (final_outcome / pnl_cents) in window:
+  No resolved rows (final_outcome/pnl_cents) in last 60 min.
+
+--- 5. System Health (Log Exceptions — last 60 min) ---
+  No Traceback/Exception/Error/DB warnings tied to [last_90s] in last 60 min.
+
+========================================================================
+  End of report.
+========================================================================

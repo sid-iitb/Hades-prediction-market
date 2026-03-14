@@ -75,6 +75,39 @@ class TestEntrySignalsFarthest(unittest.TestCase):
         })
         self.assertEqual(len(signals), 0)
 
+    def test_pick_all_in_range_returns_multiple_signals(self):
+        # With pick_all_in_range=True, all tickers in range emit YES and/or NO; risk guards filter later.
+        quotes = [
+            TickerQuote("T1", 69000, yes_ask=95, no_ask=5, yes_bid=94, no_bid=4, subtitle="$69k"),
+            TickerQuote("T2", 68500, yes_ask=96, no_ask=4, yes_bid=95, no_bid=3, subtitle="$68.5k"),
+            TickerQuote("T3", 70000, yes_ask=5, no_ask=94, yes_bid=4, no_bid=93, subtitle="$70k"),
+        ]
+        thresholds = {"yes_min": 90, "yes_max": 99, "no_min": 90, "no_max": 99}
+        signals = generate_signals_farthest(
+            quotes, spot_price=69100, ctx_late_window=False, thresholds=thresholds,
+            pick_all_in_range=True,
+        )
+        self.assertGreaterEqual(len(signals), 2)
+        tickers = {s.ticker for s in signals}
+        sides = {s.side for s in signals}
+        self.assertIn("T1", tickers)
+        self.assertIn("T2", tickers)
+        self.assertIn("T3", tickers)
+        self.assertIn("yes", sides)
+        self.assertIn("no", sides)
+
+    def test_pick_all_in_range_false_unchanged(self):
+        # Default (pick_all_in_range=False) still returns single farthest.
+        quotes = [
+            TickerQuote("NEAR", 69000, yes_ask=95, no_ask=5, yes_bid=94, no_bid=4, subtitle="$69k"),
+            TickerQuote("FAR", 68500, yes_ask=95, no_ask=5, yes_bid=94, no_bid=4, subtitle="$68.5k"),
+        ]
+        signals = generate_signals_farthest(quotes, spot_price=69100, ctx_late_window=False, thresholds={
+            "normal": {"yes_min": 94, "yes_max": 99, "no_min": 94, "no_max": 99},
+        })
+        self.assertEqual(len(signals), 1)
+        self.assertEqual(signals[0].ticker, "FAR")
+
 
 # ---------------------------------------------------------------------------
 # Entry: generate_signals_15min

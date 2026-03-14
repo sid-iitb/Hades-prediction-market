@@ -1,0 +1,25 @@
+common:
+  poll_interval_seconds: 10
+  is_dry_run: false
+
+assets:
+  SOL-USD:
+    enabled: true
+    lower_price: 74.0
+    upper_price: 94.0
+    num_grids: 5
+    order_size_usd: 2.0
+
+  DOGE-USD:
+    enabled: false
+    lower_price: 0.10
+    upper_price: 0.30
+    num_grids: 11
+    order_size_usd: 2.0
+
+  BTC-USD:
+    enabled: false
+    lower_price: 55000.0
+    upper_price: 75000.0
+    num_grids: 21
+    order_size_usd: 10.0

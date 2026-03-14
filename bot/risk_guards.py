@@ -323,8 +323,19 @@ def _min_distance_required(
     asset: str,
     spot: float,
     cfg: dict,
+    seconds_to_close: Optional[float] = None,
+    interval: Optional[str] = None,
 ) -> Optional[float]:
-    """Returns min USD distance from strike required, or None if disabled/unknown."""
+    """
+    Returns min USD distance from strike required, or None if disabled/unknown.
+
+    For 15-min interval only, cfg["assets"][asset] may be a list of time tiers:
+      - { max_seconds_left, min_seconds_left, floor_usd, (optional pct) }
+    We select the tier matching current seconds_to_close (step function).
+    If no tier matches, we clamp to the nearest tier:
+      - seconds_to_close above all tiers -> use the earliest (largest max_seconds_left) tier
+      - seconds_to_close below all tiers -> use the latest (smallest min_seconds_left) tier
+    """
     if not cfg.get("enabled", False):
         return None
     assets_cfg = cfg.get("assets", {}) or {}
@@ -332,11 +343,70 @@ def _min_distance_required(
     ac = assets_cfg.get(a) or assets_cfg.get("btc")
     if not ac:
         return None
-    pct = ac.get("pct", 0.001)
-    floor_usd = ac.get("floor_usd", 50)
     if spot is None or spot <= 0:
         return None
-    return max(floor_usd, spot * pct)
+
+    # Time-tiered floors (15-min only)
+    if str(interval).lower() in {"15min", "15_min", "fifteen_min"} and isinstance(ac, list):
+        tiers = []
+        for t in ac:
+            if not isinstance(t, dict):
+                continue
+            try:
+                mx = float(t.get("max_seconds_left"))
+                mn = float(t.get("min_seconds_left"))
+                floor = float(t.get("floor_usd"))
+            except (TypeError, ValueError):
+                continue
+            pct_t = t.get("pct", None)
+            try:
+                pct_v = float(pct_t) if pct_t is not None else None
+            except (TypeError, ValueError):
+                pct_v = None
+            tiers.append({"max": mx, "min": mn, "floor": floor, "pct": pct_v})
+
+        if not tiers:
+            return None
+
+        # Sort by max descending (earliest first)
+        tiers.sort(key=lambda x: x["max"], reverse=True)
+
+        s = float(seconds_to_close) if seconds_to_close is not None else None
+        chosen = None
+        if s is not None:
+            for t in tiers:
+                if t["min"] <= s <= t["max"]:
+                    chosen = t
+                    break
+            if chosen is None:
+                # Clamp to nearest tier in time
+                max_of_all = max(t["max"] for t in tiers)
+                min_of_all = min(t["min"] for t in tiers)
+                if s > max_of_all:
+                    # more time than defined -> widest tier (earliest)
+                    chosen = max(tiers, key=lambda x: x["max"])
+                elif s < min_of_all:
+                    # less time than defined -> closest-to-expiry tier (latest)
+                    chosen = min(tiers, key=lambda x: x["min"])
+                else:
+                    # In a gap: choose the safest (widest) tier by floor
+                    chosen = max(tiers, key=lambda x: x["floor"])
+        else:
+            # No seconds_to_close: safest (widest) tier by floor
+            chosen = max(tiers, key=lambda x: x["floor"])
+
+        pct_v = chosen.get("pct")
+        min_dist = float(chosen["floor"])
+        if pct_v is not None and pct_v > 0:
+            min_dist = max(min_dist, float(spot) * float(pct_v))
+        return min_dist
+
+    # Original (non-tiered) behavior
+    if isinstance(ac, dict):
+        pct = ac.get("pct", 0.001)
+        floor_usd = ac.get("floor_usd", 50)
+        return max(float(floor_usd), float(spot) * float(pct))
+    return None
 
 
 def gate_allow_entry(
@@ -600,7 +670,7 @@ def gate_allow_entry(
     elif not spot_ok:
         eval_payload["distance_buffer_skipped_reason"] = "DISTANCE_BUFFER_SKIPPED_SPOT_UNKNOWN"
     else:
-        min_dist = _min_distance_required(asset, spot, dist_cfg)
+        min_dist = _min_distance_required(asset, spot, dist_cfg, seconds_to_close=seconds_to_close, interval=interval)
         eval_payload["min_distance_required"] = min_dist
         if min_dist is not None:
             if side == "yes":

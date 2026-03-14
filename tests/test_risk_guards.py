@@ -198,5 +198,82 @@ class TestLatePersistenceOverride(unittest.TestCase):
         self.assertFalse(payload.get("late_persistence_applied"))
 
 
+class TestDistanceBufferTimeTiers15Min(unittest.TestCase):
+    """Verify 15-min distance_buffer can use time-tiered floors (step-function)."""
+
+    def setUp(self):
+        self.window_id = "TEST_WINDOW_TIER_%s" % id(self)
+        self.ticker = "TEST_TICKER_TIER"
+        self.entry_band = "94-99"
+
+    def tearDown(self):
+        reset_window_on_expiry("15min", self.window_id)
+
+    def _guards_with_tiers(self):
+        return {
+            "enabled": True,
+            "no_new_entry_cutoff_seconds": 0,
+            "persistence_polls": 1,
+            "late_persistence_override": {"enabled": False},
+            "stop_once_disable": {"enabled": False},
+            "recent_cross": {"enabled": False},
+            "distance_buffer": {
+                "enabled": True,
+                "assets": {
+                    "btc": [
+                        {"max_seconds_left": 420, "min_seconds_left": 300, "floor_usd": 300},
+                        {"max_seconds_left": 300, "min_seconds_left": 120, "floor_usd": 200},
+                        {"max_seconds_left": 120, "min_seconds_left": 75, "floor_usd": 100},
+                    ]
+                },
+            },
+            "anchor_one_per_side": {"enabled": False},
+        }
+
+    def test_tier_selected_by_seconds_to_close(self):
+        guards = self._guards_with_tiers()
+        # seconds_to_close=150 -> picks 300-120 tier floor=200
+        allowed, reason, payload = gate_allow_entry(
+            interval="15min",
+            window_id=self.window_id,
+            asset="btc",
+            ticker=self.ticker,
+            side="yes",
+            yes_price=95,
+            no_price=5,
+            spot=100000.0,
+            strike=99900.0,  # distance = 100
+            seconds_to_close=150.0,
+            entry_band=self.entry_band,
+            guards_cfg=guards,
+            is_hourly=False,
+        )
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "distance_buffer")
+        self.assertEqual(payload.get("min_distance_required"), 200)
+
+    def test_seconds_below_smallest_clamps_to_latest_tier(self):
+        guards = self._guards_with_tiers()
+        # seconds_to_close=60 (<75) clamps to latest tier floor=100
+        allowed, reason, payload = gate_allow_entry(
+            interval="15min",
+            window_id=self.window_id,
+            asset="btc",
+            ticker=self.ticker + "_B",
+            side="yes",
+            yes_price=95,
+            no_price=5,
+            spot=100000.0,
+            strike=99950.0,  # distance = 50
+            seconds_to_close=60.0,
+            entry_band=self.entry_band,
+            guards_cfg=guards,
+            is_hourly=False,
+        )
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "distance_buffer")
+        self.assertEqual(payload.get("min_distance_required"), 100)
+
+
 if __name__ == "__main__":
     unittest.main()

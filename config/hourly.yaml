@@ -1,19 +1,54 @@
 # Hourly: entry window + exit criteria (aligned), then risk guards, thresholds, spot_window
 
+# --- Hourly last-90s style (limit 99): 2 YES below spot + 2 NO above spot per market, in last window_seconds ---
+# 9 market IDs total: 2 each (above/below + range) for btc, eth, sol, xrp; 1 (range) for doge
+# stop_loss_pct, window_seconds, stop_loss_distance_factor: scalar = same for all; or per-asset dict e.g. { btc: 15, eth: 12, doge: 10 }
+# max_yes_per_market / max_no_per_market: cap orders per market (farthest first). 2+2 = 4 per market, 36/hour max. 0 = no cap.
+hourly_last_90s_limit_99:
+  enabled: false
+  window_seconds: 75
+  limit_price_cents: 99
+  min_bid_cents: 94
+  side: both
+  stop_loss_pct: 15
+  # Stop loss: only trigger when spot distance <= this fraction of min_distance_at_placement. Can be per-asset dict.
+  stop_loss_distance_factor: 0.75
+  run_interval_seconds: 1
+  assets: [btc, eth, sol, xrp, doge]
+  max_yes_per_market: 3
+  max_no_per_market: 3
+  max_cost_cents: 100
+  max_cost_cents_by_asset:
+    btc: 100
+    eth: 100
+    sol: 100
+    xrp: 100
+    doge: 100
+  # Skip placement if too close to threshold/edge. 0 = no filter.
+  # D (above/below): distance = |spot - strike|. B (range): distance = min distance to range start or end (boundary).
+  # So for range $65,250–$65,500, spot 65,270 is 20 from start → skip if min_dist=40 (avoid edge risk).
+  min_distance_at_placement:
+      btc: 80
+      eth: 7.5
+      sol: 0.3
+      xrp: 0.07
+      doge: 0.0017
+
 # --- Entry window & exit criteria (same window: bot sleeps until minutes_to_close <= late_window) ---
 
 schedule:
   # --- Entry window & exit criteria (same window: bot runs when minutes_to_close <= late_window) ---
   entry_window:
-    late_window_minutes: 15   # entry: start trading when minutes_to_close <= this
-    late_interval_seconds: 10  # entry: run bot every N sec while in window (overrides late_interval_minutes if set)
+    late_window_minutes: 20 # entry: start trading when minutes_to_close <= this
+    late_interval_seconds: 1  # entry: run bot every N sec while in window (overrides late_interval_minutes if set)
   exit_criteria:
-    stop_loss_pct: 0.20
-    panic_stop_loss_pct: 0.50
-    evaluation_interval_seconds: 10  # exit checked every 10 sec (aligned with entry run interval)
+    stop_loss_pct: 0.30
+    panic_stop_loss_pct: 0.30
+    stop_loss_persistence_polls: 1
+    evaluation_interval_seconds: 1  # exit checked every 10 sec (aligned with entry run interval)
   hourly_risk_guards:
     enabled: true
-    no_new_entry_cutoff_seconds: 120
+    no_new_entry_cutoff_seconds: 60
     persistence_polls: 1
     late_persistence_override:
       enabled: false
@@ -28,8 +63,8 @@ schedule:
     distance_buffer:
       enabled: true
       assets:
-        btc: { pct: 0.0025, floor_usd: 167 }
-        eth: { pct: 0.0050, floor_usd: 15 }
+        btc: { pct: 0.025, floor_usd: 350 }
+        eth: { pct: 0.0050, floor_usd: 50 }
     anchor_one_per_side:
       enabled: true
       lock_per_window: true
@@ -51,9 +86,11 @@ spot_window_by_asset:
   eth: 200
   sol: 50
   xrp: 1
+  # DOGE hourly range markets use $0.005 bands (e.g. $0.09–0.095); window in dollars so only bands near spot pass
+  doge: 0.005
 
 thresholds:
-  yes_min: 90
+  yes_min: 92
   yes_max: 99
-  no_min: 90
+  no_min: 92
   no_max: 99

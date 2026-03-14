@@ -242,7 +242,7 @@ def evaluate_positions(
     ticker_to_strike: Optional[Dict[str, float]] = None,
     seconds_to_close: Optional[float] = None,
     hard_flip_cfg: Optional[Dict[str, Any]] = None,
-    sl_persistence_polls: int = 2,
+    sl_persistence_polls: int = 1,
     panic_stop_loss_pct: Optional[float] = None,
 ) -> List[ExitResult]:
     """
@@ -471,7 +471,7 @@ def run_exit_criteria(
     interval_cfg = exit_cfg.get(interval_key, {}) or {}
     stop_loss_pct = stop_loss_pct_override if stop_loss_pct_override is not None else interval_cfg.get("stop_loss_pct", exit_cfg.get("stop_loss_pct", 0.20))
     profit_target_pct = profit_target_pct_override if profit_target_pct_override is not None else interval_cfg.get("profit_target_pct") or exit_cfg.get("profit_target_pct")
-    sl_persistence_polls = int(interval_cfg.get("stop_loss_persistence_polls") or exit_cfg.get("stop_loss_persistence_polls", 2))
+    sl_persistence_polls = int(interval_cfg.get("stop_loss_persistence_polls") or exit_cfg.get("stop_loss_persistence_polls", 1))
     # Panic stop: immediate exit when PnL ≤ panic_stop_loss_pct (bypass persistence)
     panic_stop_loss_pct = interval_cfg.get("panic_stop_loss_pct")
 

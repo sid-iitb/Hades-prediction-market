@@ -1,8 +1,15 @@
 kalshi_private_key
 *.db
 .env
+.env.local
+cdp_api_key.json
+cdp_api_key-*.json
 logs/
 .venv/
 data/
 reports/
 console.log
+# Local exports and temp files (optional: remove if you want these in repo)
+# *.csv
+# *.txt
+# *.sql

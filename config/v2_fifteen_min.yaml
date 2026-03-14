@@ -1,0 +1,47 @@
+# V2 fifteen_min: pipeline + strategies (strict schema)
+fifteen_min:
+  pipeline:
+    run_interval_seconds: 1
+    strategy_priority: [last_90s_limit_99, atm_breakout_strategy]
+
+  strategies:
+    last_90s_limit_99:
+      enabled: true
+      window_seconds: { btc: 85, eth: 85, sol: 85, xrp: 85 }
+      limit_price_cents: 99
+      min_bid_cents: { btc: 85, eth: 80, sol: 88, xrp: 75 }
+      # contracts per placement; scalar = same for all assets, or per-asset override
+      order_count: { btc: 50, eth: 50, sol: 50, xrp: 50 }  # ~$2 per order (2 * 99¢)
+      # side can be: "no", "yes", or "auto" (picks whichever side meets min_bid_cents)
+      side: auto
+      stop_loss_pct: 15
+      # Use 0.8 to ignore fake-outs on big coins, but 1.0 (always active) on tight coins
+      stop_loss_distance_factor: { btc: 0.8, eth: 0.8, sol: 0.8, xrp: 0.8 }
+      max_cost_cents: 80000      # $6 total limit per window/asset
+      min_distance_at_placement: { btc: 38.0, eth: 1.5, sol: 0.10, xrp: 0.001 }
+
+    atm_breakout_strategy:
+      enabled: true
+      min_seconds_to_close: 120    # Still stops looking for NEW trades 2 mins before expiry
+      max_seconds_to_close: 840    # Starts looking 10 mins before expiry
+      # Require minimum distance from strike at placement (same units as spot/strike; per asset)
+      min_distance_at_placement: { btc: 60, eth: 3, sol: 0.25, xrp: 0.003 }
+
+      # Breakout Confirmation Pricing (ITM entries after spot crosses strike)
+      min_entry_price: 55          # Minimum price we’re willing to pay for ITM confirmation
+      max_entry_price: 70          # Maximum price we’re willing to pay (e.g. 45–70c band)
+      # Optional: tighten/relax side-specific spread guard for entries
+      max_entry_spread_cents: 10   # Reject if ask - bid on chosen side > 10c
+
+      # Momentum entry: required $ move over the lookback window (same units as spot/strike).
+      momentum_window_seconds: 90  # Look back 30s for sustained move; ref_spot = spot from >= 30s ago
+      momentum_trigger_3s: { btc: 60.0, eth: 3, sol: 0.25, xrp: 0.003 } # Min $ move over that window; larger = tighter
+
+      # Adjusted Asymmetric Exits for ITM entries
+      take_profit_cents: 85        # Target 88c. (If bought at 60c, gain = +28c)
+      stop_loss_cents: 35          # Stop out at 35c. (If bought at 60c, loss = -25c)
+
+      # Sizing and Risk
+      order_count: 10              # contracts per order
+      max_cost_cents: 1000         # total limit per window/asset
+      contracts: 10

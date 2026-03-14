@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""
+Summary of the 66 last_90s_limit_99 filled orders: how many resolved in our favor,
+how many had stop loss. Reads placements TSV + stoplosses TSV, fetches Kalshi
+market results for each ticker, and reports won/lost/stopped out.
+
+Usage:
+  python tools/last_90s_resolution_summary.py
+  python tools/last_90s_resolution_summary.py --placements reports/last_90s_placements.tsv --stoplosses reports/last_90s_stoplosses.tsv
+  python tools/last_90s_resolution_summary.py --no-fetch  # use final_outcome column from TSV if present
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+from pathlib import Path
+
+
+def _project_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def fetch_final_outcomes(tickers: set[str]) -> dict[str, str]:
+    """Query Kalshi for each ticker's market result. Returns ticker -> yes|no|scalar|not_settled|n/a."""
+    if not tickers:
+        return {}
+    root = _project_root()
+    sys.path.insert(0, str(root))
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(root / ".env")
+        from src.client.kalshi_client import KalshiClient
+    except ImportError:
+        return {t: "n/a" for t in tickers}
+    try:
+        client = KalshiClient()
+    except Exception:
+        return {t: "n/a" for t in tickers}
+    out: dict[str, str] = {}
+    for ticker in sorted(tickers):
+        if not ticker or ticker == "n/a":
+            continue
+        try:
+            m = client.get_market(ticker)
+            if not m:
+                out[ticker] = "n/a"
+                continue
+            status = (m.get("status") or "").strip().lower()
+            result = (m.get("result") or "").strip().lower()
+            if result in ("yes", "no", "scalar"):
+                out[ticker] = result
+            elif status in ("finalized", "determined"):
+                out[ticker] = result if result else "not_settled"
+            else:
+                out[ticker] = status or "not_settled"
+        except Exception:
+            out[ticker] = "n/a"
+        time.sleep(0.15)
+    for t in tickers:
+        if t and t != "n/a" and t not in out:
+            out[t] = "n/a"
+    return out
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Last-90s filled orders: resolved in favor vs stop loss")
+    parser.add_argument("--placements", default="reports/last_90s_placements.tsv", help="Placements TSV path")
+    parser.add_argument("--stoplosses", default="reports/last_90s_stoplosses.tsv", help="Stop losses TSV path")
+    parser.add_argument("--no-fetch", action="store_true", help="Do not fetch Kalshi; use final_outcome from TSV if present")
+    args = parser.parse_args()
+
+    root = _project_root()
+    placements_path = Path(args.placements) if Path(args.placements).is_absolute() else root / args.placements
+    stoplosses_path = Path(args.stoplosses) if Path(args.stoplosses).is_absolute() else root / args.stoplosses
+
+    if not placements_path.exists():
+        print("Placements TSV not found:", placements_path, file=sys.stderr)
+        sys.exit(1)
+
+    # Parse placements: keep rows with executed=1, dedupe by order_id (keep first row per order_id)
+    with open(placements_path) as f:
+        header = f.readline().strip().split("\t")
+        try:
+            idx_order_id = header.index("order_id")
+            idx_executed = header.index("executed")
+            idx_ticker = header.index("ticker")
+            idx_asset = header.index("asset")
+            idx_side = header.index("side")
+            idx_final_outcome = header.index("final_outcome") if "final_outcome" in header else None
+        except ValueError as e:
+            print("Missing column in placements TSV:", e, file=sys.stderr)
+            sys.exit(1)
+
+    filled: list[dict] = []
+    seen_oid: set[str] = set()
+    with open(placements_path) as f:
+        f.readline()
+        for line in f:
+            parts = line.strip().split("\t")
+            if len(parts) <= max(idx_order_id, idx_executed):
+                continue
+            if parts[idx_executed].strip() != "1":
+                continue
+            oid = parts[idx_order_id].strip()
+            if not oid or oid == "n/a" or oid in seen_oid:
+                continue
+            seen_oid.add(oid)
+            ticker = parts[idx_ticker].strip() if idx_ticker < len(parts) else ""
+            asset = parts[idx_asset].strip() if idx_asset < len(parts) else ""
+            side = (parts[idx_side].strip() or "").lower() if idx_side < len(parts) else ""
+            fo_tsv = parts[idx_final_outcome].strip() if idx_final_outcome is not None and idx_final_outcome < len(parts) else ""
+            filled.append({
+                "order_id": oid,
+                "ticker": ticker,
+                "asset": asset,
+                "side": side,
+                "final_outcome_tsv": fo_tsv or None,
+            })
+
+    # Parse stop losses: (asset, ticker) and order_id if present
+    stop_tickers: set[tuple[str, str]] = set()
+    stop_order_ids: set[str] = set()
+    if stoplosses_path.exists():
+        with open(stoplosses_path) as f:
+            sl_header = f.readline().strip().split("\t")
+            try:
+                sl_asset = sl_header.index("asset")
+                sl_ticker = sl_header.index("ticker")
+                sl_oid = sl_header.index("order_id") if "order_id" in sl_header else None
+            except ValueError:
+                pass
+            else:
+                for line in f:
+                    p = line.strip().split("\t")
+                    if len(p) > max(sl_asset, sl_ticker):
+                        a, t = (p[sl_asset].strip() or "").upper(), (p[sl_ticker].strip() or "")
+                        if a and t:
+                            stop_tickers.add((a, t))
+                        if sl_oid is not None and len(p) > sl_oid and p[sl_oid].strip():
+                            stop_order_ids.add(p[sl_oid].strip())
+
+    # Fetch final outcomes from Kalshi unless --no-fetch
+    tickers_to_fetch = {row["ticker"] for row in filled if row["ticker"] and row["ticker"] != "n/a"}
+    if args.no_fetch or not tickers_to_fetch:
+        final_outcomes: dict[str, str] = {}
+    else:
+        print("Fetching market results from Kalshi for %d tickers..." % len(tickers_to_fetch), file=sys.stderr)
+        final_outcomes = fetch_final_outcomes(tickers_to_fetch)
+
+    # Classify each filled order
+    stop_loss_count = 0
+    won = 0
+    lost = 0
+    unknown = 0
+    rows_out: list[tuple[str, str, str, str, str, str]] = []
+
+    for row in filled:
+        oid = row["order_id"]
+        ticker = row["ticker"] or ""
+        asset = (row["asset"] or "").upper()
+        side = row["side"] or ""
+        fo = final_outcomes.get(ticker) or row.get("final_outcome_tsv") or "n/a"
+        fo = (fo or "").strip().lower()
+
+        is_stop = (oid in stop_order_ids) or ((asset, ticker) in stop_tickers)
+        if is_stop:
+            stop_loss_count += 1
+
+        if fo in ("yes", "no"):
+            if (side == "yes" and fo == "yes") or (side == "no" and fo == "no"):
+                res = "won"
+                won += 1
+            else:
+                res = "lost"
+                lost += 1
+        else:
+            res = "unknown"
+            unknown += 1
+
+        rows_out.append((
+            ticker,
+            asset,
+            side,
+            "stop" if is_stop else "-",
+            fo,
+            res,
+        ))
+
+    # Print report
+    print("")
+    print("=== Last-90s limit-99 filled orders: resolution summary ===")
+    print("(Based on %d unique filled orders from placements TSV with executed=1)" % len(filled))
+    print("")
+    print("--- Counts ---")
+    print("  Total filled (unique orders):     %d" % len(filled))
+    print("  Had stop loss:                    %d" % stop_loss_count)
+    print("  Resolved in our favor (won):      %d" % won)
+    print("  Resolved against us (lost):       %d" % lost)
+    print("  Unknown (market not yes/no):      %d" % unknown)
+    print("")
+    print("  (Won + Lost + Unknown = %d; stop loss is a subset of these.)" % (won + lost + unknown))
+    print("")
+    print("--- Per-order detail (ticker, asset, side, stop_loss, final_outcome, result) ---")
+    print("%s\t%s\t%s\t%s\t%s\t%s" % ("ticker", "asset", "side", "stop_loss", "final_outcome", "result"))
+    for r in rows_out:
+        print("%s\t%s\t%s\t%s\t%s\t%s" % r)
+    print("")
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()

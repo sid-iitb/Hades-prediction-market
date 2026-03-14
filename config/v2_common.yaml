@@ -1,0 +1,31 @@
+# V2 strict schema: required by v2_config_loader
+mode: TRADE
+run_mode: both
+
+# When true, pipeline runs and strategies fire but no real Kalshi orders are placed.
+# Set to false for live trading. Can override with env V2_DRY_RUN=false.
+dry_run: false
+
+intervals:
+  fifteen_min:
+    enabled: true
+    assets: [btc, eth, sol, xrp]
+    mode: TRADE
+  hourly:
+    enabled: false
+    assets: [btc, eth, sol, xrp]
+    mode: TRADE
+
+caps:
+  cap_scope: per_side
+  fifteen_min:
+    max_orders_per_ticker: 10
+    max_total_orders_per_15min: 50
+  hourly:
+    max_orders_per_ticker: 5
+    max_total_orders_per_hour: 50
+
+no_trade_windows:
+  enabled: false
+  timezone: America/Los_Angeles
+  windows: []

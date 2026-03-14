@@ -33,6 +33,9 @@ class KrakenClient:
     def latest_xrp_price(self) -> PriceQuote:
         return self._latest_price("XRPUSD", "XRP")
 
+    def latest_doge_price(self) -> PriceQuote:
+        return self._latest_price("DOGEUSD", "DOGE")
+
     def _latest_price(self, pair: str, symbol: str) -> PriceQuote:
         payload = self._get_json(f"{self._base_url}/0/public/Ticker?pair={pair}")
         if payload.get("error"):

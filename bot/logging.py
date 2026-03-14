@@ -53,22 +53,49 @@ def setup_console_log(console_log_file: Optional[str], project_root: Optional[Pa
     sys.stdout = _console_tee
 
 
+class UTCFormatter(logging.Formatter):
+    """Formatter that uses UTC for asctime so last_90s_report --since-hours filters correctly."""
+
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.fromtimestamp(record.created, tz=timezone.utc)
+        if datefmt:
+            return dt.strftime(datefmt)
+        return dt.isoformat()
+
+
 def setup_logging(log_file: str, level: str = "INFO") -> logging.Logger:
     """
     Configure logging. JSON entries go to file only.
     Console output is via print_console_summary() only (avoids duplicate output).
+    Timestamps are UTC so last_90s_report --since-hours filters skips/placements correctly.
+    Attaches file handler to root so all loggers (e.g. bot.oracle_ws_manager) write to the same file.
     """
     log_path = Path(log_file)
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    logger = logging.getLogger("hades_bot")
-    logger.setLevel(getattr(logging, level.upper(), logging.INFO))
-    logger.handlers.clear()
-    fh = logging.FileHandler(log_file, encoding="utf-8")
-    fh.setFormatter(logging.Formatter(
+    level_val = getattr(logging, level.upper(), logging.INFO)
+    formatter = UTCFormatter(
         "%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
-    ))
+    )
+    fh = logging.FileHandler(log_file, encoding="utf-8")
+    fh.setFormatter(formatter)
+
+    root = logging.getLogger()
+    root.setLevel(level_val)
+    resolved = log_path.resolve()
+    for h in list(root.handlers):
+        try:
+            if getattr(h, "baseFilename", None) and Path(h.baseFilename).resolve() == resolved:
+                root.removeHandler(h)
+        except Exception:
+            pass
+    root.addHandler(fh)
+
+    logger = logging.getLogger("hades_bot")
+    logger.setLevel(level_val)
+    logger.handlers.clear()
     logger.addHandler(fh)
+    logger.propagate = False  # avoid duplicate line via root
     # No StreamHandler - log_run JSON goes to file only; console uses print_console_summary
     return logger
 

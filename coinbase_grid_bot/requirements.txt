@@ -1,0 +1,9 @@
+# Load environment variables from .env (e.g. COINBASE_API_KEY, COINBASE_API_SECRET)
+python-dotenv>=1.0.0
+
+# Config (config.yaml)
+PyYAML>=6.0
+
+# Coinbase Advanced Trade API Python SDK
+# https://pypi.org/project/coinbase-advanced-py/
+coinbase-advanced-py>=1.8.0

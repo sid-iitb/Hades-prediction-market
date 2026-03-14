@@ -35,8 +35,8 @@ daily:
     distance_buffer:
       enabled: true
       assets:
-        btc: { pct: 0.0075, floor_usd: 500 }  # Requires 500 points of padding for 80¢ entry
-        eth: { pct: 0.0100, floor_usd: 30 }   # Requires 30 points of padding for 80¢ entry
+        btc: { pct: 0.0075, floor_usd: 750 }  # Requires 500 points of padding for 80¢ entry
+        eth: { pct: 0.0100, floor_usd: 40 }   # Requires 30 points of padding for 80¢ entry
 
   # Basket Scalping Architecture (Iron Condor)
   basket_scalping:

@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Optional, Tuple
@@ -27,6 +28,7 @@ from src.client.kalshi_client import KalshiClient
 from src.client.kraken_client import KrakenClient
 
 from bot.execution import execute_signals
+from bot.no_trade_window import in_no_trade_window
 from bot.exit_criteria import evaluate_positions, run_exit_criteria
 from bot.hour_summary import check_and_emit_hour_summary
 from bot.hourly_report import maybe_emit_hourly_report
@@ -248,18 +250,26 @@ def _get_spot_price(asset: str):
     return client.latest_btc_price().price
 
 
-def _get_spot_window(config: dict, asset: str, interval: Optional[str] = None) -> int:
-    """Get strike window for asset. interval: hourly (default), daily, weekly."""
+def _get_spot_window(config: dict, asset: str, interval: Optional[str] = None) -> float:
+    """Get strike window for asset. interval: hourly (default), daily, weekly. May be float (e.g. doge 0.005)."""
+    default = 1500
     if interval == "daily":
         cfg = config.get("daily", {}) or {}
         by_asset = cfg.get("spot_window_by_asset") or {}
-        return int(by_asset.get(asset) or cfg.get("spot_window", 3000))
-    if interval == "weekly":
+        val = by_asset.get(asset) or cfg.get("spot_window", 3000)
+        default = 3000
+    elif interval == "weekly":
         cfg = config.get("weekly", {}) or {}
         by_asset = cfg.get("spot_window_by_asset") or {}
-        return int(by_asset.get(asset) or cfg.get("spot_window", 5000))
-    by_asset = config.get("spot_window_by_asset") or {}
-    return int(by_asset.get(asset) or config.get("spot_window", 1500))
+        val = by_asset.get(asset) or cfg.get("spot_window", 5000)
+        default = 5000
+    else:
+        by_asset = config.get("spot_window_by_asset") or {}
+        val = by_asset.get(asset) or config.get("spot_window", 1500)
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return float(default)
 
 
 def _cap_state_for_window(
@@ -666,7 +676,8 @@ def run_bot_for_asset(
         )
         logger.info(json.dumps(ev_cf, default=str))
 
-    signals = generate_signals_farthest(quotes, spot_price, ctx.is_late_window, thresholds)
+    pick_all_in_range = (config.get("strategy", {}) or {}).get("pick_all_in_range", False)
+    signals = generate_signals_farthest(quotes, spot_price, ctx.is_late_window, thresholds, pick_all_in_range=pick_all_in_range)
     roll_order_size_multiplier = None  # when set (e.g. 2 or 3), roll re-entry uses base max_cost_cents × this
 
     # STOP_LOSS roll re-entry: after STOP_LOSS, buy next available ticker (different strike)
@@ -737,6 +748,9 @@ def run_bot_for_asset(
             if t is not None and s is not None:
                 guard_eval_map[(t, s)] = g
         signals = allowed_signals
+    if in_no_trade_window(config):
+        logger.info("[%s] No-trade window active (global): skipping new orders this run", asset.upper())
+        signals = []
     execution_results = execute_signals(
         signals, hour_market_id, db_path, kalshi_client, config, mode,
         max_cost_cents_override=max_cost_override,
@@ -978,6 +992,9 @@ def run_bot_15min_for_asset(
             if t is not None and s is not None:
                 guard_eval_map_15[(t, s)] = g
         signals = allowed_signals
+    if in_no_trade_window(config):
+        logger.info("[%s 15m] No-trade window active (global): skipping new orders this run", asset.upper())
+        signals = []
     execution_results = execute_signals(
         signals, market_id, db_path, kalshi_client, config, mode, interval="15min",
         asset=asset,
@@ -1256,19 +1273,22 @@ def _run_interval_daily_basket(
         )
         logger.info(json.dumps(ev2, default=str))
         if mode == "TRADE" and kalshi_client:
-            sig_yes = Signal(ticker=basket.yes_ticker, side="yes", price=basket.yes_price, reason="BASKET_ENTRY", late_window=is_late)
-            sig_no = Signal(ticker=basket.no_ticker, side="no", price=basket.no_price, reason="BASKET_ENTRY", late_window=is_late)
-            exec_results = execute_signals(
-                [sig_yes, sig_no],
-                hour_market_id=wid,
-                db_path=db_path,
-                kalshi_client=kalshi_client,
-                config=config,
-                mode="TRADE",
-                interval="daily",
-                asset=asset,
-            )
-            _log_order_events(logger, exec_results, interval="daily", window_id=wid, asset=asset)
+            if in_no_trade_window(config):
+                logger.info("[%s] No-trade window active (global): skipping daily basket orders", asset.upper())
+            else:
+                sig_yes = Signal(ticker=basket.yes_ticker, side="yes", price=basket.yes_price, reason="BASKET_ENTRY", late_window=is_late)
+                sig_no = Signal(ticker=basket.no_ticker, side="no", price=basket.no_price, reason="BASKET_ENTRY", late_window=is_late)
+                exec_results = execute_signals(
+                    [sig_yes, sig_no],
+                    hour_market_id=wid,
+                    db_path=db_path,
+                    kalshi_client=kalshi_client,
+                    config=config,
+                    mode="TRADE",
+                    interval="daily",
+                    asset=asset,
+                )
+                _log_order_events(logger, exec_results, interval="daily", window_id=wid, asset=asset)
         else:
             add_paper_position(db_path, basket.yes_ticker, "yes", basket.yes_price, "daily", asset)
             add_paper_position(db_path, basket.no_ticker, "no", basket.no_price, "daily", asset)
@@ -1399,7 +1419,8 @@ def _run_interval_daily_weekly(
             subtitle=m.get("subtitle", ""),
         )
         is_late = 0 < minutes_to_close <= late_window_minutes
-        signals = generate_signals_farthest([quote], spot_price, is_late, thresholds)
+        # pick_all_in_range is hourly-only; daily/weekly always use single farthest
+        signals = generate_signals_farthest([quote], spot_price, is_late, thresholds, pick_all_in_range=False)
         if not signals:
             continue
         sig = signals[0]
@@ -1543,7 +1564,7 @@ def run_bot(config: dict) -> None:
     if run_hourly:
         hourly_assets = intervals.get("hourly", {}).get("assets") or config.get("assets", ["btc"])
         for asset in hourly_assets:
-            if str(asset).lower() not in ("btc", "eth", "sol", "xrp"):
+            if str(asset).lower() not in ("btc", "eth", "sol", "xrp", "doge"):
                 continue
             try:
                 run_bot_for_asset(asset, config, db_path, logger, kalshi_client)
@@ -1588,6 +1609,16 @@ def main():
     parser = argparse.ArgumentParser(description="Hades Bot - BTC & ETH Hourly Markets")
     parser.add_argument("--config", "-c", default="config/config.yaml", help="Config file or dir (config/config.yaml for split)")
     parser.add_argument("--once", action="store_true", help="Run once and exit (no loop)")
+    parser.add_argument(
+        "--strategy-report-hourly",
+        action="store_true",
+        help="Run only the hourly strategy report daemon (generate ledger TSVs + email every hour)",
+    )
+    parser.add_argument(
+        "--no-refresh-from-kalshi",
+        action="store_true",
+        help="With --strategy-report-hourly: do not fetch latest fill/resolution from Kalshi (default is to refresh)",
+    )
     args = parser.parse_args()
 
     project_root = Path(__file__).resolve().parent.parent
@@ -1606,6 +1637,44 @@ def main():
             sys.exit(1)
 
     config = load_config(str(config_path))
+    # Strategy report hourly daemon: run at :10 past each hour (PST/PDT), last 1 hour; no run on startup until next :10
+    if getattr(args, "strategy_report_hourly", False):
+        from tools.strategy_report_hourly_email import run as run_strategy_report_hourly
+        import time as _time
+        from datetime import datetime, timedelta, timezone
+        import pytz
+
+        _pst = pytz.timezone("America/Los_Angeles")
+
+        def _seconds_until_next_10_pst() -> float:
+            """Seconds until next :10 past the hour in PST/PDT (America/Los_Angeles)."""
+            now_utc = datetime.now(timezone.utc)
+            now_pst = now_utc.astimezone(_pst)
+            target_minute = 10
+            this_hour_10_pst = now_pst.replace(minute=target_minute, second=0, microsecond=0)
+            if now_pst < this_hour_10_pst:
+                next_pst = this_hour_10_pst
+            else:
+                next_pst = (now_pst.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)).replace(minute=target_minute, second=0, microsecond=0)
+            next_utc = next_pst.astimezone(timezone.utc)
+            return max(1, (next_utc - now_utc).total_seconds())
+
+        refresh = not getattr(args, "no_refresh_from_kalshi", False)
+        print("Strategy report hourly daemon started (runs at :10 past each hour PST/PDT, last 1h; no run until next :10, refresh_from_kalshi=%s)" % refresh)
+        while True:
+            sleep_sec = _seconds_until_next_10_pst()
+            print("[strategy_report_hourly] Next run in %.0f s (at :10 past the hour PST/PDT)" % sleep_sec)
+            _time.sleep(sleep_sec)
+            try:
+                run_strategy_report_hourly(
+                    config_path=str(config_path),
+                    send_email=True,
+                    since_hours=1.0,
+                    project_root=project_root,
+                    refresh_from_kalshi=refresh,
+                )
+            except Exception as e:
+                print(f"[strategy_report_hourly] Error: {e}", file=sys.stderr)
     # Setup console log tee (append mode) - captures all print() output
     log_cfg = config.get("logging", {}) or {}
     from bot.logging import setup_console_log
@@ -1626,6 +1695,77 @@ def main():
         extras.append("weekly=%s" % w_mode)
     extra_str = " | " + " | ".join(extras) if extras else ""
     print(f"Run: {run_mode} | Hourly: {h_mode} | 15min: {f_mode}{extra_str} | Assets: {', '.join(config['assets'])}")
+
+    db_path = config.get("state", {}).get("db_path", "data/bot_state.db")
+    ensure_state_db(db_path)
+    try:
+        from bot.strategy_report_db import ensure_report_db
+        ensure_report_db(db_path)
+    except Exception:
+        pass
+    log_cfg = config.get("logging", {}) or {}
+    log_file = log_cfg.get("file", "logs/bot.log")
+    log_level = log_cfg.get("level", "INFO")
+    # Set up file logging once so all strategy threads log to bot.log
+    setup_logging(log_file, log_level)
+
+    last_90s_cfg = (config.get("fifteen_min") or {}).get("last_90s_limit_99") or config.get("last_90s_limit_99")
+    last_90s_enabled = isinstance(last_90s_cfg, dict) and last_90s_cfg.get("enabled", False)
+    last_90s_thread = None
+    if last_90s_enabled and not args.once:
+        from bot.last_90s_strategy import run_last_90s_loop
+        logger_90s = setup_logging(log_file, log_level)
+        last_90s_thread = threading.Thread(
+            target=run_last_90s_loop,
+            args=(config, logger_90s, db_path),
+            name="last_90s_limit_99",
+            daemon=True,
+        )
+        last_90s_thread.start()
+        print("Last-90s Limit-99c loop started (independent thread)")
+
+    hourly_last_90s_cfg = config.get("hourly_last_90s_limit_99") or (config.get("schedule") or {}).get("hourly_last_90s_limit_99")
+    hourly_last_90s_enabled = isinstance(hourly_last_90s_cfg, dict) and hourly_last_90s_cfg.get("enabled", False)
+    if hourly_last_90s_enabled and not args.once:
+        from bot.hourly_last_90s_strategy import run_hourly_last_90s_loop
+        logger_hourly_90s = setup_logging(log_file, log_level)
+        hourly_last_90s_thread = threading.Thread(
+            target=run_hourly_last_90s_loop,
+            args=(config, logger_hourly_90s, db_path),
+            name="hourly_last_90s_limit_99",
+            daemon=True,
+        )
+        hourly_last_90s_thread.start()
+        print("Hourly last-90s Limit-99c loop started (independent thread)")
+
+    market_maker_cfg = (config.get("fifteen_min") or {}).get("market_maker_strategy") or config.get("market_maker_strategy")
+    market_maker_enabled = isinstance(market_maker_cfg, dict) and market_maker_cfg.get("enabled", False)
+    if market_maker_enabled and not args.once:
+        from bot.market_maker_strategy import run_market_maker_loop
+        logger_mm = setup_logging(log_file, log_level)
+        market_maker_thread = threading.Thread(
+            target=run_market_maker_loop,
+            args=(config, logger_mm, db_path),
+            name="market_maker",
+            daemon=True,
+        )
+        market_maker_thread.start()
+        print("Coin Toss Market Maker loop started (independent thread)")
+
+    # ATM Breakout Sniper: optional independent 15-min loop (OBSERVE/TRADE) for directional breakout.
+    atm_cfg = (config.get("fifteen_min") or {}).get("atm_breakout_strategy") or config.get("atm_breakout_strategy")
+    atm_enabled = isinstance(atm_cfg, dict) and atm_cfg.get("enabled", False)
+    if atm_enabled and not args.once:
+        from bot.atm_breakout_strategy import run_atm_breakout_loop
+        logger_atm = setup_logging(log_file, log_level)
+        atm_thread = threading.Thread(
+            target=run_atm_breakout_loop,
+            args=(config, logger_atm, db_path),
+            name="atm_breakout_strategy",
+            daemon=True,
+        )
+        atm_thread.start()
+        print("ATM Breakout Sniper loop started (independent thread)")
 
     if args.once:
         run_bot(config)

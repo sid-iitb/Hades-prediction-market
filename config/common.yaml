@@ -5,6 +5,15 @@
 mode: TRADE  # OBSERVE | TRADE
 run_mode: both  # hourly | fifteen_min | both
 
+# WebSocket oracles (Kraken + Coinbase): start at bot startup, independent of any strategy.
+# Strategies use their own use_ws_oracles flag to choose asset price from WS vs REST.
+oracle_ws:
+  start_with_bot: false  # start Kraken+Coinbase WS as soon as bot starts (global); set false to disable
+
+# Hourly only: when true, emit all tickers with YES/NO in range (risk guards filter); when false, single farthest (default). Daily/weekly always use single farthest.
+strategy:
+  pick_all_in_range: true
+
 assets:
   - btc
   - eth
@@ -12,19 +21,19 @@ assets:
 
 intervals:
   hourly:
-    enabled: true
+    enabled: false
     assets: [btc, eth]
     mode: TRADE
   fifteen_min:
-    enabled: true
+    enabled: false
     assets: [btc, ETH]
     mode: TRADE
   daily:
-    enabled: true
+    enabled: false
     assets: [btc, eth]
     mode: TRADE
   weekly:
-    enabled: true
+    enabled: false
     assets: [btc, eth]
     mode: OBSERVE
 
@@ -32,11 +41,11 @@ intervals:
 caps:
   cap_scope: per_side
   hourly:
-    max_orders_per_ticker: 10
-    max_total_orders_per_hour: 20
+    max_orders_per_ticker: 100
+    max_total_orders_per_hour: 200
   fifteen_min:
     max_orders_per_ticker: 10
-    max_total_orders_per_15min: 20
+    max_total_orders_per_15min: 50
   daily:
     max_orders_per_ticker: 1
     max_total_orders_per_window: 2
@@ -60,8 +69,8 @@ order:
     max_cost_cents: 100000
     max_limit_price_cents: 99   # optional: place at 99 so fill can be 96-99
     max_cost_cents_by_asset:
-      btc: 100
-      eth: 100
+      btc: 5000
+      eth: 5000
       sol: 100
       xrp: 100
   fifteen_min:
@@ -84,6 +93,15 @@ order:
   weekly:
     contracts: 1
     max_cost_cents: 100
+
+# Global: no new orders during these volatile windows (Pacific time). Exit criteria still run.
+no_trade_windows:
+  enabled: false
+  timezone: America/Los_Angeles
+  windows:
+    - { start: "00:22", end: "02:00" }   # 4:30 PM - 5:15 PM PT
+    #- { start: "04:30", end: "05:15" }   # 4:30 AM - 5:15 AM PT
+    #- { start: "06:30", end: "07:15" }   # 6:30 AM - 7:15 AM PT
 
 # Global fallbacks only; per-interval exit_criteria in hourly/fifteen_min/daily/weekly
 exit_criteria:

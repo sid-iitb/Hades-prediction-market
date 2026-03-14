@@ -3,6 +3,8 @@ Market discovery and data fetching for the bot.
 Determines current hourly market, fetches tickers and orderbook.
 """
 import re
+import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -14,8 +16,10 @@ from src.client.kalshi_client import KalshiClient
 from src.offline_processing.generate_all_kalshi_urls import (
     ASSET_PREFIXES,
     ASSET_PREFIXES_15M,
+    ASSET_PREFIXES_HOURLY_RANGE,
     generate_15min_slug,
     generate_kalshi_slug,
+    generate_kalshi_slug_range,
 )
 
 KALSHI_API_URL = "https://api.elections.kalshi.com/trade-api/v2/markets"
@@ -23,6 +27,9 @@ LA_TZ = pytz.timezone("America/Los_Angeles")
 ET_TZ = pytz.timezone("US/Eastern")
 
 VALID_PREFIXES = tuple(ASSET_PREFIXES.values())
+# All hourly prefixes (above/below + range) for get_minutes_to_close validation
+_valid_hourly_range = tuple(ASSET_PREFIXES_HOURLY_RANGE.values())
+VALID_PREFIXES_HOURLY = tuple(set(VALID_PREFIXES) | set(_valid_hourly_range))
 VALID_PREFIXES_15M = tuple(ASSET_PREFIXES_15M.values())
 
 
@@ -45,7 +52,10 @@ class TickerQuote:
     no_ask: Optional[int]
     yes_bid: Optional[int]
     no_bid: Optional[int]
-    subtitle: str
+    subtitle: str = ""
+    # Range (B) markets: bounds for "spot in range" -> YES, else NO
+    range_low: Optional[float] = None
+    range_high: Optional[float] = None
 
 
 def get_market_hour_la() -> datetime:
@@ -55,13 +65,62 @@ def get_market_hour_la() -> datetime:
 
 def get_current_hour_market_id(asset: str = "btc") -> str:
     """
-    Get the event ticker for the current hourly market.
-    asset: btc | eth. Format: kxbtcd-YYmmDDHH or kxethd-YYmmDDHH.
+    Get the event ticker for the current hourly market (above/below).
+    asset: btc | eth | sol | xrp | doge. Format: kxbtcd-YYmmDDHH or kxethd-YYmmDDHH.
     """
     now_utc = datetime.now(pytz.utc)
     target = now_utc.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
     slug = generate_kalshi_slug(target, asset=asset)
     return slug.upper()
+
+
+def get_previous_hour_market_id(asset: str = "btc") -> str:
+    """Event ticker for the hourly market that just closed (previous hour, above/below)."""
+    now_utc = datetime.now(pytz.utc)
+    target = now_utc.replace(minute=0, second=0, microsecond=0)  # top of current hour = close of previous
+    slug = generate_kalshi_slug(target, asset=asset)
+    return slug.upper()
+
+
+def get_current_hour_market_ids(asset: str) -> List[str]:
+    """
+    All current-hour market IDs for this asset (9 total across assets: 2 each btc/eth/sol/xrp, 1 doge).
+    Returns [above_below_slug, range_slug] for btc/eth/sol/xrp, [range_slug] for doge.
+    """
+    now_utc = datetime.now(pytz.utc)
+    target = now_utc.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    asset_l = str(asset).lower()
+    ids: List[str] = []
+    if asset_l in ("btc", "eth", "sol", "xrp"):
+        ids.append(generate_kalshi_slug(target, asset=asset_l).upper())
+        range_slug = generate_kalshi_slug_range(target, asset_l)
+        if range_slug:
+            ids.append(range_slug.upper())
+    elif asset_l == "doge":
+        range_slug = generate_kalshi_slug_range(target, asset_l)
+        if range_slug:
+            ids.append(range_slug.upper())
+    return ids
+
+
+def get_previous_hour_market_ids(asset: str) -> List[str]:
+    """
+    All previous-hour market IDs for this asset (for resolve). Same count as get_current_hour_market_ids.
+    """
+    now_utc = datetime.now(pytz.utc)
+    target = now_utc.replace(minute=0, second=0, microsecond=0)  # previous hour close
+    asset_l = str(asset).lower()
+    ids: List[str] = []
+    if asset_l in ("btc", "eth", "sol", "xrp"):
+        ids.append(generate_kalshi_slug(target, asset=asset_l).upper())
+        range_slug = generate_kalshi_slug_range(target, asset_l)
+        if range_slug:
+            ids.append(range_slug.upper())
+    elif asset_l == "doge":
+        range_slug = generate_kalshi_slug_range(target, asset_l)
+        if range_slug:
+            ids.append(range_slug.upper())
+    return ids
 
 
 def get_current_15min_market_id(asset: str = "btc") -> str:
@@ -274,7 +333,7 @@ def get_15min_window_ids_for_hour(hour_market_id: str) -> List[str]:
     rest = slug[dash + 1:]
     if len(rest) < 9:
         return []
-    # Map hourly prefix to 15m prefix
+    # Map hourly prefix to 15m prefix (above/below only; range markets have no 15m)
     prefix_15m_map = {
         "KXBTCD": "KXBTC15M",
         "KXETHD": "KXETH15M",
@@ -297,10 +356,10 @@ def get_minutes_to_close(hour_market_id: str) -> float:
     """
     Minutes until market close (top of the hour).
     Slug uses Eastern Time (per Kalshi/generate_kalshi_slug).
-    Supports kxbtcd- and kxethd- prefixes.
+    Supports above/below (kxbtcd, kxethd, ...) and range (kxbtc, kxeth, kxdoge, ...) prefixes.
     """
     slug = hour_market_id.lower()
-    if not any(slug.startswith(p + "-") for p in VALID_PREFIXES):
+    if not any(slug.startswith(p + "-") for p in VALID_PREFIXES_HOURLY):
         return 999.0
     dash = slug.find("-")
     rest = slug[dash + 1:] if dash >= 0 else ""
@@ -399,6 +458,15 @@ def fetch_markets_by_close_window(
         return [], str(e)
 
 
+def _is_year_like_strike(v: float) -> bool:
+    """True if v looks like a year (e.g. 2026); must not be used as strike for crypto."""
+    try:
+        f = float(v)
+        return 2018 <= f <= 2035
+    except (TypeError, ValueError):
+        return False
+
+
 def parse_strike_from_text(text: str) -> float:
     """
     Parse strike from text. Supports:
@@ -432,72 +500,108 @@ def parse_strike(subtitle: str) -> float:
     return parse_strike_from_text(subtitle or "")
 
 
-def _parse_strike_from_ticker(ticker: str) -> float:
+def _parse_strike_from_subtitle_strict(subtitle: str) -> float:
     """
-    Try to extract strike from ticker if encoded (e.g. KXBTCD-26FEB1615-T67749.99).
-    Returns 0.0 if no strike-like suffix found.
+    Parse strike only from subtitle text that clearly describes a price.
+    Supports: "BTC > 68500", "> 68500", "above 68500", "$68,500".
+    Rejects year-like values (2018-2035) to avoid parsing "2026" from dates.
+    Returns 0.0 if no valid strike or value looks like a year.
     """
-    if not ticker or not isinstance(ticker, str):
+    if not subtitle or not isinstance(subtitle, str):
         return 0.0
-    # Pattern: -T1234.56 or -T1234 (hourly style)
-    match = re.search(r"-T([\d.]+)$", ticker, re.IGNORECASE)
+    # Explicit price patterns (order matters: prefer > N, then above N, then $N)
+    match = re.search(r">\s*\$?([\d,]+(?:\.[\d]+)?)", subtitle)
     if match:
         try:
-            v = float(match.group(1))
-            if v > 0 and v < 1e9:
+            v = float(match.group(1).replace(",", ""))
+            if v > 0 and not _is_year_like_strike(v):
                 return v
         except (ValueError, TypeError):
             pass
-    # Pattern: -1234.56 or -1234 at end (decimal strike)
-    match = re.search(r"-(\d{3,}\.?\d*)$", ticker)
+    match = re.search(r"[Aa]bove\s+\$?([\d,]+(?:\.[\d]+)?)", subtitle)
     if match:
         try:
-            v = float(match.group(1))
-            if v > 0 and v < 1e9:
+            v = float(match.group(1).replace(",", ""))
+            if v > 0 and not _is_year_like_strike(v):
+                return v
+        except (ValueError, TypeError):
+            pass
+    match = re.search(r"\$([\d,]+(?:\.[\d]+)?)", subtitle)
+    if match:
+        try:
+            v = float(match.group(1).replace(",", ""))
+            if v > 0 and not _is_year_like_strike(v):
                 return v
         except (ValueError, TypeError):
             pass
     return 0.0
 
 
+def _parse_strike_from_ticker(ticker: str) -> float:
+    """
+    Try to extract strike from ticker ONLY when strike is explicitly encoded (legacy formats).
+    - KXBTCD-26FEB1615-T67749.99 (hourly: -T<strike>)
+    - KXDOGE-26FEB2818-B0.087 (bucket: -B<strike>)
+    Do NOT use for 15-min tickers like KXBTC15M-26MAR061215-15 where -15 is a sequence ID, not strike.
+    Returns 0.0 if no strike-like suffix found.
+    """
+    if not ticker or not isinstance(ticker, str):
+        return 0.0
+    # Pattern: -T1234.56 or -T1234 (hourly style, strike in cents or dollars)
+    match = re.search(r"-T([\d.]+)$", ticker, re.IGNORECASE)
+    if match:
+        try:
+            v = float(match.group(1))
+            if v > 0 and v < 1e9 and not _is_year_like_strike(v):
+                return v
+        except (ValueError, TypeError):
+            pass
+    # Pattern: -B0.087 (range/bucket markets, strike in dollars e.g. DOGE)
+    match = re.search(r"-B([\d.]+)$", ticker, re.IGNORECASE)
+    if match:
+        try:
+            v = float(match.group(1))
+            if v > 0 and v < 1e9:
+                return v
+        except (ValueError, TypeError):
+            pass
+    # Do NOT parse -26MAR061215 or -15 as strike (new 15-min format has no strike in ticker).
+    return 0.0
+
+
 def extract_strike_from_market(m: Dict[str, Any], ticker: str) -> float:
     """
-    Robust strike extraction for 15-min (and hourly) markets.
-    Fallback chain:
-    a) floor_strike, strike (API fields)
-    b) parse from subtitle
-    c) parse from rules/description text (rules_primary, rules_secondary, etc.)
-    d) parse from title/name
-    e) parse from ticker symbol if strike encoded
+    Extract strike from Kalshi API market object only. Do not infer strike from ticker string
+    for 15-min markets (e.g. KXBTC15M-26MAR061215-15); the -15 is a sequence ID, not strike.
+    Prefer API fields (floor_strike, strike, ceiling_strike, subtitle); reject year-like values (2026).
     """
     if not m or not isinstance(m, dict):
         return 0.0
-    # a) API strike fields (15-min uses floor_strike)
+    # a) Range markets: midpoint from API
+    floor_val = m.get("floor_strike")
+    ceiling_val = m.get("ceiling_strike")
+    if floor_val is not None and ceiling_val is not None:
+        try:
+            f, c = float(floor_val), float(ceiling_val)
+            if f > 0 and c > 0 and not _is_year_like_strike(f) and not _is_year_like_strike(c):
+                return (f + c) / 2.0
+        except (ValueError, TypeError):
+            pass
+    # b) Single API strike fields (primary source for 15-min)
     for key in ("floor_strike", "strike", "ceiling_strike"):
         strike_val = m.get(key)
         if strike_val is not None:
             try:
                 v = float(strike_val)
-                if v > 0:
+                if v > 0 and not _is_year_like_strike(v):
                     return v
             except (ValueError, TypeError):
                 pass
-    # b) Subtitle
-    v = parse_strike_from_text(m.get("subtitle", ""))
+    # c) Subtitle with strict parsing (e.g. "BTC > 68500") — avoid parsing "2026" from dates
+    v = _parse_strike_from_subtitle_strict(m.get("subtitle", ""))
     if v > 0:
         return v
-    # c) Rules and description text (where 15-min strike often lives)
-    for key in ("rules_primary", "rules_secondary", "rules", "rulebook", "rules_summary",
-                "description", "yes_description", "event_description"):
-        v = parse_strike_from_text(str(m.get(key, "")))
-        if v > 0:
-            return v
-    # d) Title or name
-    for key in ("title", "name", "market_name"):
-        v = parse_strike_from_text(str(m.get(key, "")))
-        if v > 0:
-            return v
-    # e) Ticker
+    # d) Legacy ticker-encoded strike only (-T or -B suffix); never -26MAR061215 or -15
     v = _parse_strike_from_ticker(ticker or m.get("ticker", ""))
     if v > 0:
         return v
@@ -507,10 +611,11 @@ def extract_strike_from_market(m: Dict[str, Any], ticker: str) -> float:
 def fetch_eligible_tickers(
     event_ticker: str,
     spot_price: Optional[float] = None,
-    window: int = 1500,
+    window: float = 1500,
 ) -> List[Dict]:
     """
     Fetch tickers for the event, filter by strike window if spot_price given.
+    window: max distance (strike - spot) in same units as spot_price (e.g. dollars for DOGE 0.005, cents for BTC 1500).
     Returns list of {ticker, strike, yes_bid, yes_ask, no_bid, no_ask, subtitle}.
     """
     markets, err = fetch_markets_for_event(event_ticker)
@@ -521,9 +626,9 @@ def fetch_eligible_tickers(
         strike = extract_strike_from_market(m, m.get("ticker", ""))
         if strike <= 0:
             continue
-        if spot_price is not None and abs(strike - spot_price) > window:
+        if spot_price is not None and abs(strike - spot_price) > float(window):
             continue
-        result.append({
+        row = {
             "ticker": m.get("ticker"),
             "strike": strike,
             "yes_bid": m.get("yes_bid"),
@@ -531,21 +636,59 @@ def fetch_eligible_tickers(
             "no_bid": m.get("no_bid"),
             "no_ask": m.get("no_ask"),
             "subtitle": m.get("subtitle", ""),
-        })
+        }
+        floor_val = m.get("floor_strike")
+        ceiling_val = m.get("ceiling_strike")
+        if floor_val is not None and ceiling_val is not None:
+            try:
+                row["floor_strike"] = float(floor_val)
+                row["ceiling_strike"] = float(ceiling_val)
+            except (ValueError, TypeError):
+                pass
+        result.append(row)
     result.sort(key=lambda x: x["strike"])
     return result
+
+
+# In-memory cache for 15-min market metadata (strike/ticker unchanged per window). One REST call per market_id.
+# Entries expire after one window (15 min) so data is refreshed when a new market window starts.
+_FETCH_15MIN_MARKET_CACHE: Dict[str, Tuple[Optional[Dict], float]] = {}  # key -> (result, cached_at_ts)
+_FETCH_15MIN_MARKET_CACHE_LOCK = threading.Lock()
+_FETCH_15MIN_MARKET_CACHE_MAX = 128
+_FETCH_15MIN_MARKET_CACHE_TTL_SECONDS = 900  # 15 min: refresh once new window starts
 
 
 def fetch_15min_market(event_ticker: str) -> Optional[Dict]:
     """
     Fetch the single binary market for a 15-min event.
     15-min events have one market per event (ticker typically event_ticker-00).
-    Returns first market dict or None.
+    Returns first market dict or None. Results are cached per event_ticker; cache is refreshed
+    when the entry is older than one window (15 min) so new market windows get fresh data.
     """
+    key = (event_ticker or "").strip()
+    if not key:
+        return None
+    now = time.time()
+    with _FETCH_15MIN_MARKET_CACHE_LOCK:
+        if key in _FETCH_15MIN_MARKET_CACHE:
+            result, cached_at = _FETCH_15MIN_MARKET_CACHE[key]
+            if (now - cached_at) < _FETCH_15MIN_MARKET_CACHE_TTL_SECONDS:
+                return result
+            # TTL expired (new window started); fall through to refetch
     markets, err = fetch_markets_for_event(event_ticker)
     if err or not markets:
-        return None
-    return markets[0]
+        result = None
+    else:
+        result = markets[0]
+    # Only cache valid results (poison-cache fix: do not cache None or missing ticker).
+    # Only call .get() when result is a dict to avoid AttributeError on custom objects.
+    ticker_val = result.get("ticker") if (result is not None and isinstance(result, dict)) else None
+    if result is not None and isinstance(result, dict) and ticker_val:
+        with _FETCH_15MIN_MARKET_CACHE_LOCK:
+            if len(_FETCH_15MIN_MARKET_CACHE) >= _FETCH_15MIN_MARKET_CACHE_MAX:
+                _FETCH_15MIN_MARKET_CACHE.pop(next(iter(_FETCH_15MIN_MARKET_CACHE)))
+            _FETCH_15MIN_MARKET_CACHE[key] = (result, time.time())
+    return result
 
 
 def fetch_15min_quote(
@@ -584,6 +727,12 @@ def fetch_15min_quote(
             except (TypeError, ValueError):
                 return None
         t = tickers[0]
+        rlo, rhi = t.get("floor_strike"), t.get("ceiling_strike")
+        try:
+            rl = float(rlo) if rlo is not None else None
+            rh = float(rhi) if rhi is not None else None
+        except (ValueError, TypeError):
+            rl = rh = None
         quotes = [
             TickerQuote(
                 ticker=ticker,
@@ -593,6 +742,8 @@ def fetch_15min_quote(
                 yes_bid=_int_or_none(t.get("yes_bid")),
                 no_bid=_int_or_none(t.get("no_bid")),
                 subtitle=t.get("subtitle", ""),
+                range_low=rl,
+                range_high=rh,
             )
         ]
     return quotes[0] if quotes else None
@@ -629,6 +780,13 @@ def enrich_with_orderbook(
                 return int(round(float(v)))
             except (TypeError, ValueError):
                 return None
+        rlo = t.get("floor_strike")
+        rhi = t.get("ceiling_strike")
+        try:
+            range_low = float(rlo) if rlo is not None else None
+            range_high = float(rhi) if rhi is not None else None
+        except (ValueError, TypeError):
+            range_low = range_high = None
         quotes.append(TickerQuote(
             ticker=ticker,
             strike=t.get("strike", 0),
@@ -637,5 +795,7 @@ def enrich_with_orderbook(
             yes_bid=_int_or_none(yes_bid),
             no_bid=_int_or_none(no_bid),
             subtitle=t.get("subtitle", ""),
+            range_low=range_low,
+            range_high=range_high,
         ))
     return quotes

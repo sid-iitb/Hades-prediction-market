@@ -1,0 +1,19 @@
+========================================================================
+  LIVE DB VERIFICATION — strategy_report_last_90s (last 45 minutes)
+  DB: /Users/amareshpandey/Desktop/Start-up-Aajsearch/Hades-prediction-market/data/bot_state.db
+  Since: 2026-03-02T20:47:11 UTC
+========================================================================
+
+--- Last 5 rows (limit_or_market = 'limit' OR placed = 1) ---
+  (none in last 45 minutes)
+--- Last 5 rows (placed = 0) — skip_reason / skip_details ---
+  (none in last 45 minutes)
+--- Time-decay verification (config bases: btc=35, eth=2.5, sol=0.10, xrp=0.003) ---
+  No placed rows with min_distance_threshold in last 45 minutes.
+
+--- waiting_for_dip in DB (last 45 min) ---
+  Rows with skip_reason='waiting_for_dip' or skip_details containing 'waiting_for_dip': 0
+
+========================================================================
+  Done.
+========================================================================

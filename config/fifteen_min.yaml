@@ -1,13 +1,104 @@
 # 15-min: entry window + exit criteria (aligned), then price bands and risk guards
 
 fifteen_min:
+  # Last-90s Limit-99c: independent loop; places one buy in final Ns (BTC, ETH, SOL, XRP)
+  # Time separation: places only when seconds_to_close <= window_seconds (e.g. last 85s). ATM stops new entries at 120s;
+  #   so last_90s resting orders do not overlap with ATM's entry window. Orders tagged client_order_id "last90s:".
+  # If bid < 99: place at ask (market-style) for immediate fill; if bid >= 99: place limit at 99 and wait for fill.
+  # side: "auto" (default) = place on side with higher bid (yes_bid vs no_bid); "yes" | "no" to force
+  # stop_loss_pct, window_seconds, monitor_window_seconds, stop_loss_distance_factor: scalar or dict per asset
+  # monitor_window_seconds: wake up this many seconds before close to collect pre-placement telemetry (default 120)
+  # min_bid_cents: if chosen side's bid < this, skip placement (too risky) and wait for next run; default 90
+  last_90s_limit_99:
+    enabled: true
+    use_ws_oracles: false  # use asset price from WS oracles (started at bot boot); false = use REST only for this strategy
+    monitor_window_seconds: 120  # collect telemetry when seconds_to_close <= this
+    window_seconds: { btc: 65, eth: 65, sol: 65, xrp: 65 }
+    limit_price_cents: 99
+    min_bid_cents: 95  # late-sweep dynamic floor when sec_to_close <= 65; when > 65 we use 98c (early queue)
+    side: auto
+    stop_loss_pct: { btc: 30, eth: 30, sol: 40, xrp: 30 }
+    # Stop loss: only trigger when distance <= this fraction of min_distance_at_placement (0.8 = 80%). Avoids phantom stop in temporary reversals. Can be per-asset dict.
+    stop_loss_distance_factor: {btc: 0.60, eth: 0.6, sol: 0.50, xrp: 0.5 }
+    run_interval_seconds: 1  # 500 ms
+    assets: [btc, eth, sol, xrp]
+    max_cost_cents: 10000
+    max_cost_cents_by_asset:
+      btc: 10000
+      eth: 10000
+      sol: 10000
+      xrp: 10000
+    # Skip placement if distance_from_strike (USD) <= this; 0 = no filter.
+    # All values in USD. For XRP: strike/spot ~1.x (2–4 decimals); Kraken spot is full float; distance can be sub-cent.
+    # xrp: 0.0075 = 0.75¢ buffer — requires spot at least that far from strike (avoids at-the-money placement).
+    min_distance_at_placement:
+      btc: 35
+      eth: 2
+      sol: 0.12
+      xrp: 0.002
+
+  # Coin Toss Market Maker: spread-capturing MM when market is ~50/50; scratch loop for adverse selection.
+  market_maker_strategy:
+    enabled: false
+    mode: OBSERVE
+    max_cost_cents: 100          # CRITICAL: Only risk $1 per trade (total for both legs)
+    run_interval_seconds: 1
+    assets: [btc, eth, sol, xrp]
+    # Gate 1: Time Constraints
+    min_seconds_to_close: 120
+    max_seconds_to_close: 840
+    # Gate 2: Proximity (Coin Toss condition)
+    max_mm_distance: { btc: 15.0, eth: 1.5, sol: 0.10, xrp: 0.001 }
+    # Gate 3 & 4: Order Book Parity & Spread
+    min_price_parity: 48
+    max_price_parity: 52
+    min_spread_cents: 3
+    # Gate 5: Velocity (Anti-Toxic Flow)
+    safe_velocity_threshold_5s: { btc: 50.0, eth: 5.0, sol: 0.50, xrp: 0.005 }
+    # Ripcord Parameters (Exit/Scratch Logic)
+    scratch_timeout_seconds: 1.5
+    max_acceptable_loss_cents: 10
+    scratch_spot_movement_threshold: { btc: 75.0, eth: 7.5, sol: 0.75, xrp: 0.0075 }
+    zero_fill_timeout_seconds: 60  # Cancel both legs and release if neither fills by this time
+
+  # ATM Breakout Sniper: directional breakout when market is coiled (48–52) and spot momentum triggers
+  # Time separation: new entries only when 120 <= seconds_to_close <= 840 (last 2–14 min). Unfilled entry is canceled
+  #   so last_90s can place in its window (last ~85s). Orders tagged client_order_id "atm:".
+  atm_breakout_strategy:
+    enabled: false
+    mode: TRADE
+    run_interval_seconds: 1
+    assets: [btc, eth, sol, xrp]
+    min_seconds_to_close: 120
+    max_seconds_to_close: 840
+    window_seconds: 120
+    # Order size: contracts = explicit size; capped by max_cost_cents (contracts <= max_cost_cents // entry_price).
+    contracts: 1
+    max_cost_cents: 100  # max $1 per entry; actual contracts = min(contracts, max(1, max_cost_cents // entry_price))
+    # Gate 2: The Coil (Perfect 50/50 Parity)
+    min_price_parity: 45
+    max_price_parity: 55
+    # Gate 3: The Momentum Trigger (Spot change in last 3 seconds)
+    # If spot moves UP by this amount, buy YES. If DOWN, buy NO.
+    momentum_trigger_3s: { btc: 30.0, eth: 2, sol: 0.1, xrp: 0.002 }
+    # Exits (Asymmetric Risk/Reward)
+    take_profit_cents: 75
+    stop_loss_cents: 35
+    # Ratchet trailing stop: floor = max(take_profit_cents, highest_seen_bid - trailing_stop_cents)
+    trailing_stop_cents: 10
+    # Safe zone: hold to $1.00 if spot is this far past strike and time left < safe_zone_window_seconds
+    safe_distance_threshold: { btc: 40.0, eth: 2.5, sol: 0.15, xrp: 0.003 }
+    safe_zone_window_seconds: 120  # hold to expiration when in safe zone with < 2 min left
+
   # --- Entry window & exit criteria (same window: bot sleeps until seconds_to_close <= late_window_seconds) ---
-  late_window_seconds: 120   # entry: start trading when seconds_to_close <= this
-  late_window_interval_seconds: 10  # entry: run bot every N sec while in window
-  exit_criteria:             # exit: same interval as entry so exit is evaluated every run (no conflict)
+  entry_window:
+    late_window_seconds: 10  # entry: start trading when seconds_to_close <= this
+    late_window_interval_seconds: 1  # entry: run bot every N sec while in window
+  exit_criteria:
     stop_loss_pct: 0.30
-    panic_stop_loss_pct: 0.50
-    evaluation_interval_seconds: 10  # same as late_window_interval_seconds: exit checked on every run
+    panic_stop_loss_pct: 0.40
+    stop_loss_persistence_polls: 1
+    evaluation_interval_seconds: 1
 
   yes_min: 90
   yes_max: 99
@@ -15,7 +106,7 @@ fifteen_min:
   no_max: 99
   risk_guards:
     enabled: true
-    no_new_entry_cutoff_seconds: 60
+    no_new_entry_cutoff_seconds: 30
     persistence_polls: 1
     late_persistence_override:
       enabled: false
@@ -31,9 +122,17 @@ fifteen_min:
     distance_buffer:
       enabled: true
       assets:
-        btc: { pct: 0.0015, floor_usd: 100 }
-        eth: { pct: 0.0030, floor_usd: 8 }
-        sol: { pct: 0.0015, floor_usd: 0.11 }
+        # Time-tiered floors (15-min only): larger buffer with more time left
+        # Evaluates: min_seconds_left <= seconds_to_close <= max_seconds_left
+        btc:
+          - { max_seconds_left: 420, min_seconds_left: 300, floor_usd: 220 } # Last 7 to 5 mins
+          - { max_seconds_left: 300, min_seconds_left: 120, floor_usd: 150 } # Last 5 to 2 mins
+          - { max_seconds_left: 120, min_seconds_left: 0,  floor_usd: 100 } # Last 2 mins to 75s
+        eth:
+          - { max_seconds_left: 420, min_seconds_left: 300, floor_usd: 18 }
+          - { max_seconds_left: 300, min_seconds_left: 120, floor_usd: 12 }
+          - { max_seconds_left: 120, min_seconds_left: 0,  floor_usd: 6 }
+        sol: { pct: 0.0015, floor_usd: 0.5 }
     reversal_after_stop:
       enabled: true
       max_reversals_per_ticker: 1

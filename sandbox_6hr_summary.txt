@@ -1,0 +1,24 @@
+============================================================
+  SANDBOX 6-HOUR PHASE REVIEW — last_90s strategy
+  Window: last 6.0 hours (since 2026-03-03T00:06:04 UTC)
+  DB: /Users/amareshpandey/Desktop/Start-up-Aajsearch/Hades-prediction-market/data/bot_state.db
+============================================================
+
+--- 1. Execution breakdown ---
+  Total placed orders (placed == 1): 107
+  By type: limit = 91, market = 16
+  Market orders: count = 16, avg execution price = 97.94¢ (fill_price when set, else price_cents)
+
+--- 2. Skip breakdown ---
+  Total skipped opportunities (placed == 0): 5
+  Primary skip reasons (from skip_details / skip_reason):
+    no_history_recorded: 5
+
+--- 3. Stop-loss & PNL health ---
+  Stop-losses triggered (is_stop_loss == 1): 0
+  Average stop_loss_sell_price: N/A (no stop-losses)
+  Completed windows (final_outcome): WIN = 0, LOSS = 0
+
+============================================================
+  End of report.
+============================================================
